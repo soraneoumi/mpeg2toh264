@@ -272,10 +272,10 @@ test("other browsers retain native frame metadata and cancellation", async (t) =
 });
 
 /**
- * Stands in for PictureWatch: `video.picture` is what the element shows, and
- * a take differs from the one before when that value does. As with the real
- * one, the newest take is not reported until another has followed it, and
- * `delay` holds every verdict back that many further takes.
+ * Fake PictureWatch. `video.picture` is the picture the element shows, and a
+ * take counts as changed when that value differs from the previous take. As
+ * with the real watch, the newest take is not reported until another take
+ * follows it. `delay` holds each result back by that many additional takes.
  */
 function watching(delay = 0) {
   const watch = {
@@ -331,9 +331,9 @@ function watching(delay = 0) {
 const REFRESH = 1000 / 60;
 
 /**
- * Play `count` pictures of two refreshes each from refresh `from`, with the
- * painted count going up on the refreshes `paints` selects. Returns the next
- * refresh.
+ * Plays `count` pictures of two refreshes each, starting at refresh `from`.
+ * The painted count increases on the refreshes selected by `paints`. Returns
+ * the next refresh number.
  */
 function play(f, from, count, { paints, picture = (n) => n }) {
   for (let refresh = from; refresh < from + count * 2; refresh++) {
@@ -344,14 +344,14 @@ function play(f, from, count, { paints, picture = (n) => n }) {
   return from + count * 2;
 }
 
-/** The compositor painting each picture one refresh after it appears. */
+/** The compositor paints each picture one refresh after it appears. */
 const steady = (refresh) => refresh % 2 === 1;
 
 test("watched pictures arrive once each while the painted count runs out of step", async (t) => {
   const { watch, pictures } = watching();
   const f = await fixture(t, true, 1, pictures);
-  // Paints three, one and two refreshes apart: the same number as there are
-  // pictures, but on the wrong refreshes for two in every three.
+  // Paints are 3, 1 and 2 refreshes apart. There are as many paints as
+  // pictures, but two in every three paints are on the wrong refresh.
   play(f, 0, 90, { paints: (refresh) => [1, 4, 5].includes(refresh % 6) });
   const shown = f.seen.map((frame) => watch.values.get(frame.picture));
   assert.deepEqual(
@@ -385,7 +385,7 @@ test("a watched picture is adoptable during its callback and released after it",
   play(f, 0, 20, { paints: steady });
   assert.ok(during.length >= 18);
   assert.ok(during.every(Boolean));
-  // Only the newest take, and the one before it awaiting its turn, remain.
+  // Only two takes remain: the newest, and the previous one waiting for its result.
   assert.ok(watch.held.length <= 2);
 });
 
@@ -443,7 +443,7 @@ test("a still scene keeps frames coming during playback and a paused one stops t
   for (let i = 0; i < 30; i++) f.tick(refresh++ * REFRESH);
   assert.equal(watch.takes, settled);
   assert.equal(f.seen.length, delivered);
-  // Playback resumes against the picture it paused on.
+  // Playback resumes. New pictures are compared with the one shown at the pause.
   f.video.paused = false;
   f.video.dispatchEvent(new Event("playing"));
   play(f, refresh + (refresh % 2), 10, {
@@ -480,7 +480,7 @@ test("watched takes do not survive a gap in polling", async (t) => {
   const f = await fixture(t, true, 1, pictures);
   const refresh = play(f, 0, 20, { paints: steady });
   const resets = watch.resets;
-  // A background tab: no refreshes for two seconds.
+  // Simulates a background tab: no refreshes for two seconds.
   const base = refresh + 120;
   play(f, base, 10, { paints: steady, picture: (n) => n + 500 });
   assert.equal(watch.resets, resets + 1);
@@ -498,7 +498,7 @@ test("a renderer that stops watching falls back to the painted count", async (t)
   refresh = play(f, refresh, 10, { paints: steady });
   const counted = f.seen.slice(watched);
   assert.equal(watch.resets, resets + 1);
-  // The picture in hand at the change, then one for each paint.
+  // One frame for the picture at the switch, then one for each paint.
   assert.equal(counted.length, 11);
   assert.ok(counted.every((frame) => frame.picture === undefined));
   assert.equal(counted[0].mozTiming.discontinuity, true);
@@ -523,8 +523,8 @@ test("an ended video stops the watched takes", async (t) => {
 test("unchanged verdicts from playback do not settle a pause early", async (t) => {
   const { watch, pictures } = watching(4);
   const f = await fixture(t, true, 1, pictures);
-  // Verdicts run four takes late, so several unchanged ones are in hand when
-  // the element pauses on a picture that has not been delivered yet.
+  // Results arrive four takes late, so several unchanged results are pending
+  // when the element pauses on a picture that has not been delivered yet.
   let refresh = play(f, 0, 20, {
     paints: steady,
     picture: (n) => (n < 17 ? n : 17),
@@ -547,10 +547,10 @@ test("resuming into a still scene keeps frames coming", async (t) => {
   f.video.paused = false;
   f.video.dispatchEvent(new Event("playing"));
   const before = f.seen.length;
-  // A second of the paused picture, painted as playback goes on.
+  // One second of the paused picture, still being painted during playback.
   play(f, refresh + (refresh % 2), 30, { paints: steady, picture: () => 29 });
   const frames = f.seen.length - before;
-  // One for each 0.2 s of the second, counted from the resume.
+  // One frame per 0.2 s of that second, counted from the resume.
   assert.ok(frames >= 3 && frames <= 5, `${frames} frames`);
 });
 
@@ -562,8 +562,9 @@ test("the still refresh follows the playback rate", async (t) => {
   f.video.dispatchEvent(new Event("ratechange"));
   const before = f.seen.length;
   play(f, refresh, 30, { paints: steady, picture: () => 29 });
-  // A second of wall time is three of media time: at least one frame for
-  // each 0.2 s of it, less the refreshes spent waiting for verdicts.
+  // One second of wall time is three seconds of media time, so expect at
+  // least one frame per 0.2 s of media time, minus the refreshes spent
+  // waiting for results.
   assert.ok(f.seen.length - before >= 10, `${f.seen.length - before} frames`);
 });
 
@@ -589,7 +590,7 @@ test("verdicts arriving together deliver the newest picture and catch up", async
   assert.ok(
     shown.every((picture, index) => !index || picture > shown[index - 1]),
   );
-  // Back to the one refresh a verdict takes, not three behind for good.
+  // Results are back to one refresh behind, not permanently three behind.
   assert.equal(shown.at(-1), refresh - 2);
   assert.ok(watch.held.length <= 2);
 });
@@ -600,7 +601,7 @@ test("a watched frame carries the size and media time of its take", async (t) =>
   f.video.picture = 1;
   f.video.currentTime = 10;
   f.paint(1, 0);
-  // By the refresh that delivers it the element has moved on.
+  // By the refresh that delivers the take, the element has moved on.
   f.video.picture = 2;
   f.video.currentTime = 11;
   f.video.videoWidth = 1440;
@@ -633,12 +634,12 @@ test("a watch with no room skips the refresh and a counter reset starts over", a
   watch.full = true;
   const before = f.seen.length;
   refresh = play(f, refresh, 4, { paints: steady });
-  // The take already in hand still comes through; nothing new is taken.
+  // The pending take is still delivered. No new takes are made.
   assert.ok(f.seen.length - before <= 1);
   watch.full = false;
   refresh = play(f, refresh, 10, { paints: steady });
   assert.ok(f.seen.length - before >= 9);
-  // A new source starts its counts again.
+  // A new source restarts the counters.
   const resets = watch.resets;
   f.video.mozPaintedFrames = 0;
   f.video.mozParsedFrames = 0;

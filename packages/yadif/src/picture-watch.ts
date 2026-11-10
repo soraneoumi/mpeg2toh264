@@ -1,13 +1,13 @@
 import { VERTEX_SHADER, createProgram } from "./utils.js";
 import type { Pictures } from "./video-frame.js";
 
-/** Source texels along each side of the square one comparison cell covers. */
+/** Side length, in source texels, of the square that one comparison cell covers. */
 const BLOCK = 16;
 
 /**
- * Textures this may create. Two are in use on every refresh, the newest take
- * and the one awaiting its verdict; the rest cover verdicts that arrive late.
- * With none left a refresh goes without a take.
+ * Maximum number of textures. Two are always in use (the newest take and the
+ * one whose result is pending); the others cover late results. When the pool
+ * is empty, that refresh is skipped.
  */
 const TEXTURE_LIMIT = 6;
 
@@ -18,15 +18,15 @@ uniform sampler2D uReference;
 out vec4 fragColor;
 
 void main() {
-  // The sizes are compared here as well as by the caller, which knows them
-  // only from the element: that can disagree with the picture actually
-  // uploaded for a moment when the stream changes resolution.
+  // The caller compares sizes taken from the element. Those can briefly differ
+  // from the uploaded picture when the stream changes resolution, so compare
+  // the texture sizes here too. Different sizes count as changed.
   if (textureSize(uTake, 0) != textureSize(uReference, 0)) {
     fragColor = vec4(1.0);
     return;
   }
-  // Every texel is read, so a picture that differs anywhere is seen to differ.
-  // The cells at the right and bottom edges read their last texels again.
+  // Each cell samples every texel it covers, so a change anywhere in the picture is detected.
+  // Edge cells clamp and re-read their last row or column.
   ivec2 last = textureSize(uTake, 0) - 1;
   ivec2 origin = ivec2(gl_FragCoord.xy) * ${BLOCK};
   vec3 difference = vec3(0.0);
@@ -48,7 +48,7 @@ interface Take {
   texture: WebGLTexture;
   width: number;
   height: number;
-  /** Whether the picture differs from the take before it; null until known. */
+  /** Whether the picture differs from the previous take. Null until the result is read. */
   changed: boolean | null;
   fence: WebGLSync | null;
   buffer: ReadbackBuffer | null;
@@ -68,45 +68,45 @@ interface Target {
 }
 
 /**
- * Tells the pictures of a video element apart by looking at them.
+ * Detects new pictures of a video element by comparing them pixel by pixel.
  *
- * Firefox gives no dependable notice of a new picture. The element's current
- * picture is replaced by the media sink on the audio clock, at a moment that
- * has nothing to do with the display's refresh. `mozPaintedFrames` counts
- * what the compositor has painted and trails that moment by up to a refresh,
- * so the picture read when the count goes up may already be the next one,
- * which the next count then delivers again while the picture between is
- * never read. requestVideoFrameCallback() names frames exactly but is not
- * called for every one of them. What can be relied on is the picture itself:
- * texImage2D() reads whichever one is current. Taking it on every refresh and
- * comparing it with the take before finds each picture exactly once, for as
- * long as a picture lasts at least a refresh.
+ * Firefox has no reliable notification of a new picture. The media sink
+ * replaces the element's current picture on the audio clock, independently of
+ * the display refresh. `mozPaintedFrames` counts frames the compositor has
+ * painted and lags that replacement by up to one refresh. The picture read
+ * when the count increases may already be the next one, so the next increase
+ * reads it again, and the picture in between is never read.
+ * requestVideoFrameCallback() identifies frames exactly but is not called for
+ * every frame. The picture itself is reliable: texImage2D() reads whichever
+ * picture is current. Taking it on every refresh and comparing it with the
+ * previous take finds each picture exactly once, as long as each picture lasts
+ * at least one refresh.
  *
- * The comparison runs on the GPU and its result comes back through a pixel
- * buffer behind a fence. Reading it back at once would hold the calling
- * thread until the GPU process had caught up, on every refresh; measured in
- * Firefox that was about 3 ms against 0.3 ms this way. A verdict is therefore
- * known a refresh or more after its take, and the take keeps its texture
- * until then. A new picture hands that texture to the filter: reading the
+ * The comparison runs on the GPU and the result is read back through a pixel
+ * buffer behind a fence. Reading it back immediately would block the calling
+ * thread on every refresh until the GPU process catches up. In Firefox that
+ * costs about 3 ms, against 0.3 ms with the fence. A result is therefore known
+ * one or more refreshes after its take, and the take keeps its texture until
+ * then. A new picture hands that texture to the filter, because reading the
  * element again by then could return a later picture.
  *
- * Two pictures with the same pixels cannot be told apart, and the second is
- * reported as no change.
+ * Two pictures with identical pixels cannot be told apart. The second is
+ * reported as unchanged.
  */
 export class PictureWatch implements Pictures {
   readonly #gl: WebGL2RenderingContext;
   readonly #video: HTMLVideoElement;
   #program: WebGLProgram | null = null;
   #target: Target | null = null;
-  /** Textures free to take the next picture. */
+  /** Textures available for the next take. */
   #textures: WebGLTexture[] = [];
   #created = 0;
-  /** Readback buffers free for the next comparison. */
+  /** Readback buffers available for the next comparison. */
   #buffers: ReadbackBuffer[] = [];
   #cells = new Uint8Array(0);
-  /** Takes in order, from the oldest still held. */
+  /** Takes still held, oldest first. */
   #takes: Take[] = [];
-  /** The newest take, which the next one is compared with. */
+  /** The newest take. The next take is compared with it. */
   #reference: Take | null = null;
   #id = 0;
 
@@ -151,12 +151,12 @@ export class PictureWatch implements Pictures {
       reference.width !== width ||
       reference.height !== height
     ) {
-      // Nothing of the same shape to compare with: it is a new picture.
+      // No reference of the same size to compare with, so this is a new picture.
       take.changed = true;
     } else {
       this.#compare(take, reference);
     }
-    // The take before stays held until its own verdict has been dealt with.
+    // The previous take stays in #takes until it is adopted or released.
     this.#reference = take;
     this.#takes.push(take);
     return take.id;
@@ -165,9 +165,9 @@ export class PictureWatch implements Pictures {
   settle(): { id: number; changed: boolean } | null {
     const gl = this.#gl;
     const take = this.#takes.find((candidate) => !candidate.reported);
-    // The newest take is still read by the comparison that follows it, so it
-    // stays here until that has been issued; its texture cannot go to the
-    // filter, which is free to delete what it owns, while that is pending.
+    // Do not report the newest take. The next take's comparison still has to
+    // read its texture, and a texture adopted by the filter can be deleted
+    // before that comparison is issued.
     if (take === undefined || take === this.#reference) return null;
     if (take.changed === null) {
       const { fence, buffer } = take;
@@ -189,8 +189,8 @@ export class PictureWatch implements Pictures {
   }
 
   /**
-   * Hand the texture of a take to the caller in exchange for one it no longer
-   * needs, which becomes free for a later take.
+   * Give the texture of a reported take to the caller and accept a texture in
+   * exchange. The replacement becomes available for later takes.
    */
   adopt(id: number, replacement: WebGLTexture): WebGLTexture {
     const index = this.#takes.findIndex((take) => take.id === id);
@@ -205,14 +205,14 @@ export class PictureWatch implements Pictures {
   release(id: number): void {
     const index = this.#takes.findIndex((take) => take.id === id);
     const take = this.#takes[index];
-    // An adopted take has already left.
+    // adopt() has already removed it.
     if (take === undefined) return;
     this.#takes.splice(index, 1);
     this.#recycle(take);
   }
 
   reset(): void {
-    // The reference is the newest take, so it is among these.
+    // The reference is the newest take, so it is released with the rest.
     const takes = this.#takes;
     this.#takes = [];
     this.#reference = null;
@@ -235,7 +235,7 @@ export class PictureWatch implements Pictures {
     this.#program = null;
   }
 
-  /** Draw the comparison of a take with the one before it and start its readback. */
+  /** Compare a take with the reference on the GPU and start reading back the result. */
   #compare(take: Take, reference: Take): void {
     const gl = this.#gl;
     const width = Math.ceil(take.width / BLOCK);
@@ -260,7 +260,7 @@ export class PictureWatch implements Pictures {
     gl.flush();
   }
 
-  /** Give back what a comparison held, whether or not it was read. */
+  /** Release the fence and readback buffer of a comparison, whether or not it was read. */
   #finishComparison(take: Take): void {
     const gl = this.#gl;
     if (take.fence !== null) gl.deleteSync(take.fence);
@@ -268,7 +268,7 @@ export class PictureWatch implements Pictures {
     const buffer = take.buffer;
     take.buffer = null;
     if (buffer === null) return;
-    // A buffer sized for an earlier picture is of no use to the next one.
+    // A buffer sized for an earlier picture size cannot be reused.
     const target = this.#target;
     if (target !== null && buffer.bytes === target.width * target.height * 4)
       this.#buffers.push(buffer);
@@ -276,8 +276,9 @@ export class PictureWatch implements Pictures {
   }
 
   /**
-   * Free the texture of a take that has left. By then a later take has
-   * replaced it as the reference, and the comparison that read it is issued.
+   * Return the texture of a removed take to the pool. This is safe because a
+   * later take has replaced it as the reference and the comparison that read
+   * it has been issued.
    */
   #recycle(take: Take): void {
     this.#textures.push(take.texture);
@@ -288,7 +289,7 @@ export class PictureWatch implements Pictures {
     const gl = this.#gl;
     const texture = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, texture);
-    // The same parameters as the filter's own frames: these textures join them.
+    // Same parameters as the filter's frame textures, which these can replace.
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -357,15 +358,15 @@ export class PictureWatch implements Pictures {
     const gl = this.#gl;
     const buffer = gl.createBuffer();
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, buffer);
-    // STREAM_COPY for the reason given in the film detector: Chromium keeps
-    // an unused shadow copy for READ buffers.
+    // As in film-detect.ts, STREAM_COPY avoids the unused shadow copy that
+    // Chromium keeps for READ buffers.
     gl.bufferData(gl.PIXEL_PACK_BUFFER, bytes, gl.STREAM_COPY);
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
     return { buffer, bytes };
   }
 }
 
-/** Whether any cell saw a colour channel differ. Alpha is constant. */
+/** Whether any cell has a nonzero difference in a colour channel. Alpha is constant, so it is not checked. */
 function differs(cells: Uint8Array): boolean {
   for (let index = 0; index < cells.length; index += 4) {
     if (cells[index] !== 0 || cells[index + 1] !== 0 || cells[index + 2] !== 0)

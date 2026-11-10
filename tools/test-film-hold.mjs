@@ -1,6 +1,6 @@
-// Field matching is asked of the filter only for a while after a pulldown
-// cadence was held, on both engines. The detector's readback is scripted; what
-// is checked is when the filter is told to match and which comb counts it is
+// The filter is asked to match fields only for a limited time after a pulldown
+// cadence was held, on both engines. The detector readback is scripted. The
+// test checks when the filter is told to match and which comb counts it is
 // given, not the pictures.
 import assert from "node:assert/strict";
 import {
@@ -13,7 +13,7 @@ import {
 const bundles = await buildBundles(process.cwd());
 const PHASE = 6 * 4;
 const HOLD_FRAMES = 90;
-// No cadence, then one held for two seconds, then lost for good.
+// No cadence, then a cadence held for two seconds, then no cadence again.
 const LOCK_AT = BASE_MS + 2000;
 const LOSS_AT = BASE_MS + 4000;
 
@@ -26,7 +26,7 @@ function scripted() {
   };
 }
 
-/** Frames (by media time) with a filter draw told to match, within a span. */
+/** Media times of the frames drawn with the filter told to match, within a time span. */
 function matchedFrames(draws, from, to) {
   const frames = new Set();
   for (const draw of draws)
@@ -54,7 +54,7 @@ for (const rendering of ["main", "worker"]) {
     0,
     `${rendering}: matched before any cadence was held`,
   );
-  // The page learns of the loss a few frames late; the hold counts from then.
+  // The loss is read back a few frames late, and the hold counts from then.
   const after = matchedFrames(draws, LOSS_AT, Infinity).size;
   assert.ok(
     after >= HOLD_FRAMES - 2 && after <= HOLD_FRAMES + 8,
@@ -72,8 +72,9 @@ for (const rendering of ["main", "worker"]) {
     `${rendering}: reported ${stats.matched} matched frames`,
   );
 
-  // A matched second field reads the counts of the frame after its own: a
-  // comb pass over (its frame, the next), kept apart from the frame's own.
+  // A matched second field reads the comb counts of the next frame: a comb
+  // pass over (its frame, the next frame) that writes to a different target
+  // than the frame's own pass.
   const combs = draws.filter((draw) => draw.comb);
   let checked = 0;
   for (const draw of draws) {
@@ -94,8 +95,8 @@ for (const rendering of ["main", "worker"]) {
   }
   assert.ok(checked >= HOLD_FRAMES - 10, `${rendering}: ${checked} checked`);
 
-  // While the cadence is held the ahead counts are not asked for: no second
-  // field is drawn to read them.
+  // While the cadence is held, the ahead counts are not made because nothing
+  // reads them.
   const heldFrom = LOCK_AT + 500;
   const heldCombs = combs.filter(
     (comb) => comb.t >= heldFrom && comb.t < LOSS_AT,
@@ -108,7 +109,7 @@ for (const rendering of ["main", "worker"]) {
   console.log(`ok ${rendering}: ${after} frames matched after the loss`);
 }
 
-// One picture a frame: its first field is matched, and nothing looks ahead.
+// One picture per frame: its first field is matched and no ahead counts are made.
 {
   const result = await run(bundles, {
     rendering: "main",
@@ -134,16 +135,16 @@ for (const rendering of ["main", "worker"]) {
   console.log(`ok single rate: ${after} frames matched after the loss`);
 }
 
-// Progressive stretches come and go within film (soft telecine), so a short
-// one leaves the rest of the hold; a long one runs it down, and what follows
-// is not matched on the strength of film seen before it.
+// Progressive stretches come and go within film (soft telecine). A short one
+// leaves the rest of the hold. A long one runs it down, so the frames after it
+// are not matched because of film seen before it.
 for (const [frames, expected] of [
   [30, "some"],
   [HOLD_FRAMES + 30, "none"],
 ]) {
   const progressiveMs = frames * FRAME_PERIOD_MS;
-  // The player's timeline says where the stream is progressive, in media
-  // time, which starts at zero here.
+  // The player's timeline gives the progressive stretch in media time, which
+  // starts at zero here.
   const from = (LOSS_AT - BASE_MS) / 1000;
   const to = from + progressiveMs / 1000;
   const timeline = [
@@ -176,8 +177,8 @@ for (const [frames, expected] of [
       `matched ${after} frames after ${frames} progressive`,
     );
   } else {
-    // What the stretch left of the hold, less the frames that refill the
-    // history after it.
+    // The part of the hold the stretch left, minus the frames needed to
+    // refill the history after it.
     assert.ok(
       after >= HOLD_FRAMES - frames - 10 && after <= HOLD_FRAMES - frames,
       `matched ${after} frames after ${frames} progressive`,
@@ -186,12 +187,11 @@ for (const [frames, expected] of [
   console.log(`ok ${frames} progressive frames: ${after} matched after them`);
 }
 
-// Whether the frames hold one instant each is decided on the GPU, so the
-// filter is allowed to act on it whenever the comb counts are those of the
-// frame it is drawing, cadence or no cadence. It weaves from the frame's own
-// fields only, so nothing is counted for the frame after. The detection
-// scores a frame from its comb counts, which therefore have to be made first.
-// With film off there are no counts.
+// The one-instant verdict is decided on the GPU. The filter may act on it
+// whenever the comb counts are those of the frame it is drawing, with or
+// without a cadence. It weaves from the frame's own fields only, so no counts
+// are made for the next frame. The detection scores a frame from its comb
+// counts, so they must be made first. With film off there are no counts.
 for (const rendering of ["main", "worker"]) {
   const result = await run(bundles, {
     rendering,

@@ -47,19 +47,19 @@ import {
  *
  * With `film`, a frame whose pulldown phase `fieldMetrics` (see
  * film-shader.ts) gives is put back together into its film frame instead of
- * filtered; that is never done for a frame's `second` field. `phase` is the
+ * filtered. This is not done for the `second` field of a frame. `phase` is the
  * phase the page expects, for the debug overlay only. `comb` is the detector's
  * count of the combing each way of weaving would leave, block by block (see
  * COMB_FRAGMENT_SHADER), and a block past COMB_BLOCK_PIXELS is filtered
  * instead of woven.
  *
- * With `match`, a line that would be filtered is first looked for in the
- * neighbouring field it may have been captured with: the frame's own other
- * field, or the adjoining field of the frame before (for the first field) or
- * after (for the second). `combAhead` is `comb` for the frame after.
- * `instant` allows the same wherever the detection has found each frame's
- * two fields to be one instant (see INSTANT_ON in film-shader.ts), from the
- * frame's own other field only.
+ * With `match`, a line that would be filtered is first taken from the field
+ * it may have been captured with: the frame's own other field, or the
+ * adjoining field of the frame before (for the first field) or after (for the
+ * second). `combAhead` is `comb` for the frame after. With `instant`, the
+ * line is also taken from the frame's own other field, where the detection
+ * has found the two fields of each frame to be one instant (see INSTANT_ON in
+ * film-shader.ts).
  */
 export const YADIF_UNIFORMS = {
   prev: "uPrev",
@@ -120,7 +120,7 @@ uniform bool uFilm;
 uniform bool uSecond;
 /** Whether a missing line may be taken from a neighbouring field that fits. */
 uniform bool uMatch;
-/** Whether it may where the frames have been found to be one instant each. */
+/** Whether it may come from the frame's own other field where frames are one instant. */
 uniform bool uInstant;
 uniform int uPhase;
 
@@ -297,22 +297,21 @@ bool movingComb(vec3 pixel, int x, int y) {
 /**
  * Take a missing line from the field it was captured with, if there is one.
  *
- * Film keeps arriving as film when its cadence is lost: at a cut made after
- * pulldown the cycle starts again somewhere else, and the phase is unknown
- * until two cycles have gone by. Each field still has a partner from the same
- * film frame all the while, and which one it is can be seen without knowing
- * the phase: the other field of this frame, or the adjoining field of the
- * neighbouring frame -- the second field of the one before for a first
- * field, the first field of the one after for a second. Whichever leaves the
- * block less combed is woven in, and a block neither leaves clean is left to
- * the filter, as it is when a film weave would comb.
+ * A cut made after pulldown restarts the film cycle, and the phase is unknown
+ * until two cycles have passed. Each field still has a partner from the same
+ * film frame, and the partner can be found without knowing the phase. It is
+ * the other field of this frame, or the adjoining field of a neighbouring
+ * frame: the second field of the previous frame for a first field, the first
+ * field of the next frame for a second field. The block is woven from
+ * whichever candidate leaves it less combed. If neither leaves it clean, the
+ * block is left to the filter, as in the film branch.
  *
- * Real video has no such partner, but a block that barely moves can look as
- * if it had one, so the neighbouring frames are looked to only shortly
- * after film (neighbours). Where the frames have been found to hold one
- * instant each the partner is the frame's own other field and nothing else:
- * both fields of a frame then come out as the same whole picture, apart
- * from blocks that comb as the frame stands, which are filtered.
+ * Video has no partner, but a block that barely moves can look as if it had
+ * one. So the neighbouring frames are used only shortly after film
+ * (neighbours). Where the frames are found to hold one instant each, the
+ * partner is always the frame's own other field. Both fields of a frame then
+ * come out as the same picture, except in blocks that are combed as the frame
+ * stands, which are filtered.
  */
 bool matched(int x, int y, bool neighbours, out vec3 rgb) {
   ivec2 block = ivec2(x / ${COMB_BLOCK}, y / ${COMB_BLOCK});
@@ -335,7 +334,7 @@ bool matched(int x, int y, bool neighbours, out vec3 rgb) {
   return true;
 }
 
-/** Whether the detection has settled that both fields of a frame are one instant. */
+/** Whether the detection found the two fields of each frame to be one instant. */
 bool oneInstant() {
   return texelFetch(uFieldMetrics, ivec2(${FIELD_METRICS.instant}, 0), 0)[3] > 0.5;
 }

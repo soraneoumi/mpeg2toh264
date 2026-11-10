@@ -196,13 +196,14 @@ class WebGL2RenderingContext {
       toCanvas: this.#framebuffer === null,
       texture: this.#texture ? this.#texture.id : null,
       picture,
-      // The detector's comb count, with the frames it compared and where the
-      // counts went; and at a filter draw, the texture its ahead counts are
-      // read from.
+      // comb marks the detector's comb-count pass. For it, prev (with the
+      // current frame in picture) are the frames compared and target is the
+      // texture the counts go to. For a filter draw, ahead is the texture the
+      // ahead counts are read from.
       filter: fragment.includes("uParity"),
       comb: fragment.includes("woven += 1.0"),
-      // The detector's last pass, which scores the frame from its comb
-      // counts, and the texture it reads them from.
+      // metrics marks the detector's last pass, which scores the frame from
+      // its comb counts. combInput is the texture it reads them from.
       metrics: fragment.includes("vec4 instant("),
       combInput: this.#textures.get(uniform("uComb"))?.id ?? null,
       prev: this.#textures.get(uniform("uPrev"))?.mediaTime,
@@ -602,7 +603,7 @@ export async function run(bundles, options = {}) {
     readback(realm, texture) {
       readbacks.push({ realm, t: clock.now, ...texture });
     },
-    // What the film detector reads back: nothing unless the test supplies it.
+    // Film detector readback. It writes nothing unless the test supplies filmMetrics.
     metrics(realm, into) {
       filmMetrics?.({ realm, t: clock.now, into });
     },
@@ -827,8 +828,8 @@ export async function run(bundles, options = {}) {
       serve("worker", workerTimeOrigin);
       for (const [name, window] of views)
         serve(name, window.performance.timeOrigin);
-      // A frame every other refresh, unless the test says which refreshes
-      // frames arrive on.
+      // By default a frame arrives every other refresh. `arrival` overrides
+      // this per refresh.
       const arrives = arrival ? arrival(vsync) : vsync % 2 === 0;
       if (!arrives || !deliverFrames) return;
       const index = frameIndex++;

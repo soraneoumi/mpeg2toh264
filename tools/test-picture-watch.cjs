@@ -15,7 +15,7 @@ const transpile = (file) =>
       },
     },
   ).outputText;
-// A data: module cannot resolve "./utils.js", so its code goes in ahead.
+// A data: module cannot resolve "./utils.js", so utils.ts is prepended to the source.
 const source =
   transpile("utils.ts").replace(/^export /gm, "") +
   transpile("picture-watch.ts").replace(/^import .*$/gm, "");
@@ -24,10 +24,10 @@ const modulePromise = import(
 );
 
 /**
- * Enough of WebGL2 to follow what PictureWatch does with its objects. A
- * texture holds the picture uploaded to it, and a comparison is evaluated
- * when it is drawn, so reusing a texture too early shows up as a wrong
- * verdict. Fences signal only after `nextTask()`, as in a browser.
+ * Minimal WebGL2 fake that tracks what PictureWatch does with its objects. A
+ * texture records the picture uploaded to it, and a comparison is evaluated
+ * when it is drawn, so reusing a texture too early gives a wrong result.
+ * Fences signal only after `nextTask()`, as in a browser.
  */
 function fakeGL(video) {
   const constants = Object.fromEntries(
@@ -64,7 +64,7 @@ function fakeGL(video) {
     buffers: new Set(),
     fences: new Set(),
     framebuffers: new Set(),
-    /** Textures that have held a picture, as opposed to a comparison. */
+    /** Textures that have held a video picture, as opposed to a comparison target. */
     pictures: new Set(),
     unit: 0,
     bound: [null, null],
@@ -189,7 +189,7 @@ async function fixture() {
   const video = { picture: 0, videoWidth: 1440, videoHeight: 1080 };
   const { gl, state, nextTask } = fakeGL(video);
   const watch = new PictureWatch(gl, video);
-  /** One refresh: show `picture`, take it, and collect what has settled. */
+  /** One refresh: show `picture`, take it, and collect the settled results. */
   const refresh = (picture) => {
     video.picture = picture;
     nextTask();
@@ -206,7 +206,7 @@ test("each picture is reported changed once, a refresh after its take", async ()
   const f = await fixture();
   const changed = [];
   const ids = new Map();
-  // Two refreshes a picture, the last one held for five.
+  // Each picture lasts two refreshes, except the last, which lasts five.
   for (const picture of [1, 1, 2, 2, 3, 3, 4, 4, 4, 4, 4]) {
     const { id, settled } = f.refresh(picture);
     ids.set(id, picture);
@@ -216,7 +216,7 @@ test("each picture is reported changed once, a refresh after its take", async ()
     }
   }
   assert.deepEqual(changed, [1, 2, 3, 4]);
-  // The newest take and the one before it; released ones are reused.
+  // Two textures are used: the newest take and the previous one. Released textures are reused.
   assert.equal(f.state.pictures.size, 2);
   assert.deepEqual(f.state.errors, []);
 });
@@ -231,15 +231,15 @@ test("an adopted texture holds its take's picture and the exchange keeps the poo
       assert.equal(verdict.changed, true);
       head = 1 - head;
       ring[head] = f.watch.adopt(verdict.id, ring[head]);
-      // The element shows the next picture by now; the texture does not.
+      // The element already shows the next picture, but the texture still holds this one.
       assert.equal(ring[head].picture, picture - 1);
       f.watch.release(verdict.id);
     }
   }
-  // Two made by the watch and the ring's own two, in circulation.
+  // Two textures created by the watch plus the ring's two.
   assert.equal(f.state.pictures.size, 4);
   assert.throws(() => f.watch.adopt(9999, ring[0]), /not available/);
-  // The ring's owner may delete what it holds at any time.
+  // The ring's owner can delete its textures at any time.
   for (const texture of ring) f.gl.deleteTexture(texture);
   f.refresh(41);
   f.refresh(42);
@@ -258,7 +258,7 @@ test("verdicts wait for their fence and takes stop when the pool is full", async
   for (let picture = 1; picture <= 8; picture++) {
     const { id, settled } = f.refresh(picture);
     ids.push(id);
-    // Only the first take needs no comparison.
+    // Only the first take needs no comparison, so it is the only one settled while the fences are unsignaled.
     assert.deepEqual(
       settled.map((verdict) => verdict.id),
       picture === 2 ? [ids[0]] : [],
@@ -268,7 +268,7 @@ test("verdicts wait for their fence and takes stop when the pool is full", async
   assert.equal(f.state.pictures.size, 6);
   f.state.late = false;
   const { id, settled } = f.refresh(9);
-  // Still full on this refresh: the verdicts are collected after the take.
+  // The pool is still full when the take is made. Results are collected after it.
   assert.equal(id, null);
   assert.deepEqual(
     settled.map((verdict) => verdict.id),
@@ -292,12 +292,12 @@ test("a change of size is a new picture and replaces the comparison buffers", as
   assert.deepEqual(release(f.refresh(1).settled), [true]);
   assert.deepEqual(release(f.refresh(1).settled), [false]);
   f.video.videoWidth = 1920;
-  // The same picture value at another size.
+  // Same picture value, different size.
   assert.deepEqual(release(f.refresh(1).settled), [false]);
   assert.deepEqual(release(f.refresh(1).settled), [true]);
   assert.deepEqual(release(f.refresh(1).settled), [false]);
   assert.deepEqual(f.state.errors, []);
-  // One buffer in flight, and none left over from the first size.
+  // At most two buffers remain, all sized for the new picture size.
   assert.ok(f.state.buffers.size <= 2);
   assert.ok(
     [...f.state.buffers].every((buffer) => buffer.bytes === 120 * 68 * 4),

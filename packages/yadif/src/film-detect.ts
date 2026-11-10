@@ -67,15 +67,15 @@ function locate<T extends Record<string, string>>(
  * `texture` is the newest measurements, for the filter to read the phase
  * from without waiting for the page.
  * `measureComb` counts the combing weaving the frame would leave, block by
- * block, into `combTexture`, for the filter to interpolate those blocks. The
- * same count for the frame after it goes into `combAheadTexture` when asked
- * for: its second number is what the first field of that frame leaves between
+ * block, into `combTexture`, for the filter to interpolate those blocks. With
+ * `ahead` it counts the frame after it into `combAheadTexture`. The second
+ * count there is the combing left by weaving that frame's first field between
  * the second-field lines of this one.
  *
  * The measurements of one frame are written from those of the frame before
  * in a single pass, so they live in two textures taken in turns; nothing is
  * copied between passes, and the frame costs three draws and a readback,
- * and one more for each `measureComb`.
+ * and one more draw for each `measureComb` call.
  */
 export class FilmDetector {
   readonly #gl: WebGL2RenderingContext;
@@ -92,7 +92,7 @@ export class FilmDetector {
   #reduced: RenderTarget | null = null;
   /** Combed pixels per block of the frame being filtered, both ways of weaving it. */
   #comb: RenderTarget | null = null;
-  /** The same for the frame after it. */
+  /** Combed pixels per block of the frame after the one being filtered. */
   #combAhead: RenderTarget | null = null;
   /** The field metrics (see FIELD_METRICS) of this frame and the one before. */
   #metrics: [RenderTarget, RenderTarget] | null = null;
@@ -153,7 +153,10 @@ export class FilmDetector {
     return this.#comb?.textures[0] ?? null;
   }
 
-  /** Combed pixels per block of the frame last measured ahead, or null. */
+  /**
+   * Combed pixels per block of the frame last measured with `ahead`, or null
+   * before one has been.
+   */
   get combAheadTexture(): WebGLTexture | null {
     return this.#combAhead?.textures[0] ?? null;
   }
@@ -168,8 +171,8 @@ export class FilmDetector {
 
   /**
    * Forget the measurements: the next frame starts a cycle from nothing.
-   * `keepInstant` leaves the one-instant score as it is, for a gap in the
-   * frames seen that does not mean the content has changed.
+   * `keepInstant` keeps the one-instant score, for a gap in the frames when
+   * the content has not changed.
    */
   reset(keepInstant = false): void {
     const gl = this.#gl;
@@ -202,9 +205,9 @@ export class FilmDetector {
    * next frame are measured; the rest are earlier ones moved along a frame.
    * `first` is the parity of the field that was captured first.
    *
-   * Whether the frame's two fields are one instant is scored in the same
-   * pass, from the comb counts of the frame as it stands: `measureComb` for
-   * this frame has to have run before this.
+   * The same pass scores whether the two fields of a frame are one instant,
+   * from the comb counts of the frame as it stands. `measureComb` for this
+   * frame must have run before this.
    */
   detect(cur: WebGLTexture, next: WebGLTexture, first: number): void {
     const gl = this.#gl;
@@ -243,8 +246,6 @@ export class FilmDetector {
     this.#bind(0, previous.textures[0], this.#metricsLocation.previous);
     this.#bind(1, reduced.textures[0], this.#metricsLocation.second);
     this.#bind(2, reduced.textures[1], this.#metricsLocation.first);
-    // The counts `measureComb` made for this frame, which it has to have
-    // made first.
     this.#bind(3, this.#comb?.textures[0], this.#metricsLocation.comb);
     gl.uniform2i(this.#metricsLocation.size, reduced.width, reduced.height);
     gl.viewport(0, 0, FIELD_METRICS_SIZE, 1);
@@ -269,8 +270,9 @@ export class FilmDetector {
   /**
    * Count the combing each way of weaving `cur`, the frame being filtered,
    * would leave: as it stands, and with `prev`'s second field. `first` is the
-   * parity of the field that was captured first. With `ahead`, the two are
-   * the frame being filtered and the one after it, counted for the latter.
+   * parity of the field that was captured first. With `ahead`, `prev` is the
+   * frame being filtered and `cur` is the one after it, and the counts are
+   * those of `cur`.
    */
   measureComb(
     prev: WebGLTexture,
@@ -297,8 +299,8 @@ export class FilmDetector {
   /**
    * The phase of the last frame measured, once the GPU has handed it back,
    * and null while it is still on its way. It is handed back once.
-   * `instant` is whether the frames up to then were found to hold one
-   * instant each; the filter reads the same from `texture` without waiting.
+   * `instant` is the one-instant verdict as of that frame. The filter reads
+   * the same verdict from `texture` without waiting for the readback.
    */
   poll(): (Phase & { age: number; instant: boolean }) | null {
     const gl = this.#gl;

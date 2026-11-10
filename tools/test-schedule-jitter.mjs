@@ -1,7 +1,7 @@
-// Frames that arrive a refresh early or late must not cost more pictures than
-// they have to. A late frame leaves one refresh with nothing new to show, and
-// that is all: nothing is skipped afterwards to make the time back, and the
-// next late frame costs nothing at all.
+// A frame that arrives a refresh early or late must cost as few pictures as
+// possible. A late frame leaves one refresh with nothing new to show. Nothing
+// is skipped afterwards to recover the time, and the next late frame costs
+// nothing.
 import assert from "node:assert/strict";
 import { buildBundles, presentations, run } from "./yadif-clock-harness.mjs";
 
@@ -9,7 +9,7 @@ const bundles = await buildBundles(process.cwd());
 const repeat = (steps, times) =>
   Array.from({ length: times }, () => steps).flat();
 
-/** Frames arrive on these refreshes: each one `step` refreshes after the last. */
+/** The refreshes on which frames arrive: each frame comes `step` refreshes after the previous one. */
 function arrivals(steps) {
   const at = new Set();
   let vsync = 0;
@@ -21,11 +21,11 @@ function arrivals(steps) {
 }
 
 /**
- * What a run cost. Pictures are numbered in the order they exist: two fields
- * a frame when every field is shown, one picture a frame otherwise. `held` is
- * refreshes with nothing new once playback has settled; `skipped` and
- * `repeated` are counted from the first picture on, so that whatever the
- * start of a chain does shows up as well.
+ * Measure what a run costs. Pictures are numbered in the order they exist:
+ * two per frame when every field is shown, one per frame otherwise. `held`
+ * counts refreshes with nothing new once playback has settled. `skipped` and
+ * `repeated` count from the first picture, so they include whatever the start
+ * of a chain does.
  */
 async function cost(rendering, options, steps) {
   const { on, total } = arrivals(steps);
@@ -51,7 +51,8 @@ async function cost(rendering, options, steps) {
   let previous = null;
   for (let refresh = first; refresh <= last; refresh++) {
     if (!shown.has(refresh)) {
-      // One picture a frame leaves every other refresh without a new one.
+      // With one picture per frame, every other refresh has no new picture,
+      // so held is counted only for fields.
       if (each === 2 && refresh > first + 40) held++;
       continue;
     }
@@ -110,16 +111,16 @@ const cases = [
     1,
     0,
   ],
-  // The chain runs a refresh later than any frame needs; after two seconds
-  // it moves up, which costs the one picture.
+  // The chain runs a refresh later than any frame needs. After two seconds
+  // it moves up, which costs one picture.
   [
     "every frame a refresh earlier from some point on",
     [...repeat(2, 100), 1, ...repeat(2, 200)],
     0,
     1,
   ],
-  // Two refreshes late is a frame that was not there to show: its refreshes
-  // go empty and the chain starts again, with nothing skipped.
+  // A frame two refreshes late leaves its refreshes empty, and the chain
+  // restarts without skipping a picture.
   [
     "one frame two refreshes late",
     [...repeat(2, 100), 4, ...repeat(2, 150)],
@@ -142,7 +143,7 @@ for (const rendering of ["main", "worker"]) {
       assert.ok(got.held <= held, label);
       assert.ok(got.skipped <= skipped, label);
       assert.equal(got.repeated, 0, label);
-      // The start of a chain, and one restart for each thing that happened.
+      // The start of a chain, plus a restart for each event in the case.
       assert.ok(got.resynced <= 3, label);
       console.log(`ok ${label}`);
     }

@@ -21,24 +21,25 @@ export interface FrameMetadata {
   /** Firefox counters supply identity and wall-clock cadence, not a frame PTS. */
   mozTiming?: { periodMs: number; discontinuity: boolean };
   /**
-   * The take that holds this frame's picture, when it was found by watching
-   * the element's pictures. It is adoptable only until the callback returns.
+   * The take that holds this frame's picture. Set when the frame was found by
+   * comparing the element's pictures. It can be adopted only until the
+   * callback returns.
    */
   picture?: number;
 }
 
 /**
- * Takes of the element's current picture, one a refresh, each with a verdict
- * on whether it differs from the take before it. See PictureWatch.
+ * Takes of the element's current picture, one per refresh. Each take has a
+ * result saying whether it differs from the previous take. See PictureWatch.
  */
 export interface Pictures {
-  /** Take the current picture. Null when there is nowhere left to keep one. */
+  /** Take the current picture. Null when no texture is available. */
   take(): number | null;
-  /** The oldest take not yet reported, once its verdict is known. */
+  /** Report the oldest unreported take, once its result is known. */
   settle(): { id: number; changed: boolean } | null;
-  /** Let go of a reported take. Harmless when it has been adopted. */
+  /** Release a reported take. Has no effect if it was already adopted. */
   release(id: number): void;
-  /** Forget every take. */
+  /** Discard every take. */
   reset(): void;
 }
 
@@ -91,20 +92,20 @@ const MEASURE_MS = 250;
 const STALL_MS = 500;
 
 /**
- * How many frame periods must separate two new pictures before the gap is
- * counted as more than one frame. Sampling once a refresh moves an interval
- * by up to a refresh either way, which for a picture lasting two refreshes
- * is half a period; a skipped frame adds a whole one.
+ * Minimum gap between two new pictures, in frame periods, that counts as more
+ * than one frame. Sampling once per refresh shifts an interval by up to one
+ * refresh in either direction. For a picture lasting two refreshes that is
+ * half a period, while a skipped frame adds a whole period.
  */
 const SKIPPED_FRAME_PERIODS = 1.75;
 
-/** Unchanged takes in a row after which an element at rest is left alone. */
+/** Consecutive unchanged takes after which taking stops while the element is at rest. */
 const SETTLED_STILLS = 3;
 
 /**
- * How much media time may pass before a picture that is not changing is
- * delivered anyway during playback, in milliseconds. Well inside the half
- * second after which the renderer takes a frame for a jump in the stream.
+ * Media time, in milliseconds, after which an unchanged picture is delivered
+ * anyway during playback. Well below the half second after which the renderer
+ * treats a frame as a jump in the stream.
  */
 const STILL_REFRESH_MS = 200;
 
@@ -112,14 +113,15 @@ const STILL_REFRESH_MS = 200;
  * One outstanding, cancellable frame request. Prefer Firefox's counters even
  * when native rVFC exists: its notifications/mediaTime can advance in 40 ms
  * steps. Parsed/decoded frames include read-ahead, and presented frames are
- * accounted by the media sink separately from painting, so of the counters
- * only painted is followed; OR-ing them would ingest one picture repeatedly.
+ * accounted by the media sink separately from painting. Only the painted
+ * count is followed, because OR-ing the counters would ingest one picture
+ * repeatedly.
  *
- * The painted count says that there are new pictures and how often, but not
- * which picture the element holds when it is read: the two are out of step
- * by up to a refresh. Where the renderer can watch the pictures themselves
- * (`pictures`), that decides what is a new frame and the count only measures
- * the cadence. Without it, the count is all there is.
+ * The painted count shows that there are new pictures and how often, but not
+ * which picture the element holds when it is read. The two can be out of step
+ * by up to one refresh. When a PictureWatch is available (`pictures`), it
+ * decides which frames are new and the painted count only measures the
+ * cadence. Without one, the painted count alone decides.
  *
  * https://searchfox.org/firefox-main/source/dom/media/mediaelement/HTMLVideoElement.cpp
  */
@@ -128,24 +130,24 @@ export class VideoFrames {
   readonly #takeFrame: (() => VideoFrame | null | undefined) | undefined;
   readonly #moz: MozVideo | null;
   readonly #pictures: (() => Pictures | null) | undefined;
-  /** The watch the takes below belong to. */
+  /** The watch that owns the takes in #taken. */
   #watch: Pictures | null = null;
-  /** Takes awaiting their verdict, oldest first. */
+  /** Takes whose results are pending, oldest first. */
   #taken: {
     id: number;
     at: number;
     mediaTime: number;
     width: number;
     height: number;
-    /** Taken while the element was paused or ended. */
+    /** Whether the element was paused or ended when the take was made. */
     resting: boolean;
   }[] = [];
-  /** Frames counted on the watched path, standing in for `presentedFrames`. */
+  /** Frame count on the picture-watching path, reported as `presentedFrames`. */
   #frames = 0;
   #polledAt: number | null = null;
-  /** Unchanged verdicts in a row on takes made at rest. */
+  /** Consecutive unchanged results for takes made at rest. */
   #stills = 0;
-  /** When the take last delivered was made, and the painted count then. */
+  /** When the last delivered take was made, and the painted count when it was delivered. */
   #deliveredAt: number | null = null;
   #paintedAtFrame: number | null = null;
   #handle: number | null = null;
@@ -174,8 +176,9 @@ export class VideoFrames {
     video: HTMLVideoElement,
     takeFrame?: () => VideoFrame | null | undefined,
     /**
-     * The watch to find Firefox's new pictures with, asked on every poll
-     * because the renderer that owns it can change; null while there is none.
+     * Returns the PictureWatch used to find Firefox's new pictures, or null
+     * when there is none. Called on every poll because the renderer that owns
+     * the watch can change.
      */
     pictures?: () => Pictures | null,
   ) {
@@ -184,7 +187,7 @@ export class VideoFrames {
     this.#pictures = pictures;
     this.#moz = hasMozFrames(video) ? video : null;
     // Firefox 156 reports VideoFrame(video).timestamp in integer seconds, so
-    // captures cannot identify distinct pictures there at any playback rate.
+    // captures cannot identify distinct pictures at any playback rate.
     this.#canCapture = this.#moz === null && typeof VideoFrame !== "undefined";
     this.#capture = this.#canCapture && video.playbackRate > 1;
     if (this.#moz) {
@@ -438,7 +441,7 @@ export class VideoFrames {
     this.#resetTiming();
   };
 
-  /** Drop the takes in hand; the next one starts with nothing to compare to. */
+  /** Discard all takes. The next take has no reference to compare with. */
   #forgetTakes(): void {
     this.#watch?.reset();
     this.#taken = [];
@@ -471,8 +474,8 @@ export class VideoFrames {
     this.#counters = counters;
     const watch = this.#pictures?.() ?? null;
     if (watch !== this.#watch) {
-      // Takes are textures of the renderer that made them, and the counted
-      // path keeps a different idea of the last picture seen.
+      // Takes are textures owned by the renderer that made them, and the
+      // counter path tracks the last picture differently.
       this.#reset();
       this.#watch = watch;
     }
@@ -525,7 +528,7 @@ export class VideoFrames {
     }
   };
 
-  /** Fold the painted count into the cadence, on a poll that saw it advance. */
+  /** Update the cadence estimate from the painted count. Called on a poll where the count advanced. */
   #measurePeriod(now: number, video: MozVideo): void {
     if (video.paused || video.ended) return;
     const painted = video.mozPaintedFrames;
@@ -546,9 +549,9 @@ export class VideoFrames {
   }
 
   /**
-   * The poll where the pictures themselves say what is new. Every refresh
-   * takes the element's picture; a take is delivered once its verdict is in,
-   * which is a refresh or more after it was made.
+   * Poll that finds new frames by comparing pictures. Every refresh takes the
+   * element's picture. A take is delivered once its result is known, one or
+   * more refreshes after it was made.
    */
   #pollPictures(
     now: number,
@@ -559,8 +562,8 @@ export class VideoFrames {
   ): void {
     const painted = video.mozPaintedFrames;
     const paintedMoved = this.#painted !== null && painted !== this.#painted;
-    // Polling stopped for a while, as in a background tab: the takes in hand
-    // belong to a moment playback has left.
+    // Polling stopped for a while, for example in a background tab. The
+    // pending takes belong to an earlier playback position, so discard them.
     if (this.#polledAt !== null && now - this.#polledAt > STALL_MS) {
       this.#forgetTakes();
       this.#resetTiming();
@@ -570,13 +573,13 @@ export class VideoFrames {
     if (paintedMoved) this.#measurePeriod(now, video);
     const resting = video.paused || video.ended;
     if (!resting || paintedMoved) this.#stills = 0;
-    // Time at rest is not time a still scene has been playing for.
+    // Time at rest is not playback time of a still scene.
     if (resting && this.#deliveredAt !== null) this.#deliveredAt = now;
-    // An element at rest keeps its picture until a seek or a paint says
-    // otherwise, so once the takes agree there is nothing more to upload.
+    // An element at rest keeps its picture until a seek or a paint changes it,
+    // so once enough takes are unchanged there is nothing more to upload.
     const settled = resting && this.#stills >= SETTLED_STILLS;
-    // Taking starts on the same condition the counted path accepts its first
-    // frame on, and continues for as long as the element can be read.
+    // Start taking under the same condition as the counter path's first frame,
+    // and keep taking while the element can be read.
     if (ready && (first || this.#painted !== null)) {
       this.#painted = painted;
       const id = settled ? null : watch.take();
@@ -590,10 +593,10 @@ export class VideoFrames {
           resting,
         });
     }
-    // Normally one verdict is ready, for the take before this one. When more
-    // have come in together the newest picture among them is the frame: the
-    // older ones are already late, and keeping them would leave every later
-    // frame as far behind.
+    // Normally one result is ready, for the previous take. When several arrive
+    // together, the newest changed picture among them is the frame. The older
+    // ones are already late, and delivering them would keep every later frame
+    // equally late.
     let found = null;
     for (
       let verdict = watch.settle();
@@ -608,10 +611,11 @@ export class VideoFrames {
         this.#stills = 0;
       } else {
         this.#stills = taken.resting ? this.#stills + 1 : 0;
-        // Frames with the same pixels look like no frame at all. While the
-        // compositor is still painting, hand one over now and then: left to
-        // itself the renderer takes the first frame after a long still for
-        // a jump in the stream and throws its history away.
+        // A frame with the same pixels as the previous one is reported as
+        // unchanged and looks like no frame. While the compositor is still
+        // painting, deliver one periodically anyway. Otherwise the renderer
+        // treats the first frame after a long still as a jump in the stream
+        // and discards its history.
         frame =
           found === null &&
           !taken.resting &&
@@ -641,8 +645,8 @@ export class VideoFrames {
         this.#periodMs > 0 &&
         elapsed > this.#periodMs * SKIPPED_FRAME_PERIODS
       ) {
-        // The frames between were never seen: gone by between two refreshes,
-        // or the same pixels as the frame before them.
+        // The frames in between were not seen. They were shown and replaced
+        // between two refreshes, or had the same pixels as the previous frame.
         frames = Math.round(elapsed / this.#periodMs);
       }
     }
@@ -656,12 +660,12 @@ export class VideoFrames {
       this.#deliver(now, {
         width: found.width,
         height: found.height,
-        // As on the counted path, this only places the frame on the media
-        // timeline; it is the clock's value when the picture was taken.
+        // As on the counter path, this only places the frame on the media
+        // timeline. It is the clock value when the picture was taken.
         mediaTime: found.mediaTime,
         presentedFrames: this.#frames,
-        // The picture is in hand now, not when it was taken, and the
-        // schedule is anchored to when a frame is handed over.
+        // The picture is delivered now, not when it was taken, and the
+        // schedule is anchored to the delivery time.
         expectedDisplayTime: now,
         timeOrigin: performance.timeOrigin,
         mozTiming: { periodMs: this.#periodMs, discontinuity },
