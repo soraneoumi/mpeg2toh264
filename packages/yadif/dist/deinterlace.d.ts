@@ -82,6 +82,14 @@ export interface DeinterlaceStats {
     /** Whether 2:3 pulldown has been detected and the frames are shown at 24p. */
     film: boolean;
     /**
+     * Frames filtered, with no cadence held, while a field was allowed to be
+     * woven with a neighbouring field that fits: the frames shortly after a
+     * cadence was lost. Blocks with no such partner are interpolated all the
+     * same, so on video inside that window this counts frames nothing was
+     * woven in.
+     */
+    matched: number;
+    /**
      * Why requested film reconstruction is currently unavailable, or null
      * while healthy. The requesting option (`film`) stays as the
      * caller set it -- intent is preserved -- while pictures continue through

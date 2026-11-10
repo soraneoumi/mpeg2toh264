@@ -15,12 +15,15 @@ export declare const NO_PHASE: Phase;
  * `texture` is the newest measurements, for the filter to read the phase
  * from without waiting for the page.
  * `measureComb` counts the combing weaving the frame would leave, block by
- * block, into `combTexture`, for the filter to interpolate those blocks.
+ * block, into `combTexture`, for the filter to interpolate those blocks. The
+ * same count for the frame after it goes into `combAheadTexture` when asked
+ * for: its second number is what the first field of that frame leaves between
+ * the second-field lines of this one.
  *
  * The measurements of one frame are written from those of the frame before
  * in a single pass, so they live in two textures taken in turns; nothing is
  * copied between passes, and the frame costs three draws and a readback,
- * and one more for `measureComb`.
+ * and one more for each `measureComb`.
  */
 export declare class FilmDetector {
     #private;
@@ -34,6 +37,8 @@ export declare class FilmDetector {
      * null before one has been. See COMB_FRAGMENT_SHADER.
      */
     get combTexture(): WebGLTexture | null;
+    /** Combed pixels per block of the frame last measured ahead, or null. */
+    get combAheadTexture(): WebGLTexture | null;
     /** The size of the frames to be measured, which sizes the block grid. */
     resize(width: number, height: number): void;
     /** Forget every measurement: the next frame starts a cycle from nothing. */
@@ -48,9 +53,10 @@ export declare class FilmDetector {
     /**
      * Count the combing each way of weaving `cur`, the frame being filtered,
      * would leave: as it stands, and with `prev`'s second field. `first` is the
-     * parity of the field that was captured first.
+     * parity of the field that was captured first. With `ahead`, the two are
+     * the frame being filtered and the one after it, counted for the latter.
      */
-    measureComb(prev: WebGLTexture, cur: WebGLTexture, first: number): void;
+    measureComb(prev: WebGLTexture, cur: WebGLTexture, first: number, ahead?: boolean): void;
     /**
      * The phase of the last frame measured, once the GPU has handed it back,
      * and null while it is still on its way. It is handed back once.

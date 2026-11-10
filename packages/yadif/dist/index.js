@@ -1,11 +1,11 @@
-const ae = "" + new URL("assets/worker-CyLZgZN-.js", import.meta.url).href, _ = `#version 300 es
+const le = "" + new URL("assets/worker-D15SyVxv.js", import.meta.url).href, M = `#version 300 es
 void main() {
   // From the vertex index alone. There is no geometry here worth a buffer.
   vec2 corner = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
   gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);
 }
 `;
-function R(n, e, t) {
+function _(n, e, t) {
   const i = n.createProgram(), s = H(n, n.VERTEX_SHADER, t), r = H(n, n.FRAGMENT_SHADER, e);
   if (n.attachShader(i, s), n.attachShader(i, r), n.linkProgram(i), n.deleteShader(s), n.deleteShader(r), !n.getProgramParameter(i, n.LINK_STATUS)) {
     const o = n.getProgramInfoLog(i);
@@ -26,7 +26,7 @@ function H(n, e, t) {
   }
   return i;
 }
-const le = `#version 300 es
+const ue = `#version 300 es
 precision highp float;
 uniform sampler2D uTexture;
 in vec2 vTextureCoord;
@@ -38,7 +38,7 @@ void main() {
   float a = texture(uTexture, vTextureCoord)[3];
   fragColor = vec4(uTextColor * a + uBackColor * (1.0 - a), 1.0);
 }
-`, ue = `#version 300 es
+`, ce = `#version 300 es
 precision highp float;
 in vec4 aVertexPosition;
 in vec2 aTextureCoord;
@@ -52,8 +52,8 @@ void main() {
   vTextureCoord = vec2(uUvMatrix * vec3(aTextureCoord, 1.0));
 }
 `;
-function ce(n, e) {
-  const t = R(n, le, ue), i = n.getAttribLocation(t, "aVertexPosition"), s = n.getAttribLocation(t, "aTextureCoord"), r = n.getUniformLocation(t, "uTexture"), o = n.getUniformLocation(t, "uMatrix"), h = n.getUniformLocation(t, "uUvMatrix"), a = n.getUniformLocation(t, "uTextColor"), c = n.getUniformLocation(t, "uBackColor");
+function fe(n, e) {
+  const t = _(n, ue, ce), i = n.getAttribLocation(t, "aVertexPosition"), s = n.getAttribLocation(t, "aTextureCoord"), r = n.getUniformLocation(t, "uTexture"), o = n.getUniformLocation(t, "uMatrix"), h = n.getUniformLocation(t, "uUvMatrix"), a = n.getUniformLocation(t, "uTextColor"), c = n.getUniformLocation(t, "uBackColor");
   if (r == null || o == null || h == null || a == null || c == null)
     throw new Error(
       "failed to initialize DEBUG_FRAGMENT_SHADER, DEBUG_VERTEX_SHADER"
@@ -61,7 +61,7 @@ function ce(n, e) {
   const A = n.createBuffer(), f = n.createBuffer();
   return {
     gl: n,
-    ...fe(n, e),
+    ...de(n, e),
     program: t,
     programUniforms: {
       vertex: i,
@@ -76,7 +76,7 @@ function ce(n, e) {
     textureBuffer: f
   };
 }
-function fe(n, e) {
+function de(n, e) {
   const t = new OffscreenCanvas(0, 0), i = t.getContext("2d"), s = /* @__PURE__ */ new Map();
   let r = 0;
   const o = 0;
@@ -106,11 +106,11 @@ function fe(n, e) {
   const a = n.createTexture();
   return n.bindTexture(n.TEXTURE_2D, a), n.texParameteri(n.TEXTURE_2D, n.TEXTURE_MIN_FILTER, n.LINEAR), n.texParameteri(n.TEXTURE_2D, n.TEXTURE_MAG_FILTER, n.LINEAR), n.texParameteri(n.TEXTURE_2D, n.TEXTURE_WRAP_S, n.CLAMP_TO_EDGE), n.texParameteri(n.TEXTURE_2D, n.TEXTURE_WRAP_T, n.CLAMP_TO_EDGE), n.texImage2D(n.TEXTURE_2D, 0, n.RGBA, n.RGBA, n.UNSIGNED_BYTE, t), { fontTexture: a, chars: s, textureSize: { width: r, height: h } };
 }
-function de(n) {
+function me(n) {
   const e = n.gl;
   e.deleteBuffer(n.positionBuffer), e.deleteBuffer(n.textureBuffer), e.deleteTexture(n.fontTexture), e.deleteProgram(n.program);
 }
-function me(n, e, t, i, s, r, o) {
+function pe(n, e, t, i, s, r, o) {
   const h = [], a = [], c = t;
   for (const m of e) {
     if (m === `
@@ -125,8 +125,8 @@ function me(n, e, t, i, s, r, o) {
       t += u.metrics.width;
       continue;
     }
-    const l = Math.floor(t - u.metrics.actualBoundingBoxLeft), d = Math.floor(i - u.metrics.actualBoundingBoxAscent), E = l + u.width, v = d + u.height;
-    h.push(l, d), a.push(u.x, u.y), h.push(l, v), a.push(u.x, u.y + u.height), h.push(l + u.width, v), a.push(u.x + u.width, u.y + u.height), h.push(E, v), a.push(u.x + u.width, u.y + u.height), h.push(l, d), a.push(u.x, u.y), h.push(E, d), a.push(u.x + u.width, u.y), t += u.metrics.width;
+    const l = Math.floor(t - u.metrics.actualBoundingBoxLeft), d = Math.floor(i - u.metrics.actualBoundingBoxAscent), p = l + u.width, v = d + u.height;
+    h.push(l, d), a.push(u.x, u.y), h.push(l, v), a.push(u.x, u.y + u.height), h.push(l + u.width, v), a.push(u.x + u.width, u.y + u.height), h.push(p, v), a.push(u.x + u.width, u.y + u.height), h.push(l, d), a.push(u.x, u.y), h.push(p, d), a.push(u.x + u.width, u.y), t += u.metrics.width;
   }
   const A = n.gl;
   A.useProgram(n.program), A.bindBuffer(A.ARRAY_BUFFER, n.positionBuffer), A.bufferData(A.ARRAY_BUFFER, new Float32Array(h), A.STATIC_DRAW), A.vertexAttribPointer(
@@ -150,9 +150,9 @@ function me(n, e, t, i, s, r, o) {
   ), A.enableVertexAttribArray(n.programUniforms.textureCoord), A.activeTexture(A.TEXTURE0), A.bindTexture(A.TEXTURE_2D, n.fontTexture), A.uniform1i(n.programUniforms.texture, 0), A.uniform3fv(n.programUniforms.textColor, [1, 1, 1]), A.uniform3fv(n.programUniforms.backColor, [0, 0, 0]);
   function f(m, u, l) {
     const d = [];
-    for (let E = 0; E < u; E++)
+    for (let p = 0; p < u; p++)
       for (let v = 0; v < m; v++)
-        d.push(l[v * m + E]);
+        d.push(l[v * m + p]);
     return d;
   }
   A.uniformMatrix4fv(n.programUniforms.matrix, !1, f(4, 4, [
@@ -184,7 +184,7 @@ function me(n, e, t, i, s, r, o) {
     1
   ])), A.viewport(0, 0, s, r), A.enable(A.BLEND), A.blendFunc(A.SRC_ALPHA, A.ONE_MINUS_SRC_ALPHA), A.drawArrays(A.TRIANGLES, 0, h.length / 2), A.disable(A.BLEND);
 }
-const p = {
+const E = {
   /** This frame's first field is the previous frame's first field. */
   firstRepeatsPrevious: 0,
   /** This frame's second field is the next frame's second field. */
@@ -198,13 +198,13 @@ const p = {
   /** The previous frame's first field was the one before's. */
   previousFirstRepeated: 5,
   phase: 6
-}, g = 7, ie = 2, O = 1, pe = 2, W = 10, Ee = {
+}, x = 7, se = 2, O = 1, Ee = 2, W = 10, ve = {
   a: "uA",
   b: "uB",
   fieldMetrics: "uFieldMetrics",
   first: "uFirst",
   size: "uSize"
-}, se = 16, re = 8, ve = `#version 300 es
+}, re = 16, ne = 8, be = `#version 300 es
 
 precision highp float;
 
@@ -232,8 +232,8 @@ vec4 measure(float diff, float total, float threshold)
 
 void main()
 {
-  const int BLOCK_W = ${se};
-  const int BLOCK_H = ${re};
+  const int BLOCK_W = ${re};
+  const int BLOCK_H = ${ne};
 
   ivec2 block = ivec2(gl_FragCoord.xy);
   ivec2 base = ivec2(block.x * BLOCK_W, block.y * BLOCK_H * 2);
@@ -267,7 +267,7 @@ void main()
     }
   }
 
-  float run = texelFetch(uFieldMetrics, ivec2(${p.phase}, 0), 0)[1];
+  float run = texelFetch(uFieldMetrics, ivec2(${E.phase}, 0), 0)[1];
   float threshold = run == 0.0 ? 0.025 : (run <= 10.0 ? 0.11 : 0.15);
 
   vec4 even = measure(diffEven, float(totalEven), threshold);
@@ -275,11 +275,11 @@ void main()
   outFirst = uFirst == 0 ? even : odd;
   outSecond = uFirst == 0 ? odd : even;
 }
-`, be = {
+`, ge = {
   second: "uSecond",
   first: "uFirst",
   size: "uSize"
-}, S = 8, ge = `#version 300 es
+}, S = 8, xe = `#version 300 es
 precision highp float;
 
 uniform sampler2D uSecond;
@@ -316,12 +316,12 @@ void main()
   outSecond = second;
   outFirst = first;
 }
-`, xe = {
+`, we = {
   previous: "uPrevious",
   second: "uSecond",
   first: "uFirst",
   size: "uSize"
-}, we = `#version 300 es
+}, Te = `#version 300 es
 precision highp float;
 
 uniform sampler2D uPrevious;
@@ -351,7 +351,7 @@ vec4 fold(sampler2D reduced) {
 }
 
 bool same(float differing) {
-  return differing <= ${ie}.0;
+  return differing <= ${se}.0;
 }
 
 // A repeated field changes less than the opposite field.
@@ -427,31 +427,31 @@ void main()
   int metric = int(gl_FragCoord.x);
   // The comparisons against the next frame become, a frame later, the ones
   // against the previous frame, and those the ones before.
-  if (metric == ${p.firstRepeatsPrevious}) {
-    outValue = previous(${p.firstRepeatsNext});
-  } else if (metric == ${p.secondRepeatsNext}) {
+  if (metric == ${E.firstRepeatsPrevious}) {
+    outValue = previous(${E.firstRepeatsNext});
+  } else if (metric == ${E.secondRepeatsNext}) {
     outValue = fold(uSecond);
-  } else if (metric == ${p.secondRepeatsPrevious}) {
-    outValue = previous(${p.secondRepeatsNext});
-  } else if (metric == ${p.previousSecondRepeated}) {
-    outValue = previous(${p.secondRepeatsPrevious});
-  } else if (metric == ${p.firstRepeatsNext}) {
+  } else if (metric == ${E.secondRepeatsPrevious}) {
+    outValue = previous(${E.secondRepeatsNext});
+  } else if (metric == ${E.previousSecondRepeated}) {
+    outValue = previous(${E.secondRepeatsPrevious});
+  } else if (metric == ${E.firstRepeatsNext}) {
     outValue = fold(uFirst);
-  } else if (metric == ${p.previousFirstRepeated}) {
-    outValue = previous(${p.firstRepeatsPrevious});
+  } else if (metric == ${E.previousFirstRepeated}) {
+    outValue = previous(${E.firstRepeatsPrevious});
   } else {
     outValue = decide(
-      previous(${p.phase}),
-      previous(${p.firstRepeatsNext}),
+      previous(${E.phase}),
+      previous(${E.firstRepeatsNext}),
       fold(uSecond),
-      previous(${p.secondRepeatsNext}),
-      previous(${p.secondRepeatsPrevious}),
+      previous(${E.secondRepeatsNext}),
+      previous(${E.secondRepeatsPrevious}),
       fold(uFirst),
-      previous(${p.firstRepeatsPrevious})
+      previous(${E.firstRepeatsPrevious})
     );
   }
 }
-`, y = 16, Te = 8, ye = {
+`, b = 16, V = 8, ye = {
   prev: "uPrev",
   cur: "uCur",
   first: "uFirst",
@@ -486,13 +486,13 @@ bool combed(float above2, float above, float pixel, float below, float below2) {
 void main() {
   // Block rows count from the top of the frame, as the filter reads them.
   ivec2 block = ivec2(gl_FragCoord.xy);
-  ivec2 base = block * ${y};
+  ivec2 base = block * ${b};
   float standing = 0.0;
   float woven = 0.0;
-  for (int dy = 0; dy < ${y}; ++dy) {
+  for (int dy = 0; dy < ${b}; ++dy) {
     int y = base.y + dy;
     if (y >= uSize.y || (y & 1) == uFirst) continue;
-    for (int dx = 0; dx < ${y}; ++dx) {
+    for (int dx = 0; dx < ${b}; ++dx) {
       int x = base.x + dx;
       if (x >= uSize.x) break;
       float current = luma(uCur, x, y);
@@ -523,7 +523,9 @@ void main() {
   second: "uSecond",
   phase: "uPhase",
   fieldMetrics: "uFieldMetrics",
-  comb: "uComb"
+  comb: "uComb",
+  combAhead: "uCombAhead",
+  match: "uMatch"
 }, De = `#version 300 es
 precision highp float;
 precision highp int;
@@ -533,6 +535,7 @@ uniform sampler2D uCur;
 uniform sampler2D uNext;
 uniform sampler2D uFieldMetrics;
 uniform sampler2D uComb;
+uniform sampler2D uCombAhead;
 /** The size of a frame in texels. */
 uniform ivec2 uSize;
 /** The parity of the lines that are kept; the others are interpolated. */
@@ -544,6 +547,8 @@ uniform bool uSpatialCheck;
 uniform bool uDebug;
 uniform bool uFilm;
 uniform bool uSecond;
+/** Whether a missing line may be taken from a neighbouring field that fits. */
+uniform bool uMatch;
 uniform int uPhase;
 
 out vec4 fragColor;
@@ -687,18 +692,18 @@ int firstParity() {
 }
 
 bool same(int metric) {
-  return texelFetch(uFieldMetrics, ivec2(metric, 0), 0)[1] <= ${ie}.0;
+  return texelFetch(uFieldMetrics, ivec2(metric, 0), 0)[1] <= ${se}.0;
 }
 
 /** The pulldown phase the detection gave this frame, or 0. See film-shader.ts. */
 int detectedPhase() {
-  vec4 phase = texelFetch(uFieldMetrics, ivec2(${p.phase}, 0), 0);
+  vec4 phase = texelFetch(uFieldMetrics, ivec2(${E.phase}, 0), 0);
   // Deinterlace each field normally until the cadence is confirmed.
   return phase[1] >= ${W}.0 ? int(phase[0]) : 0;
 }
 
 bool isMixedPhase(int phase) {
-  return phase == ${O} || phase == ${pe};
+  return phase == ${O} || phase == ${Ee};
 }
 
 /** Detect new combing in phase 4, whose cadence is inferred from previous repeats. */
@@ -714,6 +719,38 @@ bool movingComb(vec3 pixel, int x, int y) {
   vec3 previousComb = max(min(previousAbove, previousBelow) - previous,
                           previous - max(previousAbove, previousBelow));
   return any(greaterThan(comb, max(previousComb, vec3(0.0)) + vec3(8.0 / 255.0)));
+}
+
+/**
+ * Take a missing line from the field it was captured with, if there is one.
+ *
+ * Film keeps arriving as film when its cadence is lost: at a cut made after
+ * pulldown the cycle starts again somewhere else, and the phase is unknown
+ * until two cycles have gone by. Each field still has a partner from the same
+ * film frame all the while, and which one it is can be seen without knowing
+ * the phase: the other field of this frame, or the adjoining field of the
+ * neighbouring frame -- the second field of the one before for a first
+ * field, the first field of the one after for a second. Whichever leaves the
+ * block less combed is woven in, and a block neither leaves clean is left to
+ * the filter, as it is when a film weave would comb.
+ *
+ * Real video has no such partner, but a block that barely moves can look as
+ * if it had one, so the caller asks for this only shortly after film.
+ */
+bool matched(int x, int y, out vec3 rgb) {
+  ivec2 block = ivec2(x / ${b}, y / ${b});
+  float standing = texelFetch(uComb, block, 0)[0];
+  float adjoining = uSecond ? texelFetch(uCombAhead, block, 0)[1]
+                            : texelFetch(uComb, block, 0)[1];
+  if (min(standing, adjoining) > ${V}.0) return false;
+  if (standing <= adjoining) {
+    rgb = texelFetch(uCur, ivec2(x, y), 0).rgb;
+  } else if (uSecond) {
+    rgb = texelFetch(uNext, ivec2(x, y), 0).rgb;
+  } else {
+    rgb = texelFetch(uPrev, ivec2(x, y), 0).rgb;
+  }
+  return true;
 }
 
 const int DEBUG_BAR_CELL = 32;
@@ -766,13 +803,15 @@ void main() {
       : texelFetch(uCur, ivec2(x, y), 0).rgb;
     // A block the weave would leave combed -- a cut, a fade or a telop that
     // does not follow the cadence -- is filtered like video instead.
-    vec4 comb = texelFetch(uComb, ivec2(x / ${y}, y / ${y}), 0);
-    bool combedBlock = (mixed ? comb[1] : comb[0]) > ${Te}.0;
+    vec4 comb = texelFetch(uComb, ivec2(x / ${b}, y / ${b}), 0);
+    bool combedBlock = (mixed ? comb[1] : comb[0]) > ${V}.0;
     if ((y & 1) != uParity &&
         (combedBlock || (detectedPhase() == 4 && movingComb(rgb, x, y))))
       rgb = filterPixel(uPrev, uCur, x, y);
   } else if ((y & 1) == uParity) {
     rgb = texelFetch(uCur, ivec2(x, y), 0).rgb;
+  } else if (uMatch && matched(x, y, rgb)) {
+    // Woven from the field that fits.
   } else if ((uParity ^ uTff) != 0) {
     // The first field of the frame: the moment it holds sits between the
     // previous frame and the second field of this one.
@@ -782,7 +821,7 @@ void main() {
   }
   fragColor = vec4(rgb, 1.0);
 }
-`, x = { phase: 0, run: 0 };
+`, w = { phase: 0, run: 0 };
 function C(n, e, t) {
   return Object.fromEntries(
     Object.entries(t).map(([i, s]) => [
@@ -791,60 +830,62 @@ function C(n, e, t) {
     ])
   );
 }
-class V {
+class $ {
   #t;
   #i;
   #e;
-  #n;
-  #u;
-  #o;
-  #s;
+  #h;
+  #f;
   #A;
-  #c;
+  #s;
+  #o;
+  #d;
   /** The block comparisons of both fields, and the same folded most of the way. */
   #r = null;
   #T = null;
   /** Combed pixels per block of the frame being filtered, both ways of weaving it. */
   #v = null;
+  /** The same for the frame after it. */
+  #E = null;
   /** The field metrics (see FIELD_METRICS) of this frame and the one before. */
-  #p = null;
+  #u = null;
   /** Which of the two holds the newest metrics. */
-  #E = 0;
+  #c = 0;
   /** The metrics being read back asynchronously. */
   #a = null;
-  #l = null;
-  #h = 0;
-  #f = 0;
+  #n = null;
+  #l = 0;
+  #b = 0;
   /** The last metrics read back, laid out as FIELD_METRICS says. */
-  metrics = new Float32Array(g * 4);
-  #d = 0;
+  metrics = new Float32Array(x * 4);
   #F = 0;
+  #m = 0;
   constructor(e) {
-    this.#t = e, this.#i = R(
+    this.#t = e, this.#i = _(
       e,
-      ve,
-      _
+      be,
+      M
     ), this.#e = C(
       e,
       this.#i,
-      Ee
-    ), this.#n = R(
+      ve
+    ), this.#h = _(
       e,
-      ge,
-      _
-    ), this.#u = C(
+      xe,
+      M
+    ), this.#f = C(
       e,
-      this.#n,
-      be
-    ), this.#o = R(
+      this.#h,
+      ge
+    ), this.#A = _(
       e,
-      we,
-      _
-    ), this.#s = C(e, this.#o, xe), this.#A = R(e, Fe, _), this.#c = C(e, this.#A, ye);
+      Te,
+      M
+    ), this.#s = C(e, this.#A, we), this.#o = _(e, Fe, M), this.#d = C(e, this.#o, ye);
   }
   /** The newest measurements, or null before any frame has been measured. */
   get texture() {
-    return this.#p?.[this.#E]?.textures[0] ?? null;
+    return this.#u?.[this.#c]?.textures[0] ?? null;
   }
   /**
    * Combed pixels per block of the frame last measured by `measureComb`, or
@@ -853,25 +894,29 @@ class V {
   get combTexture() {
     return this.#v?.textures[0] ?? null;
   }
+  /** Combed pixels per block of the frame last measured ahead, or null. */
+  get combAheadTexture() {
+    return this.#E?.textures[0] ?? null;
+  }
   /** The size of the frames to be measured, which sizes the block grid. */
   resize(e, t) {
-    e === this.#d && t === this.#F || (this.#d = e, this.#F = t, this.#x());
+    e === this.#F && t === this.#m || (this.#F = e, this.#m = t, this.#H());
   }
   /** Forget every measurement: the next frame starts a cycle from nothing. */
   reset() {
     const e = this.#t;
-    e.deleteSync(this.#l), this.#l = null, this.#h = 0;
-    const t = this.#p?.[this.#E];
+    e.deleteSync(this.#n), this.#n = null, this.#l = 0;
+    const t = this.#u?.[this.#c];
     if (!t) return;
-    const i = new Float32Array(g * 4);
-    for (let s = 0; s < p.phase; s++)
+    const i = new Float32Array(x * 4);
+    for (let s = 0; s < E.phase; s++)
       i[s * 4 + 1] = 1;
     e.bindTexture(e.TEXTURE_2D, t.textures[0] ?? null), e.texSubImage2D(
       e.TEXTURE_2D,
       0,
       0,
       0,
-      g,
+      x,
       1,
       e.RGBA,
       e.FLOAT,
@@ -886,43 +931,44 @@ class V {
    */
   detect(e, t, i) {
     const s = this.#t;
-    if (this.#d === 0 || this.#F === 0) return;
-    this.#V();
-    const r = this.#r, o = this.#T, h = this.#p;
+    if (this.#F === 0 || this.#m === 0) return;
+    this.#R();
+    const r = this.#r, o = this.#T, h = this.#u;
     if (r === null || o === null || h === null) return;
-    const a = h[this.#E], c = h[1 - this.#E];
-    if (s.bindFramebuffer(s.FRAMEBUFFER, r.framebuffer), s.useProgram(this.#i), this.#m(0, e, this.#e.a), this.#m(1, t, this.#e.b), this.#m(2, a.textures[0], this.#e.fieldMetrics), s.uniform1i(this.#e.first, i), s.uniform2i(this.#e.size, this.#d, this.#F), s.viewport(0, 0, r.width, r.height), s.drawArrays(s.TRIANGLES, 0, 3), s.bindFramebuffer(s.FRAMEBUFFER, o.framebuffer), s.useProgram(this.#n), this.#m(0, r.textures[0], this.#u.second), this.#m(1, r.textures[1], this.#u.first), s.uniform2i(this.#u.size, r.width, r.height), s.viewport(0, 0, o.width, o.height), s.drawArrays(s.TRIANGLES, 0, 3), s.bindFramebuffer(s.FRAMEBUFFER, c.framebuffer), s.useProgram(this.#o), this.#m(0, a.textures[0], this.#s.previous), this.#m(1, o.textures[0], this.#s.second), this.#m(2, o.textures[1], this.#s.first), s.uniform2i(this.#s.size, o.width, o.height), s.viewport(0, 0, g, 1), s.drawArrays(s.TRIANGLES, 0, 3), this.#E = 1 - this.#E, this.#h++, this.#l !== null) {
+    const a = h[this.#c], c = h[1 - this.#c];
+    if (s.bindFramebuffer(s.FRAMEBUFFER, r.framebuffer), s.useProgram(this.#i), this.#p(0, e, this.#e.a), this.#p(1, t, this.#e.b), this.#p(2, a.textures[0], this.#e.fieldMetrics), s.uniform1i(this.#e.first, i), s.uniform2i(this.#e.size, this.#F, this.#m), s.viewport(0, 0, r.width, r.height), s.drawArrays(s.TRIANGLES, 0, 3), s.bindFramebuffer(s.FRAMEBUFFER, o.framebuffer), s.useProgram(this.#h), this.#p(0, r.textures[0], this.#f.second), this.#p(1, r.textures[1], this.#f.first), s.uniform2i(this.#f.size, r.width, r.height), s.viewport(0, 0, o.width, o.height), s.drawArrays(s.TRIANGLES, 0, 3), s.bindFramebuffer(s.FRAMEBUFFER, c.framebuffer), s.useProgram(this.#A), this.#p(0, a.textures[0], this.#s.previous), this.#p(1, o.textures[0], this.#s.second), this.#p(2, o.textures[1], this.#s.first), s.uniform2i(this.#s.size, o.width, o.height), s.viewport(0, 0, x, 1), s.drawArrays(s.TRIANGLES, 0, 3), this.#c = 1 - this.#c, this.#l++, this.#n !== null) {
       s.bindFramebuffer(s.FRAMEBUFFER, null);
       return;
     }
-    this.#f = this.#h, s.bindBuffer(s.PIXEL_PACK_BUFFER, this.#a), s.readPixels(0, 0, g, 1, s.RGBA, s.FLOAT, 0), s.bindBuffer(s.PIXEL_PACK_BUFFER, null), s.bindFramebuffer(s.FRAMEBUFFER, null), this.#l = s.fenceSync(s.SYNC_GPU_COMMANDS_COMPLETE, 0), s.flush();
+    this.#b = this.#l, s.bindBuffer(s.PIXEL_PACK_BUFFER, this.#a), s.readPixels(0, 0, x, 1, s.RGBA, s.FLOAT, 0), s.bindBuffer(s.PIXEL_PACK_BUFFER, null), s.bindFramebuffer(s.FRAMEBUFFER, null), this.#n = s.fenceSync(s.SYNC_GPU_COMMANDS_COMPLETE, 0), s.flush();
   }
   /**
    * Count the combing each way of weaving `cur`, the frame being filtered,
    * would leave: as it stands, and with `prev`'s second field. `first` is the
-   * parity of the field that was captured first.
+   * parity of the field that was captured first. With `ahead`, the two are
+   * the frame being filtered and the one after it, counted for the latter.
    */
-  measureComb(e, t, i) {
-    const s = this.#t;
-    if (this.#d === 0 || this.#F === 0) return;
-    this.#V();
-    const r = this.#v;
-    r !== null && (s.bindFramebuffer(s.FRAMEBUFFER, r.framebuffer), s.useProgram(this.#A), this.#m(0, e, this.#c.prev), this.#m(1, t, this.#c.cur), s.uniform1i(this.#c.first, i), s.uniform2i(this.#c.size, this.#d, this.#F), s.viewport(0, 0, r.width, r.height), s.drawArrays(s.TRIANGLES, 0, 3), s.bindFramebuffer(s.FRAMEBUFFER, null));
+  measureComb(e, t, i, s = !1) {
+    const r = this.#t;
+    if (this.#F === 0 || this.#m === 0) return;
+    this.#R();
+    const o = s ? this.#E : this.#v;
+    o !== null && (r.bindFramebuffer(r.FRAMEBUFFER, o.framebuffer), r.useProgram(this.#o), this.#p(0, e, this.#d.prev), this.#p(1, t, this.#d.cur), r.uniform1i(this.#d.first, i), r.uniform2i(this.#d.size, this.#F, this.#m), r.viewport(0, 0, o.width, o.height), r.drawArrays(r.TRIANGLES, 0, 3), r.bindFramebuffer(r.FRAMEBUFFER, null));
   }
   /**
    * The phase of the last frame measured, once the GPU has handed it back,
    * and null while it is still on its way. It is handed back once.
    */
   poll() {
-    const e = this.#t, t = this.#l;
+    const e = this.#t, t = this.#n;
     if (t === null || this.#a === null) return null;
     switch (e.clientWaitSync(t, 0, 0)) {
       case e.ALREADY_SIGNALED:
       case e.CONDITION_SATISFIED:
-        return e.bindBuffer(e.PIXEL_PACK_BUFFER, this.#a), e.getBufferSubData(e.PIXEL_PACK_BUFFER, 0, this.metrics), e.bindBuffer(e.PIXEL_PACK_BUFFER, null), e.deleteSync(t), this.#l = null, {
-          phase: this.metrics[p.phase * 4] ?? 0,
-          run: this.metrics[p.phase * 4 + 1] ?? 0,
-          age: this.#h - this.#f
+        return e.bindBuffer(e.PIXEL_PACK_BUFFER, this.#a), e.getBufferSubData(e.PIXEL_PACK_BUFFER, 0, this.metrics), e.bindBuffer(e.PIXEL_PACK_BUFFER, null), e.deleteSync(t), this.#n = null, {
+          phase: this.metrics[E.phase * 4] ?? 0,
+          run: this.metrics[E.phase * 4 + 1] ?? 0,
+          age: this.#l - this.#b
         };
       default:
         return null;
@@ -930,49 +976,54 @@ class V {
   }
   destroy() {
     const e = this.#t;
-    if (this.#x(), this.#p !== null) {
-      for (const t of this.#p) M(e, t);
-      this.#p = null;
+    if (this.#H(), this.#u !== null) {
+      for (const t of this.#u) D(e, t);
+      this.#u = null;
     }
-    e.deleteSync(this.#l), this.#l = null, e.deleteBuffer(this.#a), this.#a = null, e.deleteProgram(this.#i), e.deleteProgram(this.#n), e.deleteProgram(this.#o), e.deleteProgram(this.#A);
+    e.deleteSync(this.#n), this.#n = null, e.deleteBuffer(this.#a), this.#a = null, e.deleteProgram(this.#i), e.deleteProgram(this.#h), e.deleteProgram(this.#A), e.deleteProgram(this.#o);
   }
-  #m(e, t, i) {
+  #p(e, t, i) {
     const s = this.#t;
     s.activeTexture(s.TEXTURE0 + e), s.bindTexture(s.TEXTURE_2D, t ?? null), s.uniform1i(i, e);
   }
-  #x() {
+  #H() {
     const e = this.#t;
-    this.#r !== null && M(e, this.#r), this.#T !== null && M(e, this.#T), this.#v !== null && M(e, this.#v), this.#r = null, this.#T = null, this.#v = null;
+    this.#r !== null && D(e, this.#r), this.#T !== null && D(e, this.#T), this.#v !== null && D(e, this.#v), this.#E !== null && D(e, this.#E), this.#r = null, this.#T = null, this.#v = null, this.#E = null;
   }
   /** Everything detect needs that is not there yet. */
-  #V() {
+  #R() {
     const e = this.#t;
-    if (this.#r === null || this.#T === null || this.#v === null) {
-      this.#x();
-      const t = Math.ceil(this.#d / se), i = Math.ceil(this.#F / (re * 2));
-      this.#r = D(e, t, i, 2), this.#T = D(
+    if (this.#r === null || this.#T === null || this.#v === null || this.#E === null) {
+      this.#H();
+      const t = Math.ceil(this.#F / re), i = Math.ceil(this.#m / (ne * 2));
+      this.#r = F(e, t, i, 2), this.#T = F(
         e,
         Math.ceil(t / S),
         Math.ceil(i / S),
         2
-      ), this.#v = D(
+      ), this.#v = F(
         e,
-        Math.ceil(this.#d / y),
-        Math.ceil(this.#F / y),
+        Math.ceil(this.#F / b),
+        Math.ceil(this.#m / b),
+        1
+      ), this.#E = F(
+        e,
+        Math.ceil(this.#F / b),
+        Math.ceil(this.#m / b),
         1
       );
     }
-    this.#p === null && (this.#p = [
-      D(e, g, 1, 1),
-      D(e, g, 1, 1)
-    ], this.#E = 0, this.reset()), this.#a === null && (this.#a = e.createBuffer(), e.bindBuffer(e.PIXEL_PACK_BUFFER, this.#a), e.bufferData(
+    this.#u === null && (this.#u = [
+      F(e, x, 1, 1),
+      F(e, x, 1, 1)
+    ], this.#c = 0, this.reset()), this.#a === null && (this.#a = e.createBuffer(), e.bindBuffer(e.PIXEL_PACK_BUFFER, this.#a), e.bufferData(
       e.PIXEL_PACK_BUFFER,
       this.metrics.byteLength,
       e.STREAM_COPY
     ), e.bindBuffer(e.PIXEL_PACK_BUFFER, null));
   }
 }
-function D(n, e, t, i) {
+function F(n, e, t, i) {
   const s = n.createFramebuffer();
   n.bindFramebuffer(n.FRAMEBUFFER, s);
   const r = [];
@@ -1001,14 +1052,14 @@ function D(n, e, t, i) {
   n.bindFramebuffer(n.FRAMEBUFFER, null);
   const h = { framebuffer: s, textures: r, width: e, height: t };
   if (!o)
-    throw M(n, h), new Error("failed to allocate framebuffer");
+    throw D(n, h), new Error("failed to allocate framebuffer");
   return h;
 }
-function M(n, { framebuffer: e, textures: t }) {
+function D(n, { framebuffer: e, textures: t }) {
   n.deleteFramebuffer(e);
   for (const i of t) n.deleteTexture(i);
 }
-function T(n, e = 0, t = n.length) {
+function y(n, e = 0, t = n.length) {
   const i = new DataView(n.buffer, n.byteOffset, n.byteLength), s = [];
   for (let r = e; r < t; ) {
     if (r + 8 > t) throw new Error("Incomplete MP4 box");
@@ -1024,21 +1075,21 @@ function T(n, e = 0, t = n.length) {
   return s;
 }
 function _e(n, e) {
-  for (const t of T(n, e.body, e.end).filter(
+  for (const t of y(n, e.body, e.end).filter(
     (i) => i.type === "trak"
   )) {
     let i = t;
     for (const s of ["mdia", "minf", "stbl", "stsd"]) {
-      const r = T(n, i.body, i.end).find(
+      const r = y(n, i.body, i.end).find(
         (o) => o.type === s
       );
       if (!r) break;
       i = r;
     }
     if (i.type === "stsd")
-      for (const s of T(n, i.body + 8, i.end)) {
+      for (const s of y(n, i.body + 8, i.end)) {
         if (s.type !== "avc1") continue;
-        const r = T(n, s.body + 78, s.end).find(
+        const r = y(n, s.body + 78, s.end).find(
           (a) => a.type === "avcC"
         );
         if (!r) throw new Error("AVC sample entry has no avcC");
@@ -1053,20 +1104,20 @@ class Me {
   #i = null;
   #e = null;
   /** Compressed frames within the MSE buffer, retained at normal speed for seeks and later accelerated playback. */
-  #n = [];
-  #u = 0;
-  #o = null;
+  #h = [];
+  #f = 0;
+  #A = null;
   #s = [];
   /** Timestamps of one-tick duplicate pictures needed only as open-GOP decoding references. */
-  #A = /* @__PURE__ */ new Set();
-  #c = !1;
+  #o = /* @__PURE__ */ new Set();
+  #d = !1;
   #r = !1;
   #T = !1;
   #v = !1;
-  #p = !1;
-  #E = /* @__PURE__ */ new WeakMap();
+  #E = !1;
+  #u = /* @__PURE__ */ new WeakMap();
   constructor(e) {
-    this.#t = e, e.addEventListener("seeking", this.#l), e.addEventListener("ratechange", this.#l);
+    this.#t = e, e.addEventListener("seeking", this.#a), e.addEventListener("ratechange", this.#a);
   }
   get active() {
     return this.#v;
@@ -1076,19 +1127,19 @@ class Me {
     if (this.#T) return;
     const t = new Uint8Array(e), i = new DataView(e);
     try {
-      for (const r of T(t)) {
+      for (const r of y(t)) {
         if (r.type === "moov") {
           this.#i = _e(t, r);
           const o = this.#i;
           o && VideoDecoder.isConfigSupported(o).then((h) => {
-            this.#E.set(o, h.supported === !0);
-          }).catch((h) => this.#h(h));
+            this.#u.set(o, h.supported === !0);
+          }).catch((h) => this.#n(h));
         }
         if (!(r.type !== "moof" || this.#i === null))
-          for (const o of T(t, r.body, r.end).filter(
+          for (const o of y(t, r.body, r.end).filter(
             (h) => h.type === "traf"
           )) {
-            const h = T(t, o.body, o.end), a = h.find((l) => l.type === "tfhd");
+            const h = y(t, o.body, o.end), a = h.find((l) => l.type === "tfhd");
             if (!a || i.getUint32(a.body + 4) !== 1) continue;
             const c = h.find((l) => l.type === "tfdt"), A = h.find((l) => l.type === "trun");
             if (!c || !A || i.getUint32(c.body) !== 16777216 || i.getUint32(A.body) !== 16781057)
@@ -1098,111 +1149,111 @@ class Me {
             if (A.body + 12 + u * 16 > A.end)
               throw new Error("Incomplete video samples");
             for (let l = 0; l < u; l++) {
-              const d = A.body + 12 + l * 16, E = i.getUint32(d), v = i.getUint32(d + 4), U = i.getUint32(d + 8), Ae = i.getInt32(d + 12);
+              const d = A.body + 12 + l * 16, p = i.getUint32(d), v = i.getUint32(d + 4), U = i.getUint32(d + 8), ae = i.getInt32(d + 12);
               if (m < 0 || m + v > t.length)
                 throw new Error("Video sample outside fragment");
-              this.#n.push({
+              this.#h.push({
                 config: this.#i,
                 decodeTime: f / 9e4,
-                timestamp: Math.round((f + Ae) * 1e6 / 9e4),
-                duration: Math.round(E * 1e6 / 9e4),
+                timestamp: Math.round((f + ae) * 1e6 / 9e4),
+                duration: Math.round(p * 1e6 / 9e4),
                 type: U & 65536 ? "delta" : "key",
                 data: t.subarray(m, m + v)
-              }), f += E, m += v;
+              }), f += p, m += v;
             }
           }
       }
       const s = this.#t.buffered;
       if (s.length > 0) {
         let r = 0;
-        for (let o = 0; o < (this.#v ? this.#u : this.#n.length); o++) {
-          const h = this.#n[o];
+        for (let o = 0; o < (this.#v ? this.#f : this.#h.length); o++) {
+          const h = this.#h[o];
           h.type === "key" && h.timestamp / 1e6 <= s.start(0) && (r = o);
         }
-        r > 0 && (this.#n.splice(0, r), this.#u = Math.max(0, this.#u - r));
+        r > 0 && (this.#h.splice(0, r), this.#f = Math.max(0, this.#f - r));
       }
     } catch (s) {
-      this.#h(s);
+      this.#n(s);
     }
   }
   /** Return undefined to use the video element, or null to wait for the next decoded frame. */
   take() {
-    if (this.#T || this.#t.playbackRate <= 1.25 || this.#i === null || this.#E.get(this.#i) !== !0) {
-      this.#v && this.#l();
+    if (this.#T || this.#t.playbackRate <= 1.25 || this.#i === null || this.#u.get(this.#i) !== !0) {
+      this.#v && this.#a();
       return;
     }
-    this.#v || (this.#l(), this.#v = !0);
+    this.#v || (this.#a(), this.#v = !0);
     const e = this.#t.currentTime;
     try {
-      for (; this.#u < this.#n.length && (this.#o?.decodeQueueSize ?? 0) < 6 && this.#s.length < 12; ) {
-        const i = this.#n[this.#u];
+      for (; this.#f < this.#h.length && (this.#A?.decodeQueueSize ?? 0) < 6 && this.#s.length < 12; ) {
+        const i = this.#h[this.#f];
         if (i.decodeTime > e + 0.25) break;
         if (this.#e !== i.config) {
-          if (this.#o) {
+          if (this.#A) {
             if (!this.#r) {
               this.#r = !0;
-              const r = this.#o;
+              const r = this.#A;
               r.flush().then(() => {
-                this.#o === r && (r.close(), this.#o = null, this.#e = null, this.#r = !1);
+                this.#A === r && (r.close(), this.#A = null, this.#e = null, this.#r = !1);
               }).catch((o) => {
-                this.#o === r && this.#h(o);
+                this.#A === r && this.#n(o);
               });
             }
             break;
           }
           const s = new VideoDecoder({
             output: (r) => {
-              this.#o !== s ? r.close() : this.#a(r);
+              this.#A !== s ? r.close() : this.#c(r);
             },
             error: (r) => {
-              this.#o === s && this.#h(r);
+              this.#A === s && this.#n(r);
             }
           });
-          this.#o = s, this.#o.configure(i.config), this.#e = i.config;
+          this.#A = s, this.#A.configure(i.config), this.#e = i.config;
         }
-        (i.duration ?? 0) < 1e3 && this.#A.add(i.timestamp), this.#o.decode(new EncodedVideoChunk(i)), this.#u++;
+        (i.duration ?? 0) < 1e3 && this.#o.add(i.timestamp), this.#A.decode(new EncodedVideoChunk(i)), this.#f++;
       }
-      if (this.#c && this.#u === this.#n.length && this.#o && !this.#r) {
+      if (this.#d && this.#f === this.#h.length && this.#A && !this.#r) {
         this.#r = !0;
-        const i = this.#o;
+        const i = this.#A;
         i.flush().catch((s) => {
-          this.#o === i && this.#h(s);
+          this.#A === i && this.#n(s);
         });
       }
     } catch (i) {
-      this.#h(i);
+      this.#n(i);
       return;
     }
     const t = this.#s[0];
-    return !t || t.timestamp / 1e6 > e + 3e-3 * this.#t.playbackRate ? this.#p ? null : void 0 : (this.#p = !0, this.#s.shift());
+    return !t || t.timestamp / 1e6 > e + 3e-3 * this.#t.playbackRate ? this.#E ? null : void 0 : (this.#E = !0, this.#s.shift());
   }
-  #a = (e) => {
-    this.#A.delete(e.timestamp) || e.timestamp / 1e6 < this.#t.currentTime - (this.#p ? 0.1 : 0.04) ? e.close() : this.#s.push(e);
+  #c = (e) => {
+    this.#o.delete(e.timestamp) || e.timestamp / 1e6 < this.#t.currentTime - (this.#E ? 0.1 : 0.04) ? e.close() : this.#s.push(e);
   };
-  #l = () => {
-    this.#o && this.#o.state !== "closed" && this.#o.close(), this.#o = null, this.#e = null;
+  #a = () => {
+    this.#A && this.#A.state !== "closed" && this.#A.close(), this.#A = null, this.#e = null;
     for (const e of this.#s) e.close();
-    this.#s = [], this.#A.clear(), this.#r = !1, this.#v = !1, this.#p = !1, this.#u = 0;
-    for (let e = 0; e < this.#n.length; e++) {
-      const t = this.#n[e];
-      t.type === "key" && t.timestamp / 1e6 <= this.#t.currentTime && (this.#u = e);
+    this.#s = [], this.#o.clear(), this.#r = !1, this.#v = !1, this.#E = !1, this.#f = 0;
+    for (let e = 0; e < this.#h.length; e++) {
+      const t = this.#h[e];
+      t.type === "key" && t.timestamp / 1e6 <= this.#t.currentTime && (this.#f = e);
     }
   };
   finish() {
-    this.#c = !0;
+    this.#d = !0;
   }
   /** Release the decoder and undisplayed frames while the filter is stopped. */
   suspend() {
-    this.#l();
+    this.#a();
   }
   reset() {
-    this.#l(), this.#n = [], this.#u = 0, this.#i = null, this.#c = !1, this.#T = !1;
+    this.#a(), this.#h = [], this.#f = 0, this.#i = null, this.#d = !1, this.#T = !1;
   }
   destroy() {
-    this.reset(), this.#t.removeEventListener("seeking", this.#l), this.#t.removeEventListener("ratechange", this.#l);
+    this.reset(), this.#t.removeEventListener("seeking", this.#a), this.#t.removeEventListener("ratechange", this.#a);
   }
-  #h(e) {
-    this.#l(), this.#T = !0, console.warn("mpeg2toh264: decoded video input unavailable", e);
+  #n(e) {
+    this.#a(), this.#T = !0, console.warn("mpeg2toh264: decoded video input unavailable", e);
   }
 }
 const P = 16, Se = 6, Pe = `#version 300 es
@@ -1240,15 +1291,15 @@ class Ce {
   #t;
   #i;
   #e = null;
-  #n = null;
+  #h = null;
   /** Textures free to take the next picture. */
-  #u = [];
-  #o = 0;
+  #f = [];
+  #A = 0;
   /** Readback buffers free for the next comparison. */
   #s = [];
-  #A = new Uint8Array(0);
+  #o = new Uint8Array(0);
   /** Takes in order, from the oldest still held. */
-  #c = [];
+  #d = [];
   /** The newest take, which the next one is compared with. */
   #r = null;
   #T = 0;
@@ -1256,7 +1307,7 @@ class Ce {
     this.#t = e, this.#i = t;
   }
   take() {
-    const e = this.#t, t = this.#u.pop() ?? this.#a();
+    const e = this.#t, t = this.#f.pop() ?? this.#c();
     if (t === null) return null;
     const i = this.#i.videoWidth, s = this.#i.videoHeight;
     e.bindTexture(e.TEXTURE_2D, t);
@@ -1270,7 +1321,7 @@ class Ce {
         this.#i
       );
     } catch (h) {
-      throw this.#u.push(t), h;
+      throw this.#f.push(t), h;
     }
     const r = {
       id: ++this.#T,
@@ -1282,10 +1333,10 @@ class Ce {
       buffer: null,
       reported: !1
     }, o = this.#r;
-    return o === null || o.width !== i || o.height !== s ? r.changed = !0 : this.#v(r, o), this.#r = r, this.#c.push(r), r.id;
+    return o === null || o.width !== i || o.height !== s ? r.changed = !0 : this.#v(r, o), this.#r = r, this.#d.push(r), r.id;
   }
   settle() {
-    const e = this.#t, t = this.#c.find((i) => !i.reported);
+    const e = this.#t, t = this.#d.find((i) => !i.reported);
     if (t === void 0 || t === this.#r) return null;
     if (t.changed === null) {
       const { fence: i, buffer: s } = t;
@@ -1293,9 +1344,9 @@ class Ce {
       const r = e.clientWaitSync(i, 0, 0);
       if (r !== e.ALREADY_SIGNALED && r !== e.CONDITION_SATISFIED)
         return null;
-      this.#A.byteLength < s.bytes && (this.#A = new Uint8Array(s.bytes));
-      const o = this.#A.subarray(0, s.bytes);
-      e.bindBuffer(e.PIXEL_PACK_BUFFER, s.buffer), e.getBufferSubData(e.PIXEL_PACK_BUFFER, 0, o), e.bindBuffer(e.PIXEL_PACK_BUFFER, null), t.changed = Be(o), this.#p(t);
+      this.#o.byteLength < s.bytes && (this.#o = new Uint8Array(s.bytes));
+      const o = this.#o.subarray(0, s.bytes);
+      e.bindBuffer(e.PIXEL_PACK_BUFFER, s.buffer), e.getBufferSubData(e.PIXEL_PACK_BUFFER, 0, o), e.bindBuffer(e.PIXEL_PACK_BUFFER, null), t.changed = Be(o), this.#E(t);
     }
     return t.reported = !0, { id: t.id, changed: t.changed };
   }
@@ -1304,63 +1355,63 @@ class Ce {
    * needs, which becomes free for a later take.
    */
   adopt(e, t) {
-    const i = this.#c.findIndex((r) => r.id === e), s = this.#c[i];
+    const i = this.#d.findIndex((r) => r.id === e), s = this.#d[i];
     if (s === void 0 || !s.reported)
       throw new Error(`picture ${e} is not available to adopt`);
-    return this.#c.splice(i, 1), this.#u.push(t), s.texture;
+    return this.#d.splice(i, 1), this.#f.push(t), s.texture;
   }
   release(e) {
-    const t = this.#c.findIndex((s) => s.id === e), i = this.#c[t];
-    i !== void 0 && (this.#c.splice(t, 1), this.#E(i));
+    const t = this.#d.findIndex((s) => s.id === e), i = this.#d[t];
+    i !== void 0 && (this.#d.splice(t, 1), this.#u(i));
   }
   reset() {
-    const e = this.#c;
-    this.#c = [], this.#r = null;
+    const e = this.#d;
+    this.#d = [], this.#r = null;
     for (const t of e)
-      this.#p(t), this.#E(t);
+      this.#E(t), this.#u(t);
   }
   destroy() {
     const e = this.#t;
     this.reset();
-    for (const t of this.#u) e.deleteTexture(t);
-    this.#u = [], this.#o = 0;
+    for (const t of this.#f) e.deleteTexture(t);
+    this.#f = [], this.#A = 0;
     for (const { buffer: t } of this.#s) e.deleteBuffer(t);
-    this.#s = [], this.#f(), this.#e !== null && e.deleteProgram(this.#e), this.#e = null;
+    this.#s = [], this.#l(), this.#e !== null && e.deleteProgram(this.#e), this.#e = null;
   }
   /** Draw the comparison of a take with the one before it and start its readback. */
   #v(e, t) {
-    const i = this.#t, s = Math.ceil(e.width / P), r = Math.ceil(e.height / P), o = this.#h(s, r), h = this.#d(s * r * 4);
-    this.#e ??= this.#l(), i.bindFramebuffer(i.FRAMEBUFFER, o.framebuffer), i.useProgram(this.#e), i.activeTexture(i.TEXTURE1), i.bindTexture(i.TEXTURE_2D, t.texture), i.activeTexture(i.TEXTURE0), i.bindTexture(i.TEXTURE_2D, e.texture), i.viewport(0, 0, s, r), i.drawArrays(i.TRIANGLES, 0, 3), i.bindBuffer(i.PIXEL_PACK_BUFFER, h.buffer), i.readPixels(0, 0, s, r, i.RGBA, i.UNSIGNED_BYTE, 0), i.bindBuffer(i.PIXEL_PACK_BUFFER, null), i.bindFramebuffer(i.FRAMEBUFFER, null), e.fence = i.fenceSync(i.SYNC_GPU_COMMANDS_COMPLETE, 0), e.buffer = h, i.flush();
+    const i = this.#t, s = Math.ceil(e.width / P), r = Math.ceil(e.height / P), o = this.#n(s, r), h = this.#b(s * r * 4);
+    this.#e ??= this.#a(), i.bindFramebuffer(i.FRAMEBUFFER, o.framebuffer), i.useProgram(this.#e), i.activeTexture(i.TEXTURE1), i.bindTexture(i.TEXTURE_2D, t.texture), i.activeTexture(i.TEXTURE0), i.bindTexture(i.TEXTURE_2D, e.texture), i.viewport(0, 0, s, r), i.drawArrays(i.TRIANGLES, 0, 3), i.bindBuffer(i.PIXEL_PACK_BUFFER, h.buffer), i.readPixels(0, 0, s, r, i.RGBA, i.UNSIGNED_BYTE, 0), i.bindBuffer(i.PIXEL_PACK_BUFFER, null), i.bindFramebuffer(i.FRAMEBUFFER, null), e.fence = i.fenceSync(i.SYNC_GPU_COMMANDS_COMPLETE, 0), e.buffer = h, i.flush();
   }
   /** Give back what a comparison held, whether or not it was read. */
-  #p(e) {
+  #E(e) {
     const t = this.#t;
     e.fence !== null && t.deleteSync(e.fence), e.fence = null;
     const i = e.buffer;
     if (e.buffer = null, i === null) return;
-    const s = this.#n;
+    const s = this.#h;
     s !== null && i.bytes === s.width * s.height * 4 ? this.#s.push(i) : t.deleteBuffer(i.buffer);
   }
   /**
    * Free the texture of a take that has left. By then a later take has
    * replaced it as the reference, and the comparison that read it is issued.
    */
-  #E(e) {
-    this.#u.push(e.texture);
+  #u(e) {
+    this.#f.push(e.texture);
+  }
+  #c() {
+    if (this.#A === Se) return null;
+    const e = this.#t, t = e.createTexture();
+    return e.bindTexture(e.TEXTURE_2D, t), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_MIN_FILTER, e.NEAREST), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_MAG_FILTER, e.NEAREST), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_WRAP_S, e.CLAMP_TO_EDGE), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_WRAP_T, e.CLAMP_TO_EDGE), this.#A++, t;
   }
   #a() {
-    if (this.#o === Se) return null;
-    const e = this.#t, t = e.createTexture();
-    return e.bindTexture(e.TEXTURE_2D, t), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_MIN_FILTER, e.NEAREST), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_MAG_FILTER, e.NEAREST), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_WRAP_S, e.CLAMP_TO_EDGE), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_WRAP_T, e.CLAMP_TO_EDGE), this.#o++, t;
-  }
-  #l() {
-    const e = this.#t, t = R(e, Pe, _);
+    const e = this.#t, t = _(e, Pe, M);
     return e.useProgram(t), e.uniform1i(e.getUniformLocation(t, "uTake"), 0), e.uniform1i(e.getUniformLocation(t, "uReference"), 1), t;
   }
-  #h(e, t) {
-    const i = this.#t, s = this.#n;
+  #n(e, t) {
+    const i = this.#t, s = this.#h;
     if (s?.width === e && s.height === t) return s;
-    this.#f();
+    this.#l();
     for (const { buffer: a } of this.#s) i.deleteBuffer(a);
     this.#s = [];
     const r = i.createTexture();
@@ -1384,13 +1435,13 @@ class Ce {
       0
     ), i.bindFramebuffer(i.FRAMEBUFFER, null);
     const h = { framebuffer: o, texture: r, width: e, height: t };
-    return this.#n = h, h;
+    return this.#h = h, h;
   }
-  #f() {
+  #l() {
     const e = this.#t;
-    this.#n !== null && (e.deleteFramebuffer(this.#n.framebuffer), e.deleteTexture(this.#n.texture), this.#n = null);
+    this.#h !== null && (e.deleteFramebuffer(this.#h.framebuffer), e.deleteTexture(this.#h.texture), this.#h = null);
   }
-  #d(e) {
+  #b(e) {
     const t = this.#s.pop();
     if (t !== void 0) return t;
     const i = this.#t, s = i.createBuffer();
@@ -1403,58 +1454,58 @@ function Be(n) {
       return !0;
   return !1;
 }
-const ne = [
+const oe = [
   "mozParsedFrames",
   "mozDecodedFrames",
   "mozPresentedFrames",
   "mozPaintedFrames"
 ];
-function oe(n) {
-  return ne.every((e) => e in n);
+function he(n) {
+  return oe.every((e) => e in n);
 }
 function ke(n) {
   return n.ownerDocument?.defaultView?.performance.timeOrigin ?? performance.timeOrigin;
 }
 function Le() {
-  return typeof HTMLVideoElement < "u" && (oe(HTMLVideoElement.prototype) || typeof HTMLVideoElement.prototype.requestVideoFrameCallback == "function");
+  return typeof HTMLVideoElement < "u" && (he(HTMLVideoElement.prototype) || typeof HTMLVideoElement.prototype.requestVideoFrameCallback == "function");
 }
 const Ue = 250, I = 500, Ie = 1.75, Ne = 3, Ge = 200;
 class Oe {
   #t;
   #i;
   #e;
-  #n;
+  #h;
   /** The watch the takes below belong to. */
-  #u = null;
+  #f = null;
   /** Takes awaiting their verdict, oldest first. */
-  #o = [];
+  #A = [];
   /** Frames counted on the watched path, standing in for `presentedFrames`. */
   #s = 0;
-  #A = null;
+  #o = null;
   /** Unchanged verdicts in a row on takes made at rest. */
-  #c = 0;
+  #d = 0;
   /** When the take last delivered was made, and the painted count then. */
   #r = null;
   #T = null;
   #v = null;
-  #p = null;
   #E = null;
-  #a = null;
-  #l = !0;
-  #h = null;
-  #f = null;
-  #d = 0;
+  #u = null;
+  #c = null;
+  #a = !0;
+  #n = null;
+  #l = null;
+  #b = 0;
   #F;
   #m;
-  #x = null;
-  #V = null;
-  #M = null;
+  #p = null;
+  #H = null;
+  #R = null;
   #N = null;
-  #xe = 0;
-  #H = [];
+  #Te = 0;
+  #V = [];
   #O = [];
   constructor(e, t, i) {
-    if (this.#t = e, this.#i = t, this.#n = i, this.#e = oe(e) ? e : null, this.#F = this.#e === null && typeof VideoFrame < "u", this.#m = this.#F && e.playbackRate > 1, this.#e) {
+    if (this.#t = e, this.#i = t, this.#h = i, this.#e = he(e) ? e : null, this.#F = this.#e === null && typeof VideoFrame < "u", this.#m = this.#F && e.playbackRate > 1, this.#e) {
       for (const s of ["emptied", "seeking", "seeked"])
         e.addEventListener(s, this.#X);
       for (const s of ["pause", "playing", "waiting", "ratechange"])
@@ -1478,16 +1529,16 @@ class Oe {
     return this.#m;
   }
   request(e) {
-    if (this.#p === null) {
-      if (this.#p = e, this.#m) {
-        this.#k();
+    if (this.#E === null) {
+      if (this.#E = e, this.#m) {
+        this.#U();
         return;
       }
-      this.#v = this.#e ? requestAnimationFrame(this.#C) : this.#t.requestVideoFrameCallback(this.#_);
+      this.#v = this.#e ? requestAnimationFrame(this.#C) : this.#t.requestVideoFrameCallback(this.#M);
     }
   }
   cancel() {
-    this.#v !== null && (this.#e ? cancelAnimationFrame(this.#v) : this.#t.cancelVideoFrameCallback(this.#v)), this.#v = null, this.#p = null, this.#x?.(), this.#x = null, this.#M !== null && this.#t.cancelVideoFrameCallback(this.#M), this.#M = null, this.#Q(), this.#N = null, this.#H = [], this.#m = this.#F && this.#t.playbackRate > 1, this.#X();
+    this.#v !== null && (this.#e ? cancelAnimationFrame(this.#v) : this.#t.cancelVideoFrameCallback(this.#v)), this.#v = null, this.#E = null, this.#p?.(), this.#p = null, this.#R !== null && this.#t.cancelVideoFrameCallback(this.#R), this.#R = null, this.#Y(), this.#N = null, this.#V = [], this.#m = this.#F && this.#t.playbackRate > 1, this.#X();
   }
   destroy() {
     this.cancel();
@@ -1510,10 +1561,10 @@ class Oe {
   /** Deliver pending input on the rendering window's refresh, before drawing. */
   flush(e) {
     if (this.#m)
-      for (this.#t.ownerDocument !== this.#V && (this.#x?.(), this.#x = null, this.#k()); this.#O.length > 0 && this.#p !== null; ) {
+      for (this.#t.ownerDocument !== this.#H && (this.#p?.(), this.#p = null, this.#U()); this.#O.length > 0 && this.#E !== null; ) {
         const t = this.#O.shift(), i = t.frame;
         try {
-          this.#b(e, {
+          this.#g(e, {
             width: i.visibleRect?.width ?? i.codedWidth,
             height: i.visibleRect?.height ?? i.codedHeight,
             mediaTime: i.timestamp / 1e6,
@@ -1528,57 +1579,57 @@ class Oe {
         }
       }
   }
-  #Q() {
+  #Y() {
     for (const e of this.#O) e.frame.close();
     this.#O = [];
   }
   #P = (e) => {
     const t = this.#F && this.#t.playbackRate > 1;
     if (t !== this.#m) {
-      const i = this.#p;
+      const i = this.#E;
       this.cancel(), this.#m = t, i !== null && this.request(i);
       return;
     }
-    ["seeking", "seeked", "emptied", "ratechange"].includes(e.type) && (this.#N = null, this.#H = []), this.#m && ((e.type === "pause" || e.type === "ended") && this.flush(performance.now()), this.#Q(), this.#x?.(), this.#x = null, this.#p !== null && this.#k());
+    ["seeking", "seeked", "emptied", "ratechange"].includes(e.type) && (this.#N = null, this.#V = []), this.#m && ((e.type === "pause" || e.type === "ended") && this.flush(performance.now()), this.#Y(), this.#p?.(), this.#p = null, this.#E !== null && this.#U());
   };
-  #k() {
-    if (!this.#m || this.#x !== null || this.#p === null || (this.#t.paused || this.#t.ended) && this.#N !== null)
+  #U() {
+    if (!this.#m || this.#p !== null || this.#E === null || (this.#t.paused || this.#t.ended) && this.#N !== null)
       return;
-    this.#M === null && typeof this.#t.requestVideoFrameCallback == "function" && (this.#M = this.#t.requestVideoFrameCallback(
-      this.#we
+    this.#R === null && typeof this.#t.requestVideoFrameCallback == "function" && (this.#R = this.#t.requestVideoFrameCallback(
+      this.#ye
     ));
     const e = Math.max(4, 8 / Math.max(1, this.#t.playbackRate)), t = this.#t.ownerDocument?.defaultView;
-    if (this.#V = this.#t.ownerDocument, t) {
-      const i = t.setTimeout(this.#L, e);
-      this.#x = () => t.clearTimeout(i);
+    if (this.#H = this.#t.ownerDocument, t) {
+      const i = t.setTimeout(this.#B, e);
+      this.#p = () => t.clearTimeout(i);
     } else {
-      const i = setTimeout(this.#L, e);
-      this.#x = () => clearTimeout(i);
+      const i = setTimeout(this.#B, e);
+      this.#p = () => clearTimeout(i);
     }
   }
-  #we = () => {
-    this.#M = null, this.#x?.(), this.#x = null, this.#L();
+  #ye = () => {
+    this.#R = null, this.#p?.(), this.#p = null, this.#B();
   };
-  #L = () => {
-    this.#x = null;
+  #B = () => {
+    this.#p = null;
     const e = this.#t;
-    if (this.#p === null) return;
+    if (this.#E === null) return;
     if (e.readyState < 2 || e.seeking) {
-      this.#k();
+      this.#U();
       return;
     }
     let t, i = !1;
     try {
       const s = this.#i?.();
       if (s === null) {
-        this.#k();
+        this.#U();
         return;
       }
       i = s !== void 0, t = s ?? new VideoFrame(e);
     } catch (s) {
       if (!(s instanceof DOMException) || s.name !== "InvalidStateError")
         throw s;
-      this.#k();
+      this.#U();
       return;
     }
     if (t.timestamp === this.#N)
@@ -1587,30 +1638,30 @@ class Oe {
       let s = 1;
       if (this.#N !== null) {
         const o = t.timestamp - this.#N;
-        if (o > 1e3 && o < 25e4 && (this.#H.push(o), this.#H.length > 7 && this.#H.shift()), o > 0 && this.#H.length > 0) {
-          const h = [...this.#H].sort((c, A) => c - A), a = h[Math.floor(h.length / 2)];
+        if (o > 1e3 && o < 25e4 && (this.#V.push(o), this.#V.length > 7 && this.#V.shift()), o > 0 && this.#V.length > 0) {
+          const h = [...this.#V].sort((c, A) => c - A), a = h[Math.floor(h.length / 2)];
           s = Math.max(1, Math.round(o / a));
         }
       }
-      this.#N = t.timestamp, this.#xe += s;
+      this.#N = t.timestamp, this.#Te += s;
       const r = performance.now() + (i ? (t.timestamp / 1e6 - e.currentTime) * 1e3 / e.playbackRate : 0);
-      for (this.#O.push({ frame: t, at: r, count: this.#xe }); this.#O.length > 4; ) this.#O.shift().frame.close();
+      for (this.#O.push({ frame: t, at: r, count: this.#Te }); this.#O.length > 4; ) this.#O.shift().frame.close();
     }
-    this.#k();
+    this.#U();
   };
   #G = () => {
-    this.#h = null, this.#f = null, this.#d = 0;
+    this.#n = null, this.#l = null, this.#b = 0;
   };
   #X = () => {
-    this.#E = null, this.#a = null, this.#l = !0, this.#z(), this.#G();
+    this.#u = null, this.#c = null, this.#a = !0, this.#z(), this.#G();
   };
   /** Drop the takes in hand; the next one starts with nothing to compare to. */
   #z() {
-    this.#u?.reset(), this.#o = [], this.#c = 0;
+    this.#f?.reset(), this.#A = [], this.#d = 0;
   }
   /** Native acquisition: pass the report on, with the clock it was made on. */
-  #_ = (e, t) => {
-    this.#b(e, {
+  #M = (e, t) => {
+    this.#g(e, {
       width: t.width,
       height: t.height,
       mediaTime: t.mediaTime,
@@ -1619,24 +1670,24 @@ class Oe {
       timeOrigin: ke(this.#t)
     });
   };
-  #b = (e, t) => {
-    const i = this.#p;
-    this.#v = null, this.#p = null, i?.(e, t);
+  #g = (e, t) => {
+    const i = this.#E;
+    this.#v = null, this.#E = null, i?.(e, t);
   };
   #C = (e) => {
-    const t = this.#e, i = ne.map((a) => t[a]);
-    this.#E?.some((a, c) => i[c] < a) && this.#X(), this.#E = i;
-    const s = this.#n?.() ?? null;
-    s !== this.#u && (this.#X(), this.#u = s);
-    const r = t.mozPaintedFrames, o = !t.seeking && t.readyState >= 2 && t.videoWidth > 0 && t.videoHeight > 0, h = this.#a === null && (r > 0 || t.paused && (t.mozPresentedFrames > 0 || t.mozDecodedFrames > 0));
+    const t = this.#e, i = oe.map((a) => t[a]);
+    this.#u?.some((a, c) => i[c] < a) && this.#X(), this.#u = i;
+    const s = this.#h?.() ?? null;
+    s !== this.#f && (this.#X(), this.#f = s);
+    const r = t.mozPaintedFrames, o = !t.seeking && t.readyState >= 2 && t.videoWidth > 0 && t.videoHeight > 0, h = this.#c === null && (r > 0 || t.paused && (t.mozPresentedFrames > 0 || t.mozDecodedFrames > 0));
     if (s !== null) {
-      this.#B(e, t, s, o, h);
+      this.#k(e, t, s, o, h);
       return;
     }
-    if (o && (h || this.#a !== null && r !== this.#a)) {
-      this.#h !== null && e - this.#h > I && (this.#G(), this.#l = !0), this.#W(e, t), this.#h = e, this.#a = r;
-      const a = this.#l;
-      this.#l = !1, this.#b(e, {
+    if (o && (h || this.#c !== null && r !== this.#c)) {
+      this.#n !== null && e - this.#n > I && (this.#G(), this.#a = !0), this.#W(e, t), this.#n = e, this.#c = r;
+      const a = this.#a;
+      this.#a = !1, this.#g(e, {
         width: t.videoWidth,
         height: t.videoHeight,
         // Used only to select source scan/size metadata on the media timeline.
@@ -1648,7 +1699,7 @@ class Oe {
         // not the video node's window, which may be a different one.
         expectedDisplayTime: e,
         timeOrigin: performance.timeOrigin,
-        mozTiming: { periodMs: this.#d, discontinuity: a }
+        mozTiming: { periodMs: this.#b, discontinuity: a }
       });
     } else
       this.#v = requestAnimationFrame(this.#C);
@@ -1656,32 +1707,32 @@ class Oe {
   /** Fold the painted count into the cadence, on a poll that saw it advance. */
   #W(e, t) {
     if (t.paused || t.ended) return;
-    const i = t.mozPaintedFrames, s = this.#f;
+    const i = t.mozPaintedFrames, s = this.#l;
     if (s && e - s.at >= Ue) {
       const r = i - s.frames;
       if (r > 0) {
         const o = (e - s.at) / r;
-        o >= 4 && o <= 200 && (this.#d = this.#d ? this.#d + (o - this.#d) * 0.25 : o);
+        o >= 4 && o <= 200 && (this.#b = this.#b ? this.#b + (o - this.#b) * 0.25 : o);
       }
-      this.#f = null;
+      this.#l = null;
     }
-    this.#f ??= { at: e, frames: i };
+    this.#l ??= { at: e, frames: i };
   }
   /**
    * The poll where the pictures themselves say what is new. Every refresh
    * takes the element's picture; a take is delivered once its verdict is in,
    * which is a refresh or more after it was made.
    */
-  #B(e, t, i, s, r) {
-    const o = t.mozPaintedFrames, h = this.#a !== null && o !== this.#a;
-    this.#A !== null && e - this.#A > I && (this.#z(), this.#G(), this.#l = !0), this.#A = e, h && this.#W(e, t);
+  #k(e, t, i, s, r) {
+    const o = t.mozPaintedFrames, h = this.#c !== null && o !== this.#c;
+    this.#o !== null && e - this.#o > I && (this.#z(), this.#G(), this.#a = !0), this.#o = e, h && this.#W(e, t);
     const a = t.paused || t.ended;
-    (!a || h) && (this.#c = 0), a && this.#r !== null && (this.#r = e);
-    const c = a && this.#c >= Ne;
-    if (s && (r || this.#a !== null)) {
-      this.#a = o;
+    (!a || h) && (this.#d = 0), a && this.#r !== null && (this.#r = e);
+    const c = a && this.#d >= Ne;
+    if (s && (r || this.#c !== null)) {
+      this.#c = o;
       const u = c ? null : i.take();
-      u !== null && this.#o.push({
+      u !== null && this.#A.push({
         id: u,
         at: e,
         mediaTime: t.currentTime,
@@ -1692,11 +1743,11 @@ class Oe {
     }
     let A = null;
     for (let u = i.settle(); u !== null; u = i.settle()) {
-      const l = this.#o.shift();
+      const l = this.#A.shift();
       if (l?.id !== u.id)
         throw new Error("picture verdicts arrived out of order");
       let d = u.changed;
-      if (d ? this.#c = 0 : (this.#c = l.resting ? this.#c + 1 : 0, d = A === null && !l.resting && this.#r !== null && (l.at - this.#r) * (t.playbackRate || 1) >= Ge && o !== this.#T), !d) {
+      if (d ? this.#d = 0 : (this.#d = l.resting ? this.#d + 1 : 0, d = A === null && !l.resting && this.#r !== null && (l.at - this.#r) * (t.playbackRate || 1) >= Ge && o !== this.#T), !d) {
         i.release(l.id);
         continue;
       }
@@ -1707,15 +1758,15 @@ class Oe {
       return;
     }
     let f = 1;
-    if (this.#h !== null) {
-      const u = A.at - this.#h;
-      u > I ? (this.#G(), this.#l = !0) : this.#d > 0 && u > this.#d * Ie && (f = Math.round(u / this.#d));
+    if (this.#n !== null) {
+      const u = A.at - this.#n;
+      u > I ? (this.#G(), this.#a = !0) : this.#b > 0 && u > this.#b * Ie && (f = Math.round(u / this.#b));
     }
-    this.#s += f, this.#h = A.at, this.#r = A.at, this.#T = o;
-    const m = this.#l;
-    this.#l = !1;
+    this.#s += f, this.#n = A.at, this.#r = A.at, this.#T = o;
+    const m = this.#a;
+    this.#a = !1;
     try {
-      this.#b(e, {
+      this.#g(e, {
         width: A.width,
         height: A.height,
         // As on the counted path, this only places the frame on the media
@@ -1726,7 +1777,7 @@ class Oe {
         // schedule is anchored to when a frame is handed over.
         expectedDisplayTime: e,
         timeOrigin: performance.timeOrigin,
-        mozTiming: { periodMs: this.#d, discontinuity: m },
+        mozTiming: { periodMs: this.#b, discontinuity: m },
         picture: A.id
       });
     } finally {
@@ -1734,23 +1785,23 @@ class Oe {
     }
   }
 }
-let he = null;
+let Ae = null;
 function Xe(n) {
-  he = n;
+  Ae = n;
 }
-const $ = 0.5, b = 4, X = 5, w = X + 1, Q = 1e3, Z = 4, B = 200, ze = 0.25, We = 1e3 / 60, He = `#version 300 es
+const Q = 0.5, g = 4, X = 5, T = X + 1, Z = 1e3, Y = 4, B = 200, ze = 0.25, We = 1e3 / 60, He = `#version 300 es
 void main() {
   // One triangle over the whole viewport, from the vertex index alone. There
   // is no geometry here worth a buffer: every pixel is the fragment shader's.
   vec2 corner = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
   gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);
 }
-`, Ve = 0.75, $e = 0.1, Y = 1, Qe = 0.02, Ze = 0.1, j = 1, Ye = 4, N = 5, je = 4, qe = {
+`, Ve = 0.75, $e = 0.1, j = 1, Qe = 0.02, Ze = 0.1, q = 1, Ye = 4, je = 90, N = 5, qe = 4, Ke = {
   2: 0,
   3: 0.25,
   4: 0.5,
   5: 0.75
-}, Ke = `#version 300 es
+}, Je = `#version 300 es
 precision highp float;
 uniform sampler2D uField;
 uniform bool uFlip;
@@ -1761,60 +1812,60 @@ void main() {
   fragColor = texelFetch(uField, position, 0);
 }
 `;
-function At() {
+function at() {
   return Le() && typeof WebGL2RenderingContext < "u";
 }
-const Je = {
+const et = {
   requestAnimationFrame: (n) => requestAnimationFrame(n),
   cancelAnimationFrame: (n) => cancelAnimationFrame(n)
 };
-class at extends EventTarget {
+class lt extends EventTarget {
   /** Receive fMP4 from the player and decode supplemental input only above 1.25x playback speed. */
   encodedVideo;
   #t;
   #i;
   #e;
-  #n;
+  #h;
   /** Finds Firefox's new pictures for the main-thread renderer. */
-  #u;
+  #f;
   /** The take holding the picture of the frame being ingested, if any. */
-  #o = null;
+  #A = null;
   #s;
   /** The pulldown detection, built only while the `film` option needs it. */
-  #A = null;
-  #c;
+  #o = null;
+  #d;
   #r;
   /** The program that copies a filtered picture onto the canvas. */
   #T;
   #v;
-  #p;
-  #E = [];
+  #E;
+  #u = [];
   /** Somewhere to filter a field into, and to read it back out of. */
-  #a = [];
+  #c = [];
   /** Which output slot was written last; the next one follows round the ring. */
-  #l = w - 1;
+  #a = T - 1;
   /** The draw path currently shown on the canvas, retained for snapshots. */
-  #h = null;
+  #n = null;
   /** Filtered fields waiting for their moment, oldest first. */
-  #f = [];
+  #l = [];
   /** The requestAnimationFrame() loop that puts them up, which is all that draws on the canvas. */
-  #d = null;
+  #b = null;
   #F = 0;
   /** Deliver captured pictures on the page's refresh during faster playback. */
   #m = null;
   /** The document the owner-change listener is on, if any. */
-  #x = null;
-  #V;
+  #p = null;
+  #H;
   /** The gap between animation frames: as near as the page gets to the screen. */
-  #M = We;
+  #R = We;
   /** Where the refresh grid fitted to the animation frames stands. (otya) */
   #N = 0;
   /** How far ahead of its animation frame the last picture shown stood. (otya) */
-  #xe = 0;
-  #H = 0;
+  #Te = 0;
+  #V = 0;
   #O = 0;
   /** The last picture chained onto the schedule; a break restarts it. (otya) */
-  #Q = null;
+  #Y = null;
   /**
    * Drop the presentation queue and restart the schedule from the clock.
    * Every schedule restart goes through here (otya nulls #lastScheduled at
@@ -1823,105 +1874,116 @@ class at extends EventTarget {
    * as late. Restart accounting for cadence changes lives in #schedule.
    */
   #P() {
-    this.#f.length = 0, this.#Q = null, this.#O = 0;
+    this.#l.length = 0, this.#Y = null, this.#O = 0;
   }
   /** The `<div>` this put around the element, so it can be taken away again. */
-  #k = null;
-  #we;
-  #L;
+  #U = null;
+  #ye;
+  #B;
   #G;
   #X = 0;
   /** otya GPU pulldown path: enabled by the `film` option (see below). */
   #z;
-  #_;
+  #M;
   /** How long a frame lasts in wall time, from what the frames themselves say. */
-  #b = 0;
+  #g = 0;
   /** The size of a frame as it is coded, which is what a texture holds. */
   #C = 0;
   #W = 0;
   /** Where the newest frame is. The two before it follow round the ring. */
-  #B = b - 1;
+  #k = g - 1;
   /** How many of the held frames are consecutive, up to HISTORY. */
-  #R = 0;
-  #Te = 0;
+  #D = 0;
+  #Fe = 0;
   /** presentedFrames at the last ingested frame; pairs with #lastMediaTime. */
-  #qe = 0;
+  #et = 0;
   /** A destination frame that arrived before the browser finished seeking. */
-  #ye = !1;
-  #D = !1;
-  /** Cancels work suspended inside a synchronous owner callback. */
-  #se = 0;
-  #Ne = !1;
-  #Z = !1;
-  #y = null;
-  #oe = [];
-  #$ = !1;
-  #Ke;
-  #Je;
-  #S;
-  #he;
-  #j;
-  #et;
-  #g = null;
-  #w;
-  #Fe = !1;
-  #tt = 0;
-  #it = !1;
-  #$t = 0;
   #Re = !1;
-  #Ge = !1;
-  #Ae = null;
-  #Qt = 0;
-  #De = /* @__PURE__ */ new Map();
+  #_ = !1;
+  /** Cancels work suspended inside a synchronous owner callback. */
+  #re = 0;
+  #Xe = !1;
+  #j = !1;
+  #y = null;
+  #Ae = [];
+  #Z = !1;
+  #tt;
+  #it;
+  #S;
+  #ae;
+  #K;
+  #st;
+  #x = null;
+  #w;
+  #De = !1;
+  #rt = 0;
+  #nt = !1;
+  #qt = 0;
+  #_e = !1;
+  #ze = !1;
+  #le = null;
+  #Kt = 0;
+  #Me = /* @__PURE__ */ new Map();
   /** Everything the next report is counted from. See DeinterlaceStats. */
-  #U = {
+  #L = {
     filtered: 0,
     missed: 0,
     degraded: 0,
     discontinuities: 0,
     resynced: 0,
     late: 0,
-    queueResetted: 0
+    queueResetted: 0,
+    matched: 0
   };
   /** `presentedFrames` of the last frame the callback saw; 0 before any. */
-  #_e = 0;
-  /** When the last frame the filter took arrived, to see the gaps between. */
-  #Oe = 0;
-  #Xe = 0;
-  #q = 0;
-  #ae = 0;
-  #le = 0;
-  #Me = 0;
-  #ue = 0;
-  #ce;
-  #ze = [];
-  #fe = [];
   #Se = 0;
-  #de = 0;
+  /** When the last frame the filter took arrived, to see the gaps between. */
+  #We = 0;
+  #He = 0;
+  #J = 0;
+  #ue = 0;
+  #ce = 0;
   #Pe = 0;
-  #me = 0;
-  /** The last phase read back from the GPU, and how many frames ago it was for. */
-  #Ce = x;
+  #fe = 0;
+  #de;
+  #Ve = [];
+  #me = [];
+  #Ce = 0;
   #pe = 0;
+  #Be = 0;
+  #Ee = 0;
+  /** The last phase read back from the GPU, and how many frames ago it was for. */
+  #ke = w;
+  #ve = 0;
   /** The phase of the frame being filtered: #known advanced by #knownAge. */
-  #I = x;
-  #K = !1;
-  #Ee = null;
-  #gt = "";
+  #I = w;
+  #$ = !1;
+  /** Frames of FILM_HOLD_FRAMES left since the cadence was last held. */
+  #Q = 0;
+  /** Whether the frame being filtered may have its fields matched. See #render. */
+  #ne = !1;
+  /** Whether the comb counts of the frame after it were made as well. */
+  #ot = !1;
+  /** Whether the frame before the newest followed a gap in the frames seen. */
+  #Ft = !1;
+  /** Whether the frames just before this one were progressive. */
+  #ht = !1;
+  #be = null;
+  #Rt = "";
   /** Debug only: frames given each phase (0 for none), and repeats dropped. */
-  #We = [0, 0, 0, 0, 0, 0];
-  #st = 0;
+  #$e = [0, 0, 0, 0, 0, 0];
+  #At = 0;
   /**
    * Why requested film reconstruction is currently degraded, or null while
    * healthy. The `film` option stays as the caller set it;
    * only the engine stands down, so this is never a silent option change.
    */
-  #re = null;
+  #oe = null;
   /** Last worker-reported filmError, to derive the page-side failure event. */
-  #rt = null;
-  #nt = 0;
+  #at = null;
+  #lt = 0;
   constructor(e, t = {}, i = null) {
-    super(), this.#e = e, this.#L = t.doubleRate ?? !1, this.#G = t.spatialCheck ?? !0, this.#z = t.debug ?? !1, this.#_ = t.film ?? !1, this.#Ke = t.onStats, this.#Je = t.onFailure, this.#S = i, this.#j = i ? "main" : t.rendering ?? "main", this.#et = t.workerUrl ?? he, this.#w = this.#j === "main" ? "main" : "idle", this.#i = i ? i.canvas : document.createElement("canvas"), this.#t = i?.canvas ?? (this.#j === "main" ? this.#i : document.createElement("canvas")), this.#he = e, i || (this.#i.style.cssText = "position:absolute;pointer-events:none;visibility:hidden");
+    super(), this.#e = e, this.#B = t.doubleRate ?? !1, this.#G = t.spatialCheck ?? !0, this.#z = t.debug ?? !1, this.#M = t.film ?? !1, this.#tt = t.onStats, this.#it = t.onFailure, this.#S = i, this.#K = i ? "main" : t.rendering ?? "main", this.#st = t.workerUrl ?? Ae, this.#w = this.#K === "main" ? "main" : "idle", this.#i = i ? i.canvas : document.createElement("canvas"), this.#t = i?.canvas ?? (this.#K === "main" ? this.#i : document.createElement("canvas")), this.#ae = e, i || (this.#i.style.cssText = "position:absolute;pointer-events:none;visibility:hidden");
     const s = this.#t.getContext("webgl2", {
       // Keep the underlying video in Chromium's compositor to receive frame notifications at the source rate.
       alpha: !0,
@@ -1933,52 +1995,52 @@ class at extends EventTarget {
     });
     if (!(s instanceof WebGL2RenderingContext))
       throw new Error("this browser has no WebGL2");
-    this.#s = s, this.#_ && (this.#yt(), this.#A = new V(s)), this.#c = q(s, De);
-    const r = this.#c;
+    this.#s = s, this.#M && (this.#St(), this.#o = new $(s)), this.#d = K(s, De);
+    const r = this.#d;
     this.#r = Object.fromEntries(
       Object.entries(Re).map(([o, h]) => [
         o,
         s.getUniformLocation(r, h)
       ])
-    ), this.#T = q(s, Ke), this.#v = s.getUniformLocation(this.#T, "uField"), this.#p = s.getUniformLocation(this.#T, "uFlip"), this.#ce = s.getExtension(
+    ), this.#T = K(s, Je), this.#v = s.getUniformLocation(this.#T, "uField"), this.#E = s.getUniformLocation(this.#T, "uFlip"), this.#de = s.getExtension(
       "EXT_disjoint_timer_query_webgl2"
     ), this.#t.addEventListener(
       "webglcontextlost",
-      this.#Vt
-    ), this.#we = i ? null : new ResizeObserver(() => this.#Ue()), this.#V = i ? null : new MutationObserver(() => {
-      this.#i.ownerDocument !== this.#x && this.#Ue();
-    }), this.encodedVideo = !i && typeof VideoDecoder < "u" ? new Me(e) : null, this.#u = i ? null : new Ce(s, e), this.#n = new Oe(
+      this.#jt
+    ), this.#ye = i ? null : new ResizeObserver(() => this.#Ge()), this.#H = i ? null : new MutationObserver(() => {
+      this.#i.ownerDocument !== this.#p && this.#Ge();
+    }), this.encodedVideo = !i && typeof VideoDecoder < "u" ? new Me(e) : null, this.#f = i ? null : new Ce(s, e), this.#h = new Oe(
       e,
       () => this.encodedVideo?.take(),
-      () => this.#w === "main" ? this.#u : null
-    ), e.addEventListener("emptied", this.#zt), e.addEventListener("resize", this.#Xt), e.addEventListener("pause", this.#ie), e.addEventListener("ended", this.#ie), e.addEventListener("seeking", this.#Ht), e.addEventListener("seeked", this.#ie), e.addEventListener("ratechange", this.#ie);
+      () => this.#w === "main" ? this.#f : null
+    ), e.addEventListener("emptied", this.#Qt), e.addEventListener("resize", this.#$t), e.addEventListener("pause", this.#se), e.addEventListener("ended", this.#se), e.addEventListener("seeking", this.#Yt), e.addEventListener("seeked", this.#se), e.addEventListener("ratechange", this.#se);
   }
   get running() {
-    return this.#D && (this.#y?.interlaced ?? !0);
+    return this.#_ && (this.#y?.interlaced ?? !0);
   }
   /** The HTML canvas currently placed over the media element. */
   get canvas() {
     return this.#i;
   }
   /** Field order for the current scan state, defaulting to top-field-first. */
-  get #xt() {
+  get #Dt() {
     return this.#y?.topFieldFirst !== !1;
   }
   /** The same public filter options for either rendering target. */
-  #wt() {
+  #_t() {
     return {
-      doubleRate: this.#L,
+      doubleRate: this.#B,
       spatialCheck: this.#G,
-      film: this.#_,
+      film: this.#M,
       debug: this.#z
     };
   }
   /** Whether the caller wants filtering, independently of the current source. */
   get enabled() {
-    return this.#Ne;
+    return this.#Xe;
   }
   set enabled(e) {
-    this.#Ne = e, this.#ot(), this.#g?.postMessage({
+    this.#Xe = e, this.#ut(), this.#x?.postMessage({
       type: "enabled",
       enabled: e
     });
@@ -1986,19 +2048,19 @@ class at extends EventTarget {
   /** Update whether the source needs filtering and which field comes first. */
   set scan(e) {
     const t = this.#y?.interlaced !== e?.interlaced, i = t || this.#y?.topFieldFirst !== e?.topFieldFirst;
-    this.#y = e, !(i && (!this.#be() || this.#y !== e)) && (this.#g?.postMessage({ type: "scan", scan: e }), i && (this.#R = 0, this.#P(), this.#Y(), t && (this.#b = 0), this.#h = null, this.#te(!1)), this.#ot(), i && ((e?.interlaced ?? !0) && (this.#S || this.#w === "main") ? this.#Le() : this.#ft()));
+    this.#y = e, !(i && (!this.#xe() || this.#y !== e)) && (this.#x?.postMessage({ type: "scan", scan: e }), i && (this.#D = 0, this.#P(), this.#q(), t && (this.#g = 0), this.#n = null, this.#ie(!1)), this.#ut(), i && ((e?.interlaced ?? !0) && (this.#S || this.#w === "main") ? this.#Ne() : this.#Et()));
   }
   get scan() {
     return this.#y;
   }
   set videoTimeline(e) {
-    this.#oe = e, this.#g?.postMessage({
+    this.#Ae = e, this.#x?.postMessage({
       type: "timeline",
       videoTimeline: e
-    }), e.length === 0 && (this.#y = null), this.#ot();
+    }), e.length === 0 && (this.#y = null), this.#ut();
   }
   get videoTimeline() {
-    return this.#oe;
+    return this.#Ae;
   }
   /**
    * What to put on the screen for fullscreen: the `<div>` holding both the
@@ -2007,135 +2069,135 @@ class at extends EventTarget {
    * the page, and with it the only deinterlaced picture there is.
    */
   get container() {
-    return this.#k ?? this.#e;
+    return this.#U ?? this.#e;
   }
   /** Whether a picture goes up for every field rather than every frame. */
   get doubleRate() {
-    return this.#L;
+    return this.#B;
   }
   set doubleRate(e) {
-    e !== this.#L && (this.#L = e, this.#ve(), this.#P(), this.#Tt());
+    e !== this.#B && (this.#B = e, this.#ge(), this.#P(), this.#Mt());
   }
   get spatialCheck() {
     return this.#G;
   }
   set spatialCheck(e) {
-    e !== this.#G && (this.#G = e, this.#ve());
+    e !== this.#G && (this.#G = e, this.#ge());
   }
   get film() {
-    return this.#_;
+    return this.#M;
   }
   set film(e) {
-    const t = this.#g ? this.#rt : this.#re;
-    if (!(e === this.#_ && (e === !1 || t === null))) {
-      if (this.#g) {
-        this.#_ = e, this.#ve(e ? "film" : void 0);
+    const t = this.#x ? this.#at : this.#oe;
+    if (!(e === this.#M && (e === !1 || t === null))) {
+      if (this.#x) {
+        this.#M = e, this.#ge(e ? "film" : void 0);
         return;
       }
       if (e) {
-        if (!this.#be()) return;
+        if (!this.#xe()) return;
         try {
-          this.#Ft();
+          this.#Pt();
         } catch (i) {
-          this.#_ = !0, this.#ve(), this.#At(
+          this.#M = !0, this.#ge(), this.#Qe(
             `film detector unavailable: ${i instanceof Error ? i.message : String(i)}`
           );
           return;
         }
       }
-      if (this.#_ = e, this.#ve(), !e) {
-        if (!this.#be()) return;
-        this.#K = !1, this.#I = x, this.#Y(), this.#A?.destroy(), this.#A = null;
+      if (this.#M = e, this.#ge(), !e) {
+        if (!this.#xe()) return;
+        this.#$ = !1, this.#Q = 0, this.#ne = !1, this.#I = w, this.#q(), this.#o?.destroy(), this.#o = null;
       }
-      this.#Tt();
+      this.#Mt();
     }
   }
   get debug() {
     return this.#z;
   }
   set debug(e) {
-    e !== this.#z && (this.#z = e, this.#ve());
+    e !== this.#z && (this.#z = e, this.#ge());
   }
   /** Whether pictures are queued for presentation by the frame loop. */
-  get #Zt() {
-    return this.#L || this.#_;
+  get #Jt() {
+    return this.#B || this.#M;
   }
-  #Tt() {
-    this.#Z || (this.#Zt ? (this.#C > 0 && this.#Ot(), (this.#y?.interlaced ?? !0) && (this.#S || this.#w === "main") && this.#Le()) : this.#_ || (this.#h = null, this.#te(!1), this.#Ie()));
+  #Mt() {
+    this.#j || (this.#Jt ? (this.#C > 0 && this.#Vt(), (this.#y?.interlaced ?? !0) && (this.#S || this.#w === "main") && this.#Ne()) : this.#M || (this.#n = null, this.#ie(!1), this.#Oe()));
   }
   /** Apply mutable filter settings to the existing Worker and canvas. */
-  #ve(e) {
-    this.#g?.postMessage({
+  #ge(e) {
+    this.#x?.postMessage({
       type: "settings",
-      options: this.#wt(),
+      options: this.#_t(),
       retryFilm: e
     });
   }
-  #yt() {
+  #St() {
     if (this.#s.getExtension("EXT_color_buffer_float") === null)
       throw new Error("film needs EXT_color_buffer_float");
   }
   /** Build the GPU pulldown detector the `film` option needs, or throw. */
-  #Ft() {
-    this.#yt(), this.#A ??= new V(this.#s), this.#C > 0 && this.#A.resize(this.#C, this.#W);
+  #Pt() {
+    this.#St(), this.#o ??= new $(this.#s), this.#C > 0 && this.#o.resize(this.#C, this.#W);
   }
-  #ot() {
-    this.#Ne && (this.#oe.length > 0 || (this.#y?.interlaced ?? !0)) ? this.start() : this.stop();
+  #ut() {
+    this.#Xe && (this.#Ae.length > 0 || (this.#y?.interlaced ?? !0)) ? this.start() : this.stop();
   }
   /** Start the bundled Worker when the required transfer APIs are available. */
-  #Yt() {
-    return this.#S || this.#j === "main" ? !1 : this.#w === "starting" || this.#w === "active" ? !0 : typeof Worker < "u" && typeof VideoFrame < "u" && typeof OffscreenCanvas < "u" && this.#et !== null && "transferControlToOffscreen" in HTMLCanvasElement.prototype ? (this.#Rt(), !0) : this.#j === "auto" ? (this.#He(), !1) : (this.#w = "failed", this.#D = !1, !0);
+  #ei() {
+    return this.#S || this.#K === "main" ? !1 : this.#w === "starting" || this.#w === "active" ? !0 : typeof Worker < "u" && typeof VideoFrame < "u" && typeof OffscreenCanvas < "u" && this.#st !== null && "transferControlToOffscreen" in HTMLCanvasElement.prototype ? (this.#Ct(), !0) : this.#K === "auto" ? (this.#Ze(), !1) : (this.#w = "failed", this.#_ = !1, !0);
   }
   /** Transfer the display canvas to a new Worker, replacing it if already transferred. */
-  #Rt() {
-    this.#J(), this.#g?.terminate(), this.#g = null, this.#Re = !1, this.#Ge = !1, this.#rt = null, this.#nt = 0;
+  #Ct() {
+    this.#ee(), this.#x?.terminate(), this.#x = null, this.#_e = !1, this.#ze = !1, this.#at = null, this.#lt = 0;
     let e = this.#i;
-    if (this.#it) {
+    if (this.#nt) {
       e = document.createElement("canvas"), e.className = this.#i.className;
       const r = this.#i.getAttribute("style");
       r === null ? e.removeAttribute("style") : e.setAttribute("style", r), e.style.visibility = "hidden", this.#i.parentElement && this.#i.replaceWith(e), this.#i = e;
     }
-    const t = ++this.#tt;
+    const t = ++this.#rt;
     this.#w = "starting";
     let i, s;
     try {
-      s = e.transferControlToOffscreen(), this.#it = !0, i = new Worker(this.#et, { type: "module" });
+      s = e.transferControlToOffscreen(), this.#nt = !0, i = new Worker(this.#st, { type: "module" });
     } catch (r) {
-      this.#Be(
+      this.#Le(
         r instanceof Error ? r.message : String(r)
       );
       return;
     }
-    this.#g = i, i.onmessage = (r) => {
-      t === this.#tt && this.#jt(r.data);
+    this.#x = i, i.onmessage = (r) => {
+      t === this.#rt && this.#ti(r.data);
     }, i.onerror = (r) => {
-      t === this.#tt && (r.preventDefault(), this.#Be(r.message || "the deinterlacer worker failed"));
+      t === this.#rt && (r.preventDefault(), this.#Le(r.message || "the deinterlacer worker failed"));
     }, i.postMessage(
       {
         type: "initialize",
         canvas: s,
-        options: this.#wt(),
+        options: this.#_t(),
         scan: this.#y,
-        videoTimeline: this.#oe,
-        enabled: this.#D,
-        video: this.#at()
+        videoTimeline: this.#Ae,
+        enabled: this.#_,
+        video: this.#ft()
       },
       [s]
     );
   }
   /** Apply Worker notifications and release the wait for the next input frame. */
-  #jt(e) {
+  #ti(e) {
     switch (e.type) {
       case "ready":
-        this.#w = "active", this.#D && (this.#ke(), this.#je());
+        this.#w = "active", this.#_ && (this.#Ue(), this.#Je());
         break;
       case "failed":
-        this.#Be(e.message);
+        this.#Le(e.message);
         break;
       case "consumed": {
-        this.#Re = !1, this.#Ge = !0;
-        const t = this.#Ae;
-        this.#Ae = null, t && this.#_t(t);
+        this.#_e = !1, this.#ze = !0;
+        const t = this.#le;
+        this.#le = null, t && this.#kt(t);
         break;
       }
       case "visibility":
@@ -2145,22 +2207,22 @@ class at extends EventTarget {
         const t = {
           ...e.stats,
           dropped: this.#e.getVideoPlaybackQuality?.().droppedVideoFrames ?? 0
-        }, i = t.filmError ?? null, s = this.#nt;
-        if (this.#rt = i, this.#nt = e.filmFailure, i !== null && e.filmFailure !== s) {
+        }, i = t.filmError ?? null, s = this.#lt;
+        if (this.#at = i, this.#lt = e.filmFailure, i !== null && e.filmFailure !== s) {
           this.dispatchEvent(
             new CustomEvent("failure", { detail: i })
           );
           try {
-            this.#Je?.(i);
+            this.#it?.(i);
           } catch {
           }
         }
-        this.dispatchEvent(new CustomEvent("stats", { detail: t })), this.#Ke?.(t);
+        this.dispatchEvent(new CustomEvent("stats", { detail: t })), this.#tt?.(t);
         break;
       }
       case "capture": {
-        const t = this.#De.get(e.id);
-        if (this.#De.delete(e.id), !t) {
+        const t = this.#Me.get(e.id);
+        if (this.#Me.delete(e.id), !t) {
           e.image?.close();
           break;
         }
@@ -2178,10 +2240,10 @@ class at extends EventTarget {
    * `stats.filmError` and the page derives the event from the episode count,
    * so a film degradation is never mistaken for worker death.
    */
-  #ht(e) {
+  #ct(e) {
     if (this.dispatchEvent(new CustomEvent("failure", { detail: e })), !this.#S)
       try {
-        this.#Je?.(e);
+        this.#it?.(e);
       } catch {
       }
   }
@@ -2193,82 +2255,82 @@ class at extends EventTarget {
    * rewrite the caller's 24fps intent -- so the option stays on and only
    * the engine stands down.
    */
-  #At(e) {
-    this.#re !== e && (this.#re = e, this.#K = !1, this.#I = x, this.#Y(), this.#A?.destroy(), this.#A = null, this.#ht(e));
+  #Qe(e) {
+    this.#oe !== e && (this.#oe = e, this.#$ = !1, this.#Q = 0, this.#ne = !1, this.#I = w, this.#q(), this.#o?.destroy(), this.#o = null, this.#ct(e));
   }
   /**
    * Re-arm film reconstruction at a resource-reallocation point (start, scan
    * change, resize, or re-setting the option). The next frame retries; a
    * repeated failure degrades again and notifies as a new episode.
    */
-  #be() {
-    return this.#Z ? !1 : (this.#g || (this.#re = null), !0);
+  #xe() {
+    return this.#j ? !1 : (this.#x || (this.#oe = null), !0);
   }
   /** Retry a transient Worker failure once, then show the media element if it fails again. */
-  #Be(e) {
-    if (this.#w === "starting" && this.#j === "auto" && !this.#Fe) {
-      this.#He();
+  #Le(e) {
+    if (this.#w === "starting" && this.#K === "auto" && !this.#De) {
+      this.#Ze();
       return;
     }
-    if (this.#Dt(e), !this.#Fe) {
-      this.#Fe = !0, this.#Rt();
+    if (this.#Bt(e), !this.#De) {
+      this.#De = !0, this.#Ct();
       return;
     }
-    console.error(`Deinterlacer Worker stopped: ${e}`), this.#w = "failed", this.#g?.terminate(), this.#g = null, this.#J(), this.#ht(`deinterlacer worker stopped: ${e}`), this.stop();
+    console.error(`Deinterlacer Worker stopped: ${e}`), this.#w = "failed", this.#x?.terminate(), this.#x = null, this.#ee(), this.#ct(`deinterlacer worker stopped: ${e}`), this.stop();
   }
   /** Restore the main-thread canvas when automatic Worker selection fails. */
-  #He() {
+  #Ze() {
     const e = this.#t;
     e.className = this.#i.className;
     const t = this.#i.getAttribute("style");
-    t === null ? e.removeAttribute("style") : e.setAttribute("style", t), e.style.visibility = "hidden", this.#i.parentElement && this.#i.replaceWith(e), this.#i = e, this.#it = !1, this.#g?.terminate(), this.#g = null, this.#w = "main", this.#J(), this.#D && (this.#ke(), this.#je(), (this.#y?.interlaced ?? !0) && this.#Le());
+    t === null ? e.removeAttribute("style") : e.setAttribute("style", t), e.style.visibility = "hidden", this.#i.parentElement && this.#i.replaceWith(e), this.#i = e, this.#nt = !1, this.#x?.terminate(), this.#x = null, this.#w = "main", this.#ee(), this.#_ && (this.#Ue(), this.#Je(), (this.#y?.interlaced ?? !0) && this.#Ne());
   }
   /** Close the queued frame still owned by the page when switching renderers. */
-  #J() {
-    this.#Ae?.frame.close(), this.#Ae = null;
+  #ee() {
+    this.#le?.frame.close(), this.#le = null;
   }
   /** Reject captures whose replies would be lost when the Worker is rebuilt. */
-  #Dt(e) {
-    for (const t of this.#De.values())
+  #Bt(e) {
+    for (const t of this.#Me.values())
       t.reject(new Error(e));
-    this.#De.clear();
+    this.#Me.clear();
   }
   start() {
-    if (!(this.#D || this.#Z || this.#$) && (this.#se++, this.#D = !0, this.#Wt(), !!this.#be())) {
-      if (this.#ci(), this.#je(), this.#Yt()) {
-        this.#g?.postMessage({
+    if (!(this.#_ || this.#j || this.#Z) && (this.#re++, this.#_ = !0, this.#Zt(), !!this.#xe())) {
+      if (this.#vi(), this.#Je(), this.#ei()) {
+        this.#x?.postMessage({
           type: "enabled",
           enabled: !0
-        }), this.#w === "active" && this.#ke();
+        }), this.#w === "active" && this.#Ue();
         return;
       }
-      this.#ke(), (this.#y?.interlaced ?? !0) && this.#Le();
+      this.#Ue(), (this.#y?.interlaced ?? !0) && this.#Ne();
     }
   }
   /** Take the deinterlaced picture away, leaving the element's own showing. */
   stop() {
-    this.#se++, this.#D && (this.#D = !1, this.#n.cancel(), this.encodedVideo?.suspend(), this.#Bt(), this.#ft(), this.#R = 0, this.#h = null, this.#te(!1), this.#J(), this.#g?.postMessage({
+    this.#re++, this.#_ && (this.#_ = !1, this.#h.cancel(), this.encodedVideo?.suspend(), this.#Gt(), this.#Et(), this.#D = 0, this.#n = null, this.#ie(!1), this.#ee(), this.#x?.postMessage({
       type: "enabled",
       enabled: !1
     }));
   }
   destroy() {
-    if (!this.#Z) {
-      this.#Z = !0, this.#Ne = !1, this.stop(), this.#g?.postMessage({ type: "destroy" }), this.#g?.terminate(), this.#g = null, this.#J(), this.#Dt("the deinterlacer was destroyed"), this.#x?.removeEventListener(
+    if (!this.#j) {
+      this.#j = !0, this.#Xe = !1, this.stop(), this.#x?.postMessage({ type: "destroy" }), this.#x?.terminate(), this.#x = null, this.#ee(), this.#Bt("the deinterlacer was destroyed"), this.#p?.removeEventListener(
         "visibilitychange",
-        this.#pt
-      ), this.#x = null, this.#V?.disconnect(), this.#t.removeEventListener(
+        this.#gt
+      ), this.#p = null, this.#H?.disconnect(), this.#t.removeEventListener(
         "webglcontextlost",
-        this.#Vt
-      ), this.#n.destroy(), this.#u?.destroy(), this.encodedVideo?.destroy(), this.#e.removeEventListener("emptied", this.#zt), this.#e.removeEventListener("resize", this.#Xt), this.#e.removeEventListener("pause", this.#ie), this.#e.removeEventListener("ended", this.#ie), this.#e.removeEventListener("seeking", this.#Ht), this.#e.removeEventListener("seeked", this.#ie), this.#e.removeEventListener("ratechange", this.#ie), this.#fi();
-      for (const e of this.#E) this.#s.deleteTexture(e);
-      this.#E = [], this.#Ie();
+        this.#jt
+      ), this.#h.destroy(), this.#f?.destroy(), this.encodedVideo?.destroy(), this.#e.removeEventListener("emptied", this.#Qt), this.#e.removeEventListener("resize", this.#$t), this.#e.removeEventListener("pause", this.#se), this.#e.removeEventListener("ended", this.#se), this.#e.removeEventListener("seeking", this.#Yt), this.#e.removeEventListener("seeked", this.#se), this.#e.removeEventListener("ratechange", this.#se), this.#bi();
+      for (const e of this.#u) this.#s.deleteTexture(e);
+      this.#u = [], this.#Oe();
       for (const e of [
-        ...this.#ze,
-        ...this.#fe.map(({ q: t }) => t)
+        ...this.#Ve,
+        ...this.#me.map(({ q: t }) => t)
       ])
         this.#s.deleteQuery(e);
-      this.#ze.length = 0, this.#fe.length = 0, this.#A?.destroy(), this.#A = null, this.#Ee !== null && (de(this.#Ee), this.#Ee = null), this.#s.deleteProgram(this.#c), this.#s.deleteProgram(this.#T), this.#s.getExtension("WEBGL_lose_context")?.loseContext();
+      this.#Ve.length = 0, this.#me.length = 0, this.#o?.destroy(), this.#o = null, this.#be !== null && (me(this.#be), this.#be = null), this.#s.deleteProgram(this.#d), this.#s.deleteProgram(this.#T), this.#s.getExtension("WEBGL_lose_context")?.loseContext();
     }
   }
   /**
@@ -2280,11 +2342,11 @@ class at extends EventTarget {
    * permanent cost of `preserveDrawingBuffer` on ordinary playback.
    */
   capture() {
-    if (this.#w === "active" && this.#i.style.visibility === "visible" && this.#g) {
-      const s = ++this.#Qt, r = new Promise((o, h) => {
-        this.#De.set(s, { resolve: o, reject: h });
+    if (this.#w === "active" && this.#i.style.visibility === "visible" && this.#x) {
+      const s = ++this.#Kt, r = new Promise((o, h) => {
+        this.#Me.set(s, { resolve: o, reject: h });
       });
-      return this.#g.postMessage({
+      return this.#x.postMessage({
         type: "capture",
         id: s,
         width: this.#e.videoWidth,
@@ -2293,12 +2355,12 @@ class at extends EventTarget {
     }
     if (this.#w === "starting" || this.#w === "failed")
       return createImageBitmap(this.#e);
-    const e = this.#h;
-    if (this.#S && (!this.#D || this.#$ || !e))
+    const e = this.#n;
+    if (this.#S && (!this.#_ || this.#Z || !e))
       return Promise.reject(new Error("no rendered picture is available"));
-    if (!this.#D || this.#$ || !e)
+    if (!this.#_ || this.#Z || !e)
       return createImageBitmap(this.#e);
-    e.kind === "texture" ? this.#vt(e.texture, e.flip, !1) : this.#ne(e.flush, e.second, null, !1);
+    e.kind === "texture" ? this.#wt(e.texture, e.flip, !1) : this.#he(e.flush, e.second, null, !1);
     const t = this.#e.videoWidth, i = this.#e.videoHeight;
     return t > 0 && i > 0 && (t !== this.#t.width || i !== this.#t.height) ? createImageBitmap(this.#t, {
       resizeWidth: t,
@@ -2312,11 +2374,11 @@ class at extends EventTarget {
   removeEventListener(e, t, i) {
     super.removeEventListener(e, t, i);
   }
-  #ke() {
-    this.#S || !this.#D || this.#n.request(this.#si);
+  #Ue() {
+    this.#S || !this.#_ || this.#h.request(this.#ai);
   }
   /** Copy the element's playback state for seek and presentation timing decisions. */
-  #at() {
+  #ft() {
     const e = [];
     for (let t = 0; t < this.#e.buffered.length; t++)
       e.push({
@@ -2336,7 +2398,7 @@ class at extends EventTarget {
     };
   }
   /** Keep one frame in flight and the newest one waiting, staying close to the audio clock. */
-  #qt(e, t, i) {
+  #ii(e, t, i) {
     let s;
     try {
       s = i?.clone() ?? new VideoFrame(this.#e, {
@@ -2344,30 +2406,30 @@ class at extends EventTarget {
       });
     } catch (o) {
       const h = o instanceof Error ? o.message : String(o);
-      this.#j === "auto" && !this.#Ge && !this.#Fe ? (this.#He(), this.#$e(e, t)) : this.#Be(h);
+      this.#K === "auto" && !this.#ze && !this.#De ? (this.#Ze(), this.#je(e, t)) : this.#Le(h);
       return;
     }
     const r = {
-      id: ++this.#$t,
+      id: ++this.#qt,
       frame: s,
       now: e,
       metadata: t,
-      video: this.#at()
+      video: this.#ft()
     };
-    if (this.#Re) {
-      this.#Ae?.frame.close(), this.#Ae = r;
+    if (this.#_e) {
+      this.#le?.frame.close(), this.#le = r;
       return;
     }
-    this.#_t(r);
+    this.#kt(r);
   }
   /** Transfer the selected frame once the Worker has released the previous input. */
-  #_t(e) {
-    const t = this.#g;
+  #kt(e) {
+    const t = this.#x;
     if (!t || this.#w !== "active") {
       e.frame.close();
       return;
     }
-    this.#Re = !0;
+    this.#_e = !0;
     const i = {
       type: "frame",
       id: e.id,
@@ -2378,67 +2440,85 @@ class at extends EventTarget {
     try {
       t.postMessage(i, [e.frame]);
     } catch (s) {
-      this.#Re = !1, e.frame.close();
+      this.#_e = !1, e.frame.close();
       const r = s instanceof Error ? s.message : String(s);
-      this.#j === "auto" && !this.#Ge && !this.#Fe ? (this.#He(), this.#$e(e.now, e.metadata)) : this.#Be(r);
+      this.#K === "auto" && !this.#ze && !this.#De ? (this.#Ze(), this.#je(e.now, e.metadata)) : this.#Le(r);
     }
   }
-  #Kt(e, t, i) {
-    this.#Ee == null && (this.#Ee = ce(this.#s, "20px monospace")), me(this.#Ee, e, t, i, this.#C, this.#W, 20);
+  #si(e, t, i) {
+    this.#be == null && (this.#be = fe(this.#s, "20px monospace")), pe(this.#be, e, t, i, this.#C, this.#W, 20);
   }
-  #Mt(e) {
-    if (this.#ce == null || this.#fe.length > 30)
+  #Lt(e) {
+    if (this.#de == null || this.#me.length > 30)
       return;
-    const t = this.#ze.pop() ?? this.#s.createQuery();
-    return this.#s.beginQuery(this.#ce.TIME_ELAPSED_EXT, t), this.#fe.push({ q: t, isField: e }), t;
+    const t = this.#Ve.pop() ?? this.#s.createQuery();
+    return this.#s.beginQuery(this.#de.TIME_ELAPSED_EXT, t), this.#me.push({ q: t, isField: e }), t;
   }
-  #Ve(e) {
-    this.#ce != null && (e != null && this.#s.endQuery(this.#ce.TIME_ELAPSED_EXT), this.#fe = this.#fe.filter(
+  #Ye(e) {
+    this.#de != null && (e != null && this.#s.endQuery(this.#de.TIME_ELAPSED_EXT), this.#me = this.#me.filter(
       ({ q: t, isField: i }) => {
         if (this.#s.getQueryParameter(t, this.#s.QUERY_RESULT_AVAILABLE)) {
           const s = this.#s.getQueryParameter(t, this.#s.QUERY_RESULT);
-          return i ? (this.#Pe += s, this.#me++) : (this.#Se += s, this.#de++), this.#ze.push(t), !1;
+          return i ? (this.#Be += s, this.#Ee++) : (this.#Ce += s, this.#pe++), this.#Ve.push(t), !1;
         }
         return !0;
       }
     ));
   }
-  #Y() {
-    this.#I = x, this.#Ce = x, this.#pe = 0, this.#K = !1, this.#A?.reset();
+  #q() {
+    this.#I = w, this.#ke = w, this.#ve = 0, this.#$ = !1, this.#o?.reset();
   }
   /** Detect the pulldown phase of the frame being filtered on the GPU. */
-  #Jt() {
-    const { prev: e, cur: t, next: i } = this.#Nt(!1), s = this.#E[e], r = this.#E[t], o = this.#E[i];
+  #ri() {
+    const { prev: e, cur: t, next: i } = this.#Tt(!1), s = this.#u[e], r = this.#u[t], o = this.#u[i];
     if (!s || !r || !o) return;
     const h = this.#y?.topFieldFirst !== !1 ? 0 : 1;
-    this.#A?.detect(r, o, h), this.#A?.measureComb(s, r, h);
+    this.#o?.detect(r, o, h), this.#o?.measureComb(s, r, h);
+  }
+  /**
+   * Count the combing of the frame after the one being filtered, which says
+   * whether its first field belongs between this frame's second-field lines.
+   * Returns whether the count was made.
+   */
+  #ni() {
+    const { cur: e, next: t } = this.#Tt(!1), i = this.#u[e], s = this.#u[t], r = this.#o;
+    if (!i || !s || !r) return !1;
+    const o = this.#y?.topFieldFirst !== !1 ? 0 : 1;
+    try {
+      r.measureComb(i, s, o, !0);
+    } catch (h) {
+      return this.#Qe(
+        `film detection failed: ${h instanceof Error ? h.message : String(h)}`
+      ), !1;
+    }
+    return !0;
   }
   /**
    * Read back the previous frame's phase if it has arrived, and advance it
    * to the frame being filtered. The run is not advanced: only the GPU
    * counts observed frames.
    */
-  #ei() {
-    const e = this.#A?.poll() ?? null;
-    e !== null && (this.#Ce = e, this.#pe = e.age), this.#pe++;
-    const { phase: t, run: i } = this.#Ce;
-    t === 0 || this.#pe > Math.ceil(N * Math.max(1, this.#e.playbackRate)) ? this.#I = x : this.#I = {
-      phase: (t - 1 + this.#pe) % N + 1,
+  #oi() {
+    const e = this.#o?.poll() ?? null;
+    e !== null && (this.#ke = e, this.#ve = e.age), this.#ve++;
+    const { phase: t, run: i } = this.#ke;
+    t === 0 || this.#ve > Math.ceil(N * Math.max(1, this.#e.playbackRate)) ? this.#I = w : this.#I = {
+      phase: (t - 1 + this.#ve) % N + 1,
       run: i
     };
   }
-  #ti(e) {
-    const t = [], i = this.#A?.metrics ?? new Float32Array(0);
-    for (let r = 0; r < p.phase; r++) {
+  #hi(e) {
+    const t = [], i = this.#o?.metrics ?? new Float32Array(0);
+    for (let r = 0; r < E.phase; r++) {
       const o = i[r * 4] ?? 0, h = i[r * 4 + 1] ?? 0, a = i[r * 4 + 2] ?? 0;
       t.push(
         `${o.toFixed(3)},${h.toString().padStart(4)},${a.toFixed(3)}`
       );
     }
-    const s = this.#We.map((r, o) => `${o === 0 ? "-" : o}:${r}`).join(" ");
-    return `frame=${e} phase=${this.#I.phase} run=${this.#I.run} known=${this.#Ce.phase}/${this.#Ce.run} age=${this.#pe} ${this.#K ? "film" : "video"} period=${this.#b.toFixed(3)}
+    const s = this.#$e.map((r, o) => `${o === 0 ? "-" : o}:${r}`).join(" ");
+    return `frame=${e} phase=${this.#I.phase} run=${this.#I.run} known=${this.#ke.phase}/${this.#ke.run} age=${this.#ve} ${this.#$ ? "film" : "video"} period=${this.#g.toFixed(3)}
 ${t.join(" ")}
-${s} dropped:${this.#st}`;
+${s} dropped:${this.#At}`;
   }
   /**
    * A timestamp taken on `origin`'s clock, expressed on this realm's.
@@ -2450,7 +2530,7 @@ ${s} dropped:${this.#st}`;
    * large numbers, their difference is not, and doing it the other way round
    * would spend the precision the schedule is measured in.
    */
-  #lt(e, t) {
+  #dt(e, t) {
     const i = t - performance.timeOrigin;
     return Number.isFinite(i) && i !== 0 ? e + i : e;
   }
@@ -2465,34 +2545,34 @@ ${s} dropped:${this.#st}`;
    * Those fall back to the moment the frame was taken in hand, which is this
    * renderer's own clock and always valid.
    */
-  #ii(e, t) {
+  #Ai(e, t) {
     const i = e.expectedDisplayTime;
     if (!Number.isFinite(i) || i <= 0 || !Number.isFinite(e.timeOrigin)) return t;
-    const s = this.#lt(i, e.timeOrigin), r = Ye * Math.max(this.#M, this.#b);
+    const s = this.#dt(i, e.timeOrigin), r = Ye * Math.max(this.#R, this.#g);
     return s < t - r || s > t + r ? t : s;
   }
-  #si = (e, t) => {
-    if (!this.#D || this.#$) return;
-    this.#mt();
-    const i = this.#lt(e, t.timeOrigin), { frame: s, picture: r, ...o } = t;
-    this.#he = s ?? this.#e, this.#o = r ?? null;
+  #ai = (e, t) => {
+    if (!this.#_ || this.#Z) return;
+    this.#bt();
+    const i = this.#dt(e, t.timeOrigin), { frame: s, picture: r, ...o } = t;
+    this.#ae = s ?? this.#e, this.#A = r ?? null;
     try {
-      this.#ri(i, o, s);
+      this.#li(i, o, s);
     } finally {
-      this.#he = this.#e, this.#o = null;
+      this.#ae = this.#e, this.#A = null;
     }
-    this.#ke();
+    this.#Ue();
   };
   /**
    * Take a frame from either acquisition path into the selected renderer.
    * `now` is the ingestion time on this realm's clock.
    */
-  #ri(e, t, i) {
+  #li(e, t, i) {
     if (this.#w === "active") {
-      this.#qt(e, t, i);
+      this.#ii(e, t, i);
       return;
     }
-    this.#w !== "starting" && this.#$e(e, t);
+    this.#w !== "starting" && this.#je(e, t);
   }
   /**
    * @internal Feed Worker input through the same history and rendering decisions
@@ -2501,132 +2581,133 @@ ${s} dropped:${this.#st}`;
    * using the accompanying timeOrigin.
    */
   ingestExternalFrame(e, t, i) {
-    this.#he = i;
+    this.#ae = i;
     try {
-      this.#$e(e, t);
+      this.#je(e, t);
     } finally {
-      this.#he = this.#e;
+      this.#ae = this.#e;
     }
   }
   /** Take one input into the shared history and decide its YADIF or IVTC presentation. */
-  #$e(e, t) {
-    const i = this.#se;
-    if (this.#ee(i) && (this.#ni(t.mediaTime), !!this.#ee(i) && t.width > 0 && t.height > 0)) {
+  #je(e, t) {
+    const i = this.#re;
+    if (this.#te(i) && (this.#ui(t.mediaTime), !!this.#te(i) && t.width > 0 && t.height > 0)) {
       let s = !1;
-      if (!this.#ye && this.#e.seeking) {
-        const l = this.#e.buffered, d = this.#b >= Z ? this.#b / 1e3 : B / 1e3;
-        for (let E = 0; E < l.length; E++)
-          if (t.mediaTime >= l.start(E) && t.mediaTime < l.end(E) && Math.abs(t.mediaTime - this.#e.currentTime) <= d) {
+      if (!this.#Re && this.#e.seeking) {
+        const l = this.#e.buffered, d = this.#g >= Y ? this.#g / 1e3 : B / 1e3;
+        for (let p = 0; p < l.length; p++)
+          if (t.mediaTime >= l.start(p) && t.mediaTime < l.end(p) && Math.abs(t.mediaTime - this.#e.currentTime) <= d) {
             s = !0;
             break;
           }
       }
-      if (s && (this.#ye = !0), (this.#C === 0 || this.#W === 0) && this.#Gt(t.width, t.height), !this.#ee(i)) return;
+      if (s && (this.#Re = !0), (this.#C === 0 || this.#W === 0) && this.#Ht(t.width, t.height), !this.#te(i)) return;
       if (this.#y && !this.#y.interlaced) {
         const l = performance.now();
-        this.#Lt(l), this.#Oe = l, this.#li(), this.#ae += performance.now() - l, this.#q++, this.#le++, this.#Ut(l);
+        this.#Xt(l), this.#We = l, this.#Q > 0 && this.#Q--, this.#ht = !0, this.#pi(), this.#ue += performance.now() - l, this.#J++, this.#ce++, this.#zt(l);
         return;
       }
-      const r = t.mediaTime - this.#Te, o = t.mozTiming, h = s || (o ? o.discontinuity || r < 0 || r > $ : r < 0 || r > $);
-      h && (this.#R = 0, this.#b = 0, this.#U.discontinuities++, this.#P(), this.#Y());
-      const a = this.#ui(t.presentedFrames, h);
-      if (this.#R > 0 && t.mediaTime === this.#Te && (!o || t.presentedFrames === this.#qe))
+      const r = t.mediaTime - this.#Fe, o = t.mozTiming, h = s || (o ? o.discontinuity || r < 0 || r > Q : r < 0 || r > Q);
+      h && (this.#D = 0, this.#g = 0, this.#L.discontinuities++, this.#P(), this.#q(), (s || !this.#ht) && (this.#Q = 0)), this.#ht = !1;
+      const a = this.#Ei(t.presentedFrames, h);
+      if (this.#D > 0 && t.mediaTime === this.#Fe && (!o || t.presentedFrames === this.#et))
         return;
       if (!h) {
         const l = o?.periodMs ?? 0;
-        l > 0 ? this.#St(
+        l > 0 ? this.#Ut(
           l * (this.#e.playbackRate || 1) / 1e3,
           1
-        ) : this.#R > 0 && r > 0 && this.#St(r, a + 1);
+        ) : this.#D > 0 && r > 0 && this.#Ut(r, a + 1);
       }
-      this.#Te = t.mediaTime, this.#qe = t.presentedFrames;
+      this.#Fe = t.mediaTime, this.#et = t.presentedFrames;
       const c = performance.now();
-      this.#Lt(c), this.#Oe = c;
-      const A = performance.now(), f = this.#Mt(!1);
-      if (this.#It(), this.#_ && !this.#re && !this.#A)
+      this.#Xt(c), this.#We = c;
+      const A = performance.now(), f = this.#Lt(!1);
+      if (this.#Wt(), this.#M && !this.#oe && !this.#o)
         try {
-          this.#Ft();
+          this.#Pt();
         } catch (l) {
-          this.#At(
+          this.#Qe(
             `film detector unavailable: ${l instanceof Error ? l.message : String(l)}`
           );
         }
-      if (!this.#ee(i)) {
-        this.#Z || this.#Ve(f);
+      if (!this.#te(i)) {
+        this.#j || this.#Ye(f);
         return;
       }
-      if (this.#_ && !this.#re) {
-        if (this.#R === b && a === 0)
+      if (this.#ne = !1, this.#ot = !1, this.#M && !this.#oe) {
+        let l = !1;
+        if (this.#D === g && a === 0)
           try {
-            this.#ei(), this.#Jt();
-          } catch (l) {
-            this.#At(
-              `film detection failed: ${l instanceof Error ? l.message : String(l)}`
+            this.#oi(), this.#ri(), l = !0;
+          } catch (d) {
+            this.#Qe(
+              `film detection failed: ${d instanceof Error ? d.message : String(d)}`
             );
           }
         else
-          this.#Y();
-        this.#We[this.#I.phase] = (this.#We[this.#I.phase] ?? 0) + 1, this.#K = this.#I.phase !== 0 && this.#I.run >= W, this.#z && (this.#gt = this.#ti(t.presentedFrames));
+          this.#q();
+        this.#$e[this.#I.phase] = (this.#$e[this.#I.phase] ?? 0) + 1, this.#$ = this.#I.phase !== 0 && this.#I.run >= W, this.#$ ? this.#Q = je : this.#Q > 0 && this.#Q--, this.#ne = l && !this.#Ft && this.#Q > 0, this.#ot = this.#ne && !this.#$ && this.#B && this.#Ie() && this.#ni(), this.#ne && !this.#$ && this.#L.matched++, this.#z && (this.#Rt = this.#hi(t.presentedFrames));
       }
-      if (!this.#ee(i)) {
-        this.#Z || this.#Ve(f);
+      if (this.#Ft = a > 0, !this.#te(i)) {
+        this.#j || this.#Ye(f);
         return;
       }
-      const u = this.#ii(t, e) + this.#M;
-      if (this.#K)
-        if (this.#Qe()) {
+      const u = this.#Ai(t, e) + this.#R;
+      if (this.#$)
+        if (this.#Ie()) {
           const l = this.#I.phase;
           if (l === O)
-            this.#st++, this.#O++;
+            this.#At++, this.#O++;
           else {
-            const d = this.#b * N / je, E = this.#ct(1, e, d), v = qe[l] ?? 0, U = E || this.#Q === null ? u + d : u + v * this.#b;
-            this.#Ze(
+            const d = this.#g * N / qe, p = this.#pt(1, e, d), v = Ke[l] ?? 0, U = p || this.#Y === null ? u + d : u + v * this.#g;
+            this.#qe(
               "film",
               !1,
-              this.#ut("film", U, d),
+              this.#mt("film", U, d),
               d
             );
           }
         } else
-          this.#ne(!1, !1, null);
-      else if (this.#L && this.#Qe()) {
-        const l = this.#b / 2, E = this.#ct(2, e, l) || this.#Q === null ? u + l * 2 : u, v = this.#ut("field", E, l);
-        this.#Ze("field", !1, v, l), this.#Ze("field", !0, v + l, l);
-      } else if (this.#Qe()) {
-        const l = this.#b, E = this.#ct(1, e, l) || this.#Q === null ? u + l : u;
-        this.#Ze(
+          this.#he(!1, !1, null);
+      else if (this.#B && this.#Ie()) {
+        const l = this.#g / 2, p = this.#pt(2, e, l) || this.#Y === null ? u + l * 2 : u, v = this.#mt("field", p, l);
+        this.#qe("field", !1, v, l), this.#qe("field", !0, v + l, l);
+      } else if (this.#Ie()) {
+        const l = this.#g, p = this.#pt(1, e, l) || this.#Y === null ? u + l : u;
+        this.#qe(
           "frame",
           !1,
-          this.#ut("frame", E, l),
+          this.#mt("frame", p, l),
           l
-        ) || (this.#U.late++, this.#ne(!1, !1, null));
+        ) || (this.#L.late++, this.#he(!1, !1, null));
       } else
-        this.#U.late += this.#f.length, this.#P(), this.#ne(!1, !1, null);
-      this.#ue = Math.max(
-        this.#ue,
-        this.#f.length
-      ), this.#Ve(f), this.#ae += performance.now() - A, this.#q++, this.#Ut(c);
+        this.#L.late += this.#l.length, this.#P(), this.#he(!1, !1, null);
+      this.#fe = Math.max(
+        this.#fe,
+        this.#l.length
+      ), this.#Ye(f), this.#ue += performance.now() - A, this.#J++, this.#zt(c);
     }
   }
-  #ee(e) {
-    return !this.#Z && this.#D && e === this.#se;
+  #te(e) {
+    return !this.#j && this.#_ && e === this.#re;
   }
-  #ni(e) {
-    const t = this.#se;
+  #ui(e) {
+    const t = this.#re;
     let i;
-    for (let o = this.#oe.length - 1; o >= 0; o--) {
-      const h = this.#oe[o];
+    for (let o = this.#Ae.length - 1; o >= 0; o--) {
+      const h = this.#Ae[o];
       if (h.start <= e + 1e-6) {
         i = h;
         break;
       }
     }
-    if (i?.codedSize && (i.codedSize.width !== this.#C || i.codedSize.height !== this.#W) && this.#Gt(i.codedSize.width, i.codedSize.height), !this.#ee(t)) return;
+    if (i?.codedSize && (i.codedSize.width !== this.#C || i.codedSize.height !== this.#W) && this.#Ht(i.codedSize.width, i.codedSize.height), !this.#te(t)) return;
     const s = i?.scan;
     if (!s || this.#y?.interlaced === s.interlaced && this.#y.topFieldFirst === s.topFieldFirst)
       return;
     const r = this.#y?.interlaced;
-    this.#y = s, this.#R = 0, this.#P(), this.#be() && (r !== s.interlaced && (this.#b = 0), s.interlaced && (this.#S || this.#w === "main") ? this.#Le() : this.#ft(), this.#Y());
+    this.#y = s, this.#D = 0, this.#P(), this.#xe() && (r !== s.interlaced && (this.#g = 0), s.interlaced && (this.#S || this.#w === "main") ? this.#Ne() : this.#Et(), this.#q());
   }
   /**
    * Whether pictures are being filtered ahead of time and queued, rather than
@@ -2636,8 +2717,8 @@ ${s} dropped:${this.#st}`;
    * and it goes up now -- and neither has a filter that has yet to see two
    * frames go by, since until then there is no idea how long a frame lasts.
    */
-  #Qe() {
-    return (this.#L || this.#_) && this.#b > 0 && this.#a.length === w;
+  #Ie() {
+    return (this.#B || this.#M) && this.#g > 0 && this.#c.length === T;
   }
   /**
    * How long a frame lasts in wall time, kept as a smoothed estimate.
@@ -2650,9 +2731,9 @@ ${s} dropped:${this.#st}`;
    * half a frame late and hold the picture through a refresh it should have
    * moved in.
    */
-  #St(e, t) {
+  #Ut(e, t) {
     const s = e * 1e3 / (this.#e.playbackRate || 1) / t;
-    s < Z || s > B || (this.#b = this.#b > 0 && s > this.#b * Ve ? this.#b + (s - this.#b) * ze : s);
+    s < Y || s > B || (this.#g = this.#g > 0 && s > this.#g * Ve ? this.#g + (s - this.#g) * ze : s);
   }
   /**
    * Filter one field into an output texture and put it in the queue.
@@ -2662,14 +2743,14 @@ ${s} dropped:${this.#st}`;
    * held as pictures. What is queued after that is a copy waiting for a
    * moment, which no later frame can take away.
    */
-  #Ze(e, t, i, s) {
-    const r = this.#Pt();
+  #qe(e, t, i, s) {
+    const r = this.#It();
     if (r === null) return !1;
-    const o = this.#a[r];
+    const o = this.#c[r];
     if (!o) return !1;
-    for (this.#l = r; this.#f.length > 0 && this.#f[0]?.slot === r; )
-      this.#f.shift(), this.#U.late++;
-    this.#ne(!1, t, o.framebuffer);
+    for (this.#a = r; this.#l.length > 0 && this.#l[0]?.slot === r; )
+      this.#l.shift(), this.#L.late++;
+    this.#he(!1, t, o.framebuffer);
     const h = {
       slot: r,
       at: i,
@@ -2678,7 +2759,7 @@ ${s} dropped:${this.#st}`;
       phase: e === "film" ? this.#I.phase : e === "field" ? t ? 2 : 1 : 0,
       droppedBefore: this.#O
     };
-    return this.#O = 0, this.#f.push(h), this.#Q = h, !0;
+    return this.#O = 0, this.#l.push(h), this.#Y = h, !0;
   }
   /**
    * When a picture goes up: one duration after the last one of its cadence,
@@ -2687,69 +2768,69 @@ ${s} dropped:${this.#st}`;
    * restarts from `ideal` when the gap has grown to a whole picture or the
    * cadence has changed. (otya)
    */
-  #ut(e, t, i) {
+  #mt(e, t, i) {
     if (!(i > 0)) return t;
-    const s = this.#Q;
+    const s = this.#Y;
     if (s !== null && s.cadence === e) {
       const r = s.at + s.duration, o = t - r;
       if (Math.abs(o) < i) {
         const h = Math.max(
-          -Y,
-          Math.min(Y, o * $e)
+          -j,
+          Math.min(j, o * $e)
         );
         return r + h;
       }
     }
-    s !== null && this.#U.resynced++;
-    for (let r = this.#f.at(-1); r && r.at >= t; )
-      this.#f.pop(), this.#U.late++, r = this.#f.at(-1);
+    s !== null && this.#L.resynced++;
+    for (let r = this.#l.at(-1); r && r.at >= t; )
+      this.#l.pop(), this.#L.late++, r = this.#l.at(-1);
     return t;
   }
   /** Make room without treating ordinary capacity pressure as clock divergence. */
-  #ct(e, t, i) {
-    const s = this.#f.at(-1), r = (X + 1) * Math.max(this.#M, i);
+  #pt(e, t, i) {
+    const s = this.#l.at(-1), r = (X + 1) * Math.max(this.#R, i);
     if (s && s.at - t > r)
-      return this.#P(), this.#U.queueResetted++, !0;
+      return this.#P(), this.#L.queueResetted++, !0;
     const o = Math.max(
       0,
-      this.#f.length + e - X
+      this.#l.length + e - X
     );
     let h = 0, a = 0;
     for (; a < o; ) {
-      const c = this.#f.shift();
+      const c = this.#l.shift();
       if (!c) break;
       h += c.duration, a++;
     }
-    for (const c of this.#f) c.at -= h;
-    return this.#U.late += a, !1;
+    for (const c of this.#l) c.at -= h;
+    return this.#L.late += a, !1;
   }
   /** Select an output whose pixels are not still represented by the canvas or queue. */
-  #Pt() {
-    const e = this.#h?.kind === "texture" ? this.#h.texture : null, t = new Set(this.#f.map(({ slot: s }) => s));
-    for (let s = 1; s <= w; s++) {
-      const r = (this.#l + s) % w, o = this.#a[r];
+  #It() {
+    const e = this.#n?.kind === "texture" ? this.#n.texture : null, t = new Set(this.#l.map(({ slot: s }) => s));
+    for (let s = 1; s <= T; s++) {
+      const r = (this.#a + s) % T, o = this.#c[r];
       if (o && o.texture !== e && !t.has(r))
         return r;
     }
-    const i = this.#f[0];
+    const i = this.#l[0];
     if (i) {
-      const s = this.#a[i.slot];
+      const s = this.#c[i.slot];
       if (s && s.texture !== e) return i.slot;
     }
     return null;
   }
   /** The loop that puts filtered fields up, and the only thing that draws. */
-  #Le() {
-    this.#d === null && (!this.#D || this.#$ || (this.#F = 0, this.#d = this.#ge(this.#dt)));
+  #Ne() {
+    this.#b === null && (!this.#_ || this.#Z || (this.#F = 0, this.#b = this.#we(this.#vt)));
   }
-  #ft() {
-    this.#Ye(this.#d), this.#d = null, this.#P();
+  #Et() {
+    this.#Ke(this.#b), this.#b = null, this.#P();
   }
-  #dt = (e) => {
-    if (this.#d = null, !this.#D || this.#$) return;
-    this.#oi(e);
-    const t = this.#se;
-    this.#n.flush(e), this.#ee(t) && (this.#w === "main" && this.#Ai(this.#N, e), this.#d = this.#ge(this.#dt));
+  #vt = (e) => {
+    if (this.#b = null, !this.#_ || this.#Z) return;
+    this.#ci(e);
+    const t = this.#re;
+    this.#h.flush(e), this.#te(t) && (this.#w === "main" && this.#di(this.#N, e), this.#b = this.#we(this.#vt));
   };
   /**
    * Fit a grid of refreshes (period and phase) to the animation frames. rAF
@@ -2757,15 +2838,15 @@ ${s} dropped:${this.#st}`;
    * nearest-refresh decision in #present can take; the grid is what it
    * compares against. A frame far off the grid restarts it. (otya)
    */
-  #oi(e) {
+  #ci(e) {
     const t = e - this.#F;
     this.#F = e;
-    const i = Math.max(1, Math.round(t / this.#M)), s = this.#N + i * this.#M, r = e - s;
-    if (this.#N === 0 || t <= 0 || t > B || Math.abs(r) > this.#M / 4) {
-      t >= 1 && t <= B && (this.#M = t), this.#N = e;
+    const i = Math.max(1, Math.round(t / this.#R)), s = this.#N + i * this.#R, r = e - s;
+    if (this.#N === 0 || t <= 0 || t > B || Math.abs(r) > this.#R / 4) {
+      t >= 1 && t <= B && (this.#R = t), this.#N = e;
       return;
     }
-    this.#M += r / i * Qe, this.#N = s + r * Ze;
+    this.#R += r / i * Qe, this.#N = s + r * Ze;
   }
   /**
    * Where animation frames come from, and the clock their timestamps carry.
@@ -2777,12 +2858,12 @@ ${s} dropped:${this.#st}`;
    * element. The element is consulted as well, because the two move together
    * and either may be read first while a move is in progress.
    */
-  #Ct() {
+  #Nt() {
     const e = this.#S;
     if (e)
       return { frames: e, origin: performance.timeOrigin };
     const t = this.#i.ownerDocument?.defaultView ?? this.#e.ownerDocument?.defaultView ?? null;
-    return t === null ? { frames: Je, origin: performance.timeOrigin } : { frames: t, origin: t.performance.timeOrigin };
+    return t === null ? { frames: et, origin: performance.timeOrigin } : { frames: t, origin: t.performance.timeOrigin };
   }
   /**
    * Ask the current source for one frame, on this module's clock.
@@ -2793,14 +2874,14 @@ ${s} dropped:${this.#st}`;
    * the callback: the source that was asked is the source that answers, so
    * the origin captured here is the right one however often the owner moves.
    */
-  #ge(e) {
-    const { frames: t, origin: i } = this.#Ct(), s = t.requestAnimationFrame(
-      (r) => e(this.#lt(r, i))
+  #we(e) {
+    const { frames: t, origin: i } = this.#Nt(), s = t.requestAnimationFrame(
+      (r) => e(this.#dt(r, i))
     );
     return { frames: t, handle: s };
   }
   /** Cancel a pending animation frame through the source that issued it. */
-  #Ye(e) {
+  #Ke(e) {
     e?.frames.cancelAnimationFrame(e.handle);
   }
   /**
@@ -2818,36 +2899,36 @@ ${s} dropped:${this.#st}`;
    * which no adoption changes. Only the refresh grid starts again, because a
    * grid describes one compositor and this is a different one.
    */
-  #mt() {
+  #bt() {
     if (this.#S) return;
-    this.#hi();
-    const { frames: e } = this.#Ct(), t = this.#d !== null && this.#d.frames !== e, i = this.#m !== null && this.#m.frames !== e;
-    !t && !i || (this.#F = 0, t && (this.#Ye(this.#d), this.#d = this.#ge(this.#dt)), i && (this.#Ye(this.#m), this.#m = this.#ge(this.#Et)));
+    this.#fi();
+    const { frames: e } = this.#Nt(), t = this.#b !== null && this.#b.frames !== e, i = this.#m !== null && this.#m.frames !== e;
+    !t && !i || (this.#F = 0, t && (this.#Ke(this.#b), this.#b = this.#we(this.#vt)), i && (this.#Ke(this.#m), this.#m = this.#we(this.#xt)));
   }
   /** Watch the current document for visibility changes and DOM adoption. */
-  #hi() {
+  #fi() {
     const e = this.#S ? null : this.#i.ownerDocument ?? null;
-    e !== this.#x && (this.#x?.removeEventListener(
+    e !== this.#p && (this.#p?.removeEventListener(
       "visibilitychange",
-      this.#pt
-    ), this.#x = e, e?.addEventListener("visibilitychange", this.#pt), this.#V?.disconnect(), e && this.#V?.observe(e, { childList: !0, subtree: !0 }));
+      this.#gt
+    ), this.#p = e, e?.addEventListener("visibilitychange", this.#gt), this.#H?.disconnect(), e && this.#H?.observe(e, { childList: !0, subtree: !0 }));
   }
-  #pt = () => {
-    this.#Z || this.#mt();
+  #gt = () => {
+    this.#j || this.#bt();
   };
   /** Deliver faster-playback captures even when a Worker owns the drawing loop. */
-  #je() {
-    this.#S || this.#m !== null || !this.#n.captureDriven || !this.#D || this.#$ || (this.#m = this.#ge(this.#Et));
+  #Je() {
+    this.#S || this.#m !== null || !this.#h.captureDriven || !this.#_ || this.#Z || (this.#m = this.#we(this.#xt));
   }
   /** Cancel the page's pending capture delivery. */
-  #Bt() {
-    this.#Ye(this.#m), this.#m = null;
+  #Gt() {
+    this.#Ke(this.#m), this.#m = null;
   }
   /** Flush captured pictures on the refresh that will present them. */
-  #Et = (e) => {
-    if (this.#m = null, !this.#D || this.#$) return;
-    const t = this.#se;
-    this.#n.flush(e), this.#ee(t) && this.#n.captureDriven && (this.#m = this.#ge(this.#Et));
+  #xt = (e) => {
+    if (this.#m = null, !this.#_ || this.#Z) return;
+    const t = this.#re;
+    this.#h.flush(e), this.#te(t) && this.#h.captureDriven && (this.#m = this.#we(this.#xt));
   };
   /**
    * Put up whichever filtered field belongs on the screen next.
@@ -2863,48 +2944,48 @@ ${s} dropped:${this.#st}`;
    * so that the slip a cadence the refresh does not divide into must make
    * every so often happens once rather than flapping.
    */
-  #Ai(e, t) {
-    const i = this.#M / 2, s = (a) => {
+  #di(e, t) {
+    const i = this.#R / 2, s = (a) => {
       const c = a.at - e;
-      return c <= i - j ? !0 : c > i + j ? !1 : this.#xe > 0;
+      return c <= i - q ? !0 : c > i + q ? !1 : this.#Te > 0;
     };
-    for (; this.#f[1] && s(this.#f[1]); )
-      this.#U.late++, this.#f.shift();
-    const r = this.#f[0];
+    for (; this.#l[1] && s(this.#l[1]); )
+      this.#L.late++, this.#l.shift();
+    const r = this.#l[0];
     if (!r || !s(r)) return;
-    this.#f.shift(), this.#xe = r.at - e;
-    const o = performance.now(), h = this.#Mt(!0);
-    this.#kt(r.slot), this.#Ve(h), this.#Me += performance.now() - o, this.#le++, this.#z && this.#ai(r, t), this.#H = t;
+    this.#l.shift(), this.#Te = r.at - e;
+    const o = performance.now(), h = this.#Lt(!0);
+    this.#Ot(r.slot), this.#Ye(h), this.#Pe += performance.now() - o, this.#ce++, this.#z && this.#mi(r, t), this.#V = t;
   }
   /** Preserve upstream's opt-in presentation timing log in either renderer. */
-  #ai(e, t) {
-    const i = this.#H === 0 ? 0 : t - this.#H, s = i / this.#M, r = e.cadence === "film" ? `phase ${e.phase}` : e.cadence === "field" ? `field ${e.phase}` : "frame", o = e.phase === 0 ? "duplicate" : `phase ${O}`, h = e.droppedBefore > 0 ? `, ${o} dropped before it` + (e.droppedBefore > 1 ? ` (${e.droppedBefore})` : "") : "";
+  #mi(e, t) {
+    const i = this.#V === 0 ? 0 : t - this.#V, s = i / this.#R, r = e.cadence === "film" ? `phase ${e.phase}` : e.cadence === "field" ? `field ${e.phase}` : "frame", o = e.phase === 0 ? "duplicate" : `phase ${O}`, h = e.droppedBefore > 0 ? `, ${o} dropped before it` + (e.droppedBefore > 1 ? ` (${e.droppedBefore})` : "") : "";
     console.log(
       `yadif: +${i.toFixed(2)} ms (${s.toFixed(2)} refreshes) ${e.cadence} ${r}, due ${(e.at - t).toFixed(2)} ms${h}`
     );
   }
   /** Copy one of the filtered pictures onto the canvas. */
-  #kt(e) {
-    const t = this.#a[e];
-    t && this.#vt(t.texture);
+  #Ot(e) {
+    const t = this.#c[e];
+    t && this.#wt(t.texture);
   }
   /** Put a progressive frame through unchanged, keeping one display surface. */
-  #li() {
-    this.#It();
-    const e = this.#E[this.#B];
-    e && this.#vt(e, !0), this.#R = 0;
+  #pi() {
+    this.#Wt();
+    const e = this.#u[this.#k];
+    e && this.#wt(e, !0), this.#D = 0;
   }
   /** Apply visibility on the page; a Worker reports only the desired state. */
-  #te(e) {
+  #ie(e) {
     if (this.#S) {
       this.#S.onVisibility(e);
       return;
     }
     this.#i.style.visibility = e ? "visible" : "hidden";
   }
-  #vt(e, t = !1, i = !0) {
+  #wt(e, t = !1, i = !0) {
     const s = this.#s;
-    s.bindFramebuffer(s.FRAMEBUFFER, null), s.useProgram(this.#T), s.activeTexture(s.TEXTURE0), s.bindTexture(s.TEXTURE_2D, e), s.uniform1i(this.#v, 0), s.uniform1i(this.#p, t ? 1 : 0), s.viewport(0, 0, this.#C, this.#W), s.drawArrays(s.TRIANGLES, 0, 3), this.#h = { kind: "texture", texture: e, flip: t }, this.#te(!0), i && this.#X++;
+    s.bindFramebuffer(s.FRAMEBUFFER, null), s.useProgram(this.#T), s.activeTexture(s.TEXTURE0), s.bindTexture(s.TEXTURE_2D, e), s.uniform1i(this.#v, 0), s.uniform1i(this.#E, t ? 1 : 0), s.viewport(0, 0, this.#C, this.#W), s.drawArrays(s.TRIANGLES, 0, 3), this.#n = { kind: "texture", texture: e, flip: t }, this.#ie(!0), i && this.#X++;
   }
   /**
    * Account for the frames between this one and the last one seen.
@@ -2918,52 +2999,52 @@ ${s} dropped:${this.#st}`;
    *
    * Returns how many frames were missed between the last one and this one.
    */
-  #ui(e, t) {
+  #Ei(e, t) {
     let i = 0;
-    return this.#_e !== 0 && !t && (i = Math.max(0, e - this.#_e - 1), this.#U.missed += i), this.#_e = e, i;
+    return this.#Se !== 0 && !t && (i = Math.max(0, e - this.#Se - 1), this.#L.missed += i), this.#Se = e, i;
   }
   /**
    * Frames stopped arriving for a while -- a pause, a stall, a tab in the
    * background -- and a rate averaged over time nothing was asked of the
    * filter says nothing about it. Begin the interval at this frame.
    */
-  #Lt(e) {
-    e - this.#Oe <= Q || (this.#Xe = e, this.#q = 0, this.#ae = 0, this.#le = 0, this.#Me = 0, this.#ue = 0, this.#X = 0, this.#Se = 0, this.#de = 0, this.#Pe = 0, this.#me = 0);
+  #Xt(e) {
+    e - this.#We <= Z || (this.#He = e, this.#J = 0, this.#ue = 0, this.#ce = 0, this.#Pe = 0, this.#fe = 0, this.#X = 0, this.#Ce = 0, this.#pe = 0, this.#Be = 0, this.#Ee = 0);
   }
-  #Ut(e) {
-    const t = e - this.#Xe;
-    if (t < Q) return;
-    const i = this.#Qe() && (this.#L || this.#K) ? this.#le : this.#q, s = this.#q ? (this.#ae + this.#Me) / this.#q : 0;
+  #zt(e) {
+    const t = e - this.#He;
+    if (t < Z) return;
+    const i = this.#Ie() && (this.#B || this.#$) ? this.#ce : this.#J, s = this.#J ? (this.#ue + this.#Pe) / this.#J : 0;
     let r;
-    this.#ce != null && (r = 0, this.#de !== 0 && (r += this.#Se / 1e6 / this.#de), this.#me !== 0 && (r += this.#Pe / 1e6 / this.#me / 2));
+    this.#de != null && (r = 0, this.#pe !== 0 && (r += this.#Ce / 1e6 / this.#pe), this.#Ee !== 0 && (r += this.#Be / 1e6 / this.#Ee / 2));
     const o = {
-      ...this.#U,
+      ...this.#L,
       // The element's own count of what its decoder could not keep up with,
       // which is the machine being behind rather than this filter.
       dropped: this.#e.getVideoPlaybackQuality?.().droppedVideoFrames ?? 0,
       fps: i * 1e3 / t,
       frameMs: s,
-      maxQueuedFields: this.#ue,
+      maxQueuedFields: this.#fe,
       outputFps: this.#X * 1e3 / t,
       gpuMs: r,
-      film: this.#K,
-      filmError: this.#re
+      film: this.#$,
+      filmError: this.#oe
     };
-    this.dispatchEvent(new CustomEvent("stats", { detail: o })), this.#Ke?.(o), this.#Xe = e, this.#q = 0, this.#ae = 0, this.#le = 0, this.#Me = 0, this.#ue = 0, this.#X = 0, this.#Se = 0, this.#de = 0, this.#Pe = 0, this.#me = 0;
+    this.dispatchEvent(new CustomEvent("stats", { detail: o })), this.#tt?.(o), this.#He = e, this.#J = 0, this.#ue = 0, this.#ce = 0, this.#Pe = 0, this.#fe = 0, this.#X = 0, this.#Ce = 0, this.#pe = 0, this.#Be = 0, this.#Ee = 0;
   }
   /** Take the newest frame into the ring. */
-  #It() {
+  #Wt() {
     const e = this.#s;
-    this.#B = (this.#B + 1) % b;
-    const t = this.#o, i = this.#E[this.#B];
-    t !== null && this.#u !== null && i !== void 0 ? (this.#E[this.#B] = this.#u.adopt(t, i), this.#o = null) : (e.bindTexture(e.TEXTURE_2D, i ?? null), e.texImage2D(
+    this.#k = (this.#k + 1) % g;
+    const t = this.#A, i = this.#u[this.#k];
+    t !== null && this.#f !== null && i !== void 0 ? (this.#u[this.#k] = this.#f.adopt(t, i), this.#A = null) : (e.bindTexture(e.TEXTURE_2D, i ?? null), e.texImage2D(
       e.TEXTURE_2D,
       0,
       e.RGBA,
       e.RGBA,
       e.UNSIGNED_BYTE,
-      this.#he
-    )), this.#R = Math.min(this.#R + 1, b);
+      this.#ae
+    )), this.#D = Math.min(this.#D + 1, g);
   }
   /**
    * Filter one frame, onto the canvas or into an output texture.
@@ -2980,22 +3061,24 @@ ${s} dropped:${this.#st}`;
    * With `film` on, the shader is also given the field metrics, and puts a
    * film frame back together rather than filtering it.
    */
-  #ne(e, t, i, s = !0) {
-    if (this.#R === 0 || this.#$) return;
-    s && (this.#R === b && !e ? this.#U.filtered++ : this.#U.degraded++);
-    const r = this.#s, { prev: o, cur: h, next: a } = this.#Nt(e);
-    r.bindFramebuffer(r.FRAMEBUFFER, i), r.useProgram(this.#c);
-    for (const [u, l] of [o, h, a].entries())
-      r.activeTexture(r.TEXTURE0 + u), r.bindTexture(r.TEXTURE_2D, this.#E[l] ?? null);
+  #he(e, t, i, s = !0) {
+    if (this.#D === 0 || this.#Z) return;
+    s && (this.#D === g && !e ? this.#L.filtered++ : this.#L.degraded++);
+    const r = this.#s, { prev: o, cur: h, next: a } = this.#Tt(e);
+    r.bindFramebuffer(r.FRAMEBUFFER, i), r.useProgram(this.#d);
+    for (const [d, p] of [o, h, a].entries())
+      r.activeTexture(r.TEXTURE0 + d), r.bindTexture(r.TEXTURE_2D, this.#u[p] ?? null);
     r.uniform1i(this.#r.prev, 0), r.uniform1i(this.#r.cur, 1), r.uniform1i(this.#r.next, 2);
-    const c = this.#_ ? this.#A?.texture ?? null : null, A = this.#_ ? this.#A?.combTexture ?? null : null, f = c !== null && A !== null;
-    c !== null && A !== null && (r.activeTexture(r.TEXTURE0 + 3), r.bindTexture(r.TEXTURE_2D, c), r.uniform1i(this.#r.fieldMetrics, 3), r.activeTexture(r.TEXTURE0 + 4), r.bindTexture(r.TEXTURE_2D, A), r.uniform1i(this.#r.comb, 4)), r.uniform2i(this.#r.size, this.#C, this.#W);
-    const m = this.#xt ? 0 : 1;
-    r.uniform1i(this.#r.parity, t ? 1 - m : m), r.uniform1i(this.#r.tff, this.#xt ? 1 : 0), r.uniform1i(this.#r.second, t ? 1 : 0), r.uniform1i(this.#r.spatialCheck, this.#G ? 1 : 0), r.uniform1i(this.#r.debug, this.#z ? 1 : 0), r.uniform1i(this.#r.film, f ? 1 : 0), r.uniform1i(this.#r.phase, this.#I.phase), r.viewport(0, 0, this.#C, this.#W), r.drawArrays(r.TRIANGLES, 0, 3), this.#z && f && this.#Kt(this.#gt, 0, 90), i === null && (this.#h = { kind: "yadif", flush: e, second: t }, this.#te(!0), s && this.#X++);
+    const c = this.#M ? this.#o?.texture ?? null : null, A = this.#M ? this.#o?.combTexture ?? null : null, f = c !== null && A !== null;
+    c !== null && A !== null && (r.activeTexture(r.TEXTURE0 + 3), r.bindTexture(r.TEXTURE_2D, c), r.uniform1i(this.#r.fieldMetrics, 3), r.activeTexture(r.TEXTURE0 + 4), r.bindTexture(r.TEXTURE_2D, A), r.uniform1i(this.#r.comb, 4));
+    const m = this.#ot ? this.#o?.combAheadTexture ?? null : null, u = f && this.#ne && !e && (!t || m !== null);
+    r.activeTexture(r.TEXTURE0 + 5), r.bindTexture(r.TEXTURE_2D, m), r.uniform1i(this.#r.combAhead, 5), r.activeTexture(r.TEXTURE0), r.uniform2i(this.#r.size, this.#C, this.#W);
+    const l = this.#Dt ? 0 : 1;
+    r.uniform1i(this.#r.parity, t ? 1 - l : l), r.uniform1i(this.#r.tff, this.#Dt ? 1 : 0), r.uniform1i(this.#r.second, t ? 1 : 0), r.uniform1i(this.#r.spatialCheck, this.#G ? 1 : 0), r.uniform1i(this.#r.debug, this.#z ? 1 : 0), r.uniform1i(this.#r.film, f ? 1 : 0), r.uniform1i(this.#r.match, u ? 1 : 0), r.uniform1i(this.#r.phase, this.#I.phase), r.viewport(0, 0, this.#C, this.#W), r.drawArrays(r.TRIANGLES, 0, 3), this.#z && f && this.#si(this.#Rt, 0, 90), i === null && (this.#n = { kind: "yadif", flush: e, second: t }, this.#ie(!0), s && this.#X++);
   }
-  #Nt(e) {
-    const t = (i) => (this.#B + b - i) % b;
-    return this.#R === 1 ? { prev: this.#B, cur: this.#B, next: this.#B } : e ? { prev: t(1), cur: this.#B, next: this.#B } : this.#R === 2 ? { prev: t(1), cur: t(1), next: this.#B } : { prev: t(2), cur: t(1), next: this.#B };
+  #Tt(e) {
+    const t = (i) => (this.#k + g - i) % g;
+    return this.#D === 1 ? { prev: this.#k, cur: this.#k, next: this.#k } : e ? { prev: t(1), cur: this.#k, next: this.#k } : this.#D === 2 ? { prev: t(1), cur: t(1), next: this.#k } : { prev: t(2), cur: t(1), next: this.#k };
   }
   /**
    * Put the canvas exactly where the element's picture is.
@@ -3008,8 +3091,8 @@ ${s} dropped:${this.#st}`;
    * is worked out again here. It assumes the element's `object-fit` is the
    * `contain` it is by default.
    */
-  #Ue() {
-    if (this.#mt(), !this.#k) return;
+  #Ge() {
+    if (this.#bt(), !this.#U) return;
     const e = this.#e, t = e.videoWidth, i = e.videoHeight;
     if (t === 0 || i === 0) return;
     const s = Math.min(
@@ -3018,12 +3101,12 @@ ${s} dropped:${this.#st}`;
     ), r = t * s, o = i * s;
     this.#i.style.left = `${e.offsetLeft + (e.offsetWidth - r) / 2}px`, this.#i.style.top = `${e.offsetTop + (e.offsetHeight - o) / 2}px`, this.#i.style.width = `${r}px`, this.#i.style.height = `${o}px`;
   }
-  #Gt(e, t) {
+  #Ht(e, t) {
     const i = this.#s;
-    this.#t.width = e, this.#t.height = t, this.#C = e, this.#W = t, this.#R = 0, this.#h = null, this.#P(), this.#Ue();
-    for (const s of this.#E) i.deleteTexture(s);
-    this.#E = [];
-    for (let s = 0; s < b; s++) {
+    this.#t.width = e, this.#t.height = t, this.#C = e, this.#W = t, this.#D = 0, this.#Q = 0, this.#n = null, this.#P(), this.#Ge();
+    for (const s of this.#u) i.deleteTexture(s);
+    this.#u = [];
+    for (let s = 0; s < g; s++) {
       const r = i.createTexture();
       i.bindTexture(i.TEXTURE_2D, r), i.texParameteri(i.TEXTURE_2D, i.TEXTURE_MIN_FILTER, i.NEAREST), i.texParameteri(i.TEXTURE_2D, i.TEXTURE_MAG_FILTER, i.NEAREST), i.texParameteri(i.TEXTURE_2D, i.TEXTURE_WRAP_S, i.CLAMP_TO_EDGE), i.texParameteri(i.TEXTURE_2D, i.TEXTURE_WRAP_T, i.CLAMP_TO_EDGE), i.texImage2D(
         i.TEXTURE_2D,
@@ -3035,9 +3118,9 @@ ${s} dropped:${this.#st}`;
         i.RGBA,
         i.UNSIGNED_BYTE,
         null
-      ), this.#E.push(r);
+      ), this.#u.push(r);
     }
-    this.#Ie(), (this.#L || this.#_) && this.#Ot(), this.#A?.resize(e, t), this.#be();
+    this.#Oe(), (this.#B || this.#M) && this.#Vt(), this.#o?.resize(e, t), this.#xe();
   }
   /**
    * Somewhere to keep a filtered field until its moment comes.
@@ -3048,11 +3131,11 @@ ${s} dropped:${this.#st}`;
    * -- the whole lot goes and the fields are drawn as their frames arrive,
    * which is the timing this replaces but is still a picture.
    */
-  #Ot() {
+  #Vt() {
     const e = this.#s;
-    if (!(this.#a.length === w || this.#C === 0)) {
-      this.#Ie();
-      for (let t = 0; t < w; t++) {
+    if (!(this.#c.length === T || this.#C === 0)) {
+      this.#Oe();
+      for (let t = 0; t < T; t++) {
         const i = e.createTexture();
         e.bindTexture(e.TEXTURE_2D, i), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_MIN_FILTER, e.NEAREST), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_MAG_FILTER, e.NEAREST), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_WRAP_S, e.CLAMP_TO_EDGE), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_WRAP_T, e.CLAMP_TO_EDGE), e.texImage2D(
           e.TEXTURE_2D,
@@ -3075,20 +3158,20 @@ ${s} dropped:${this.#st}`;
         );
         const r = e.checkFramebufferStatus(e.FRAMEBUFFER) === e.FRAMEBUFFER_COMPLETE;
         if (e.bindFramebuffer(e.FRAMEBUFFER, null), !r) {
-          e.deleteFramebuffer(s), e.deleteTexture(i), this.#Ie();
+          e.deleteFramebuffer(s), e.deleteTexture(i), this.#Oe();
           return;
         }
-        this.#a.push({ texture: i, framebuffer: s });
+        this.#c.push({ texture: i, framebuffer: s });
       }
-      this.#l = w - 1;
+      this.#a = T - 1;
     }
   }
-  #Ie() {
-    const e = this.#s, t = this.#h?.kind === "texture" ? this.#h.texture : null;
-    this.#a.some((i) => i.texture === t) && (this.#h = null);
-    for (const { texture: i, framebuffer: s } of this.#a)
+  #Oe() {
+    const e = this.#s, t = this.#n?.kind === "texture" ? this.#n.texture : null;
+    this.#c.some((i) => i.texture === t) && (this.#n = null);
+    for (const { texture: i, framebuffer: s } of this.#c)
       e.deleteFramebuffer(s), e.deleteTexture(i);
-    this.#a = [], this.#P();
+    this.#c = [], this.#P();
   }
   /**
    * Wrap the element in a `<div>` of this one's own and put the canvas over
@@ -3096,93 +3179,94 @@ ${s} dropped:${this.#st}`;
    * element out of the tree and back within the one task leaves playback
    * alone, which is what makes turning this on mid-stream free.
    */
-  #ci() {
-    if (this.#k) return;
+  #vi() {
+    if (this.#U) return;
     const e = this.#e.parentElement;
     if (!e) return;
     const t = document.createElement("div");
-    t.style.cssText = "position:relative;display:inline-block;line-height:0;max-width:100%", e.insertBefore(t, this.#e), t.appendChild(this.#e), t.appendChild(this.#i), this.#k = t, this.#we?.observe(this.#e), this.#Ue();
+    t.style.cssText = "position:relative;display:inline-block;line-height:0;max-width:100%", e.insertBefore(t, this.#e), t.appendChild(this.#e), t.appendChild(this.#i), this.#U = t, this.#ye?.observe(this.#e), this.#Ge();
   }
-  #fi() {
+  #bi() {
     if (this.#S) return;
-    const e = this.#k;
-    this.#k = null, this.#we?.disconnect(), this.#i.remove(), e?.parentElement && (e.parentElement.insertBefore(this.#e, e), e.remove());
+    const e = this.#U;
+    this.#U = null, this.#ye?.disconnect(), this.#i.remove(), e?.parentElement && (e.parentElement.insertBefore(this.#e, e), e.remove());
   }
-  #Xt = () => this.#Ue();
+  #$t = () => this.#Ge();
   /** Forward a media event with the page's playback state that gives it meaning. */
-  #bt(e) {
-    return !this.#g || this.#w === "main" ? !1 : (this.#g.postMessage({
+  #yt(e) {
+    return !this.#x || this.#w === "main" ? !1 : (this.#x.postMessage({
       type: "event",
       name: e,
-      video: this.#at()
+      video: this.#ft()
     }), !0);
   }
-  #zt = () => {
-    if (this.#bt("emptied")) {
-      this.#J(), this.#te(!1);
+  #Qt = () => {
+    if (this.#yt("emptied")) {
+      this.#ee(), this.#ie(!1);
       return;
     }
-    this.#R = 0, this.#Te = 0, this.#qe = 0, this.#P(), this.#Y(), this.#b = 0, this.#Wt(), this.#h = null, this.#te(!1);
+    this.#D = 0, this.#Fe = 0, this.#et = 0, this.#P(), this.#q(), this.#Q = 0, this.#g = 0, this.#Zt(), this.#n = null, this.#ie(!1);
   };
-  #Wt() {
-    this.#U = {
+  #Zt() {
+    this.#L = {
       filtered: 0,
       missed: 0,
       degraded: 0,
       discontinuities: 0,
       resynced: 0,
       late: 0,
-      queueResetted: 0
-    }, this.#We.fill(0), this.#st = 0, this.#_e = 0, this.#Xe = 0, this.#Oe = 0, this.#q = 0, this.#ae = 0, this.#le = 0, this.#Me = 0, this.#ue = 0, this.#X = 0, this.#P(), this.#Se = 0, this.#de = 0, this.#Pe = 0, this.#me = 0;
+      queueResetted: 0,
+      matched: 0
+    }, this.#$e.fill(0), this.#At = 0, this.#Se = 0, this.#He = 0, this.#We = 0, this.#J = 0, this.#ue = 0, this.#ce = 0, this.#Pe = 0, this.#fe = 0, this.#X = 0, this.#P(), this.#Ce = 0, this.#pe = 0, this.#Be = 0, this.#Ee = 0;
   }
   /**
    * A new seek invalidates any destination frame remembered for the last one.
    */
-  #Ht = () => {
-    if (this.#bt("seeking")) {
-      this.#J();
+  #Yt = () => {
+    if (this.#yt("seeking")) {
+      this.#ee();
       return;
     }
-    this.#ye = !1;
+    this.#Re = !1;
   };
   /**
    * Playback stopped, so the frame being held back goes up now. One picture,
    * whatever the rate: a still frame stands for a moment, and the moment is
    * the one the first field was taken at.
    */
-  #ie = (e) => {
-    if (e.type === "ratechange" && (this.#n.captureDriven ? this.#je() : this.#Bt()), (e.type === "pause" || e.type === "ended" || e.type === "seeked" || e.type === "ratechange") && this.#bt(e.type)) {
-      this.#J();
+  #se = (e) => {
+    if (e.type === "ratechange" && (this.#h.captureDriven ? this.#Je() : this.#Gt()), (e.type === "pause" || e.type === "ended" || e.type === "seeked" || e.type === "ratechange") && this.#yt(e.type)) {
+      this.#ee();
       return;
     }
     if (e.type === "seeked") {
-      const i = this.#ye;
-      if (this.#ye = !1, i) return;
-      this.#R = 0, this.#P(), this.#Y(), this.#h = null, this.#te(!1);
+      const i = this.#Re;
+      if (this.#Re = !1, i) return;
+      this.#D = 0, this.#P(), this.#q(), this.#n = null, this.#ie(!1);
       return;
     }
     const t = e.type === "ratechange";
-    if (t && (this.#b = 0, this.#Te = this.#e.currentTime), this.#P(), this.#D && this.#R > 0) {
-      const i = this.#Pt(), s = i === null ? void 0 : this.#a[i];
-      i !== null && s ? (this.#l = i, this.#ne(!0, !1, s.framebuffer), this.#kt(i)) : this.#ne(!0, !1, null);
+    if (t && (this.#g = 0, this.#Fe = this.#e.currentTime), this.#P(), this.#_ && this.#D > 0) {
+      const i = this.#It(), s = i === null ? void 0 : this.#c[i];
+      i !== null && s ? (this.#a = i, this.#he(!0, !1, s.framebuffer), this.#Ot(i)) : this.#he(!0, !1, null);
     }
-    t && (this.#R = 0, this.#_e = 0, this.#Y());
+    t && (this.#D = 0, this.#Se = 0, this.#q());
   };
   /**
    * A lost context takes the textures and the program with it. Rebuilding
    * them is possible, but a page that has lost its context has bigger
    * problems; getting out of the way leaves the element's own picture showing.
    */
-  #Vt = (e) => {
+  #jt = (e) => {
     if (e.preventDefault(), this.#S) {
       this.#S.onFailure("the deinterlacer WebGL context was lost");
       return;
     }
-    this.#w !== "active" && (this.#$ = !0, this.#ht("the deinterlacer WebGL context was lost"), this.stop());
+    this.#w !== "active" && (this.#Z = !0, this.#ct("the deinterlacer WebGL context was lost"), this.stop());
   };
 }
-function q(n, e) {
-  const t = n.createProgram(), i = K(n, n.VERTEX_SHADER, He), s = K(n, n.FRAGMENT_SHADER, e);
+function K(n, e) {
+  const t = n.createProgram(), i = J(n, n.VERTEX_SHADER, He), s = J(n, n.FRAGMENT_SHADER, e);
   if (n.attachShader(t, i), n.attachShader(t, s), n.linkProgram(t), n.deleteShader(i), n.deleteShader(s), !n.getProgramParameter(t, n.LINK_STATUS)) {
     const r = n.getProgramInfoLog(t);
     throw n.deleteProgram(t), new Error(
@@ -3191,7 +3275,7 @@ function q(n, e) {
   }
   return t;
 }
-function K(n, e, t) {
+function J(n, e, t) {
   const i = n.createShader(e);
   if (!i) throw new Error("the deinterlacer could not create a shader");
   if (n.shaderSource(i, t), n.compileShader(i), !n.getShaderParameter(i, n.COMPILE_STATUS)) {
@@ -3202,19 +3286,19 @@ function K(n, e, t) {
   }
   return i;
 }
-const J = "data:video/mp4;base64,AAAAHGZ0eXBpc281AAACAGlzbzVpc282bXA0MQAAAu9tb292AAAAbG12aGQAAAAAAAAAAAAAAAAAAAPoAAAAAAABAAABAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAB8nRyYWsAAABcdGtoZAAAAAMAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAFoAAABDgAAAAAAY5tZGlhAAAAIG1kaGQAAAAAAAAAAAAAAAAAAHUwAAAAAFXEAAAAAAAtaGRscgAAAAAAAAAAdmlkZQAAAAAAAAAAAAAAAFZpZGVvSGFuZGxlcgAAAAE5bWluZgAAABR2bWhkAAAAAQAAAAAAAAAAAAAAJGRpbmYAAAAcZHJlZgAAAAAAAAABAAAADHVybCAAAAABAAAA+XN0YmwAAACtc3RzZAAAAAAAAAABAAAAnWF2YzEAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAFoAQ4AEgAAABIAAAAAAAAAAEVTGF2YzYxLjE5LjEwMSBsaWJ4MjY0AAAAAAAAAAAAAAAY//8AAAA3YXZjQwFkACn/4QAZZ2QAKazZQFoET94CIAAAfSAAHUwD4sWywAEAB2j5KBLLIsD9+PgAAAAAEHBhc3AAAAABAAAAAQAAABBzdHRzAAAAAAAAAAAAAAAQc3RzYwAAAAAAAAAAAAAAFHN0c3oAAAAAAAAAAAAAAAAAAAAQc3RjbwAAAAAAAAAAAAAAKG12ZXgAAAAgdHJleAAAAAAAAAABAAAAAQAAAAAAAAAAAAAAAAAAAGF1ZHRhAAAAWW1ldGEAAAAAAAAAIWhkbHIAAAAAAAAAAG1kaXJhcHBsAAAAAAAAAAAAAAAALGlsc3QAAAAkqXRvbwAAABxkYXRhAAAAAQAAAABMYXZmNjEuNy4xMDAAAACYbW9vZgAAABBtZmhkAAAAAAAAAAEAAACAdHJhZgAAABx0ZmhkAAIAOAAAAAEAAAPpAAAEJwEBAAAAAAAUdGZkdAEAAAAAAAAAAAAAAAAAAEh0cnVuAAAKBQAAAAYAAACgAgAAAAAABCcAAAfSAAAAQgAAE40AAAA/AAAH0gAAAgAAAAAAAAAARAAAA+kAAAG7AAAH0gAACK9tZGF0AAACrwYF//+r3EXpvebZSLeWLNgg2SPu73gyNjQgLSBjb3JlIDE2NCByMzEwOCAzMWUxOWY5IC0gSC4yNjQvTVBFRy00IEFWQyBjb2RlYyAtIENvcHlsZWZ0IDIwMDMtMjAyMyAtIGh0dHA6Ly93d3cudmlkZW9sYW4ub3JnL3gyNjQuaHRtbCAtIG9wdGlvbnM6IGNhYmFjPTEgcmVmPTQgZGVibG9jaz0xOjA6MCBhbmFseXNlPTB4MzoweDEzMyBtZT11bWggc3VibWU9MTAgcHN5PTEgcHN5X3JkPTEuMDA6MC4wMCBtaXhlZF9yZWY9MSBtZV9yYW5nZT0yNCBjaHJvbWFfbWU9MSB0cmVsbGlzPTIgOHg4ZGN0PTEgY3FtPTAgZGVhZHpvbmU9MjEsMTEgZmFzdF9wc2tpcD0xIGNocm9tYV9xcF9vZmZzZXQ9LTIgdGhyZWFkcz0xNSBsb29rYWhlYWRfdGhyZWFkcz0xIHNsaWNlZF90aHJlYWRzPTAgbnI9MCBkZWNpbWF0ZT0xIGludGVybGFjZWQ9dGZmIGJsdXJheV9jb21wYXQ9MCBjb25zdHJhaW5lZF9pbnRyYT0wIGJmcmFtZXM9MyBiX3B5cmFtaWQ9MiBiX2FkYXB0PTIgYl9iaWFzPTAgZGlyZWN0PTMgd2VpZ2h0Yj0xIG9wZW5fZ29wPTAgd2VpZ2h0cD0wIGtleWludD0zMCBrZXlpbnRfbWluPTMgc2NlbmVjdXQ9NDAgaW50cmFfcmVmcmVzaD0wIHJjX2xvb2thaGVhZD0zMCByYz1jcmYgbWJ0cmVlPTEgY3JmPTguMCBxY29tcD0wLjYwIHFwbWluPTAgcXBtYXg9NjkgcXBzdGVwPTQgaXBfcmF0aW89MS40MCBhcT0xOjEuMDAAgAAAAAUGAQEygAAAAWdliIICAj/+/76ivgU3edyfbbnP6kzu1BfFPXa9rMu/FCi/GMk76JT20AAAAwAAAwAAAwAAAwAAAwAAAwEJmrWZnq7KhXxVTgAAAwAAAwAAAwAABJ9gAAADAAAKtgAAAwAAAwCi4AAAAwAAHQgAAAMAAAiqAAADAAADA7EAAAMAAAMCCgAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAL+QAAAAUGAQEygAAAADVBmiIWQj/51kP//f3t2AAPsAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAS8AAAAAUGAQEygAAAADJBnkETiEf/hv/80gAJcAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAkIQAAAAUGAQEygAAAAfMBnmCTRCP/9ZJR/1zH/6vL5qeSOTmASFdQlObW+4YAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAxvEAAAAwAAAwAAAwAAE4wAAAMAAAMAAAMAAFuAAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAMuAAAAABQYBATKAAAAANwGeYZakI//1bXH/Een/+rAALngAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAN+EAAAAFBgEBMoAAAAGuQZpileloiEf/2XyP/Fn/6mXyw21/v4X7ly3FFO60AAADAAADAAADAAADAAADAAADAAADADKWVJAQiFeS9HQZhFSJuVc/HAAAAwAAAwAAAwAAAwAAAwAAAwAAj8AAAAMAAAMABTIAAAMAAAMAAD+QAAADAAADAAQkAAADAAADAABJgAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAXUQAAAENtZnJhAAAAK3RmcmEBAAAAAAAAAQAAAAAAAAABAAAAAAAAB9IAAAAAAAADCwEBAQAAABBtZnJvAAAAAAAAAEM=", et = 0.5, tt = 3e3, ee = 0.1, F = 16, te = 'video/mp4; codecs="avc1.640029"';
+const ee = "data:video/mp4;base64,AAAAHGZ0eXBpc281AAACAGlzbzVpc282bXA0MQAAAu9tb292AAAAbG12aGQAAAAAAAAAAAAAAAAAAAPoAAAAAAABAAABAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAB8nRyYWsAAABcdGtoZAAAAAMAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAFoAAABDgAAAAAAY5tZGlhAAAAIG1kaGQAAAAAAAAAAAAAAAAAAHUwAAAAAFXEAAAAAAAtaGRscgAAAAAAAAAAdmlkZQAAAAAAAAAAAAAAAFZpZGVvSGFuZGxlcgAAAAE5bWluZgAAABR2bWhkAAAAAQAAAAAAAAAAAAAAJGRpbmYAAAAcZHJlZgAAAAAAAAABAAAADHVybCAAAAABAAAA+XN0YmwAAACtc3RzZAAAAAAAAAABAAAAnWF2YzEAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAFoAQ4AEgAAABIAAAAAAAAAAEVTGF2YzYxLjE5LjEwMSBsaWJ4MjY0AAAAAAAAAAAAAAAY//8AAAA3YXZjQwFkACn/4QAZZ2QAKazZQFoET94CIAAAfSAAHUwD4sWywAEAB2j5KBLLIsD9+PgAAAAAEHBhc3AAAAABAAAAAQAAABBzdHRzAAAAAAAAAAAAAAAQc3RzYwAAAAAAAAAAAAAAFHN0c3oAAAAAAAAAAAAAAAAAAAAQc3RjbwAAAAAAAAAAAAAAKG12ZXgAAAAgdHJleAAAAAAAAAABAAAAAQAAAAAAAAAAAAAAAAAAAGF1ZHRhAAAAWW1ldGEAAAAAAAAAIWhkbHIAAAAAAAAAAG1kaXJhcHBsAAAAAAAAAAAAAAAALGlsc3QAAAAkqXRvbwAAABxkYXRhAAAAAQAAAABMYXZmNjEuNy4xMDAAAACYbW9vZgAAABBtZmhkAAAAAAAAAAEAAACAdHJhZgAAABx0ZmhkAAIAOAAAAAEAAAPpAAAEJwEBAAAAAAAUdGZkdAEAAAAAAAAAAAAAAAAAAEh0cnVuAAAKBQAAAAYAAACgAgAAAAAABCcAAAfSAAAAQgAAE40AAAA/AAAH0gAAAgAAAAAAAAAARAAAA+kAAAG7AAAH0gAACK9tZGF0AAACrwYF//+r3EXpvebZSLeWLNgg2SPu73gyNjQgLSBjb3JlIDE2NCByMzEwOCAzMWUxOWY5IC0gSC4yNjQvTVBFRy00IEFWQyBjb2RlYyAtIENvcHlsZWZ0IDIwMDMtMjAyMyAtIGh0dHA6Ly93d3cudmlkZW9sYW4ub3JnL3gyNjQuaHRtbCAtIG9wdGlvbnM6IGNhYmFjPTEgcmVmPTQgZGVibG9jaz0xOjA6MCBhbmFseXNlPTB4MzoweDEzMyBtZT11bWggc3VibWU9MTAgcHN5PTEgcHN5X3JkPTEuMDA6MC4wMCBtaXhlZF9yZWY9MSBtZV9yYW5nZT0yNCBjaHJvbWFfbWU9MSB0cmVsbGlzPTIgOHg4ZGN0PTEgY3FtPTAgZGVhZHpvbmU9MjEsMTEgZmFzdF9wc2tpcD0xIGNocm9tYV9xcF9vZmZzZXQ9LTIgdGhyZWFkcz0xNSBsb29rYWhlYWRfdGhyZWFkcz0xIHNsaWNlZF90aHJlYWRzPTAgbnI9MCBkZWNpbWF0ZT0xIGludGVybGFjZWQ9dGZmIGJsdXJheV9jb21wYXQ9MCBjb25zdHJhaW5lZF9pbnRyYT0wIGJmcmFtZXM9MyBiX3B5cmFtaWQ9MiBiX2FkYXB0PTIgYl9iaWFzPTAgZGlyZWN0PTMgd2VpZ2h0Yj0xIG9wZW5fZ29wPTAgd2VpZ2h0cD0wIGtleWludD0zMCBrZXlpbnRfbWluPTMgc2NlbmVjdXQ9NDAgaW50cmFfcmVmcmVzaD0wIHJjX2xvb2thaGVhZD0zMCByYz1jcmYgbWJ0cmVlPTEgY3JmPTguMCBxY29tcD0wLjYwIHFwbWluPTAgcXBtYXg9NjkgcXBzdGVwPTQgaXBfcmF0aW89MS40MCBhcT0xOjEuMDAAgAAAAAUGAQEygAAAAWdliIICAj/+/76ivgU3edyfbbnP6kzu1BfFPXa9rMu/FCi/GMk76JT20AAAAwAAAwAAAwAAAwAAAwAAAwEJmrWZnq7KhXxVTgAAAwAAAwAAAwAABJ9gAAADAAAKtgAAAwAAAwCi4AAAAwAAHQgAAAMAAAiqAAADAAADA7EAAAMAAAMCCgAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAL+QAAAAUGAQEygAAAADVBmiIWQj/51kP//f3t2AAPsAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAS8AAAAAUGAQEygAAAADJBnkETiEf/hv/80gAJcAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAkIQAAAAUGAQEygAAAAfMBnmCTRCP/9ZJR/1zH/6vL5qeSOTmASFdQlObW+4YAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAxvEAAAAwAAAwAAAwAAE4wAAAMAAAMAAAMAAFuAAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAMuAAAAABQYBATKAAAAANwGeYZakI//1bXH/Een/+rAALngAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAN+EAAAAFBgEBMoAAAAGuQZpileloiEf/2XyP/Fn/6mXyw21/v4X7ly3FFO60AAADAAADAAADAAADAAADAAADAAADADKWVJAQiFeS9HQZhFSJuVc/HAAAAwAAAwAAAwAAAwAAAwAAAwAAj8AAAAMAAAMABTIAAAMAAAMAAD+QAAADAAADAAQkAAADAAADAABJgAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAXUQAAAENtZnJhAAAAK3RmcmEBAAAAAAAAAQAAAAAAAAABAAAAAAAAB9IAAAAAAAADCwEBAQAAABBtZnJvAAAAAAAAAEM=", tt = 0.5, it = 3e3, te = 0.1, R = 16, ie = 'video/mp4; codecs="avc1.640029"';
 let z = null;
-function it(n = {}) {
-  return z ??= st(n), z;
+function st(n = {}) {
+  return z ??= rt(n), z;
 }
-async function lt(n = {}) {
-  return (await it(n)).deinterlaces;
+async function ut(n = {}) {
+  return (await st(n)).deinterlaces;
 }
-function ut() {
+function ct() {
   z = null;
 }
-async function st(n) {
-  const e = n.tolerance ?? et, t = n.timeoutMs ?? tt, i = performance.now(), s = (h) => ({
+async function rt(n) {
+  const e = n.tolerance ?? tt, t = n.timeoutMs ?? it, i = performance.now(), s = (h) => ({
     deinterlaces: !1,
     survives: null,
     tookMs: performance.now() - i,
@@ -3226,14 +3310,14 @@ async function st(n) {
   r.muted = !0, r.defaultMuted = !0, r.playsInline = !0, r.preload = "auto";
   let o = null;
   try {
-    o = nt(r, t);
+    o = ot(r, t);
     const h = L(k(r, "loadeddata"), t), a = r.play().then(
       () => !0,
       () => !1
     );
-    if (await o.ready, await h, await ot(r, t, await a), r.videoWidth === 0 || r.videoHeight === 0)
+    if (await o.ready, await h, await ht(r, t, await a), r.videoWidth === 0 || r.videoHeight === 0)
       return s(new Error("the probe clip decoded to nothing"));
-    const c = ht(r);
+    const c = At(r);
     return {
       deinterlaces: c < 1 - e,
       survives: c,
@@ -3245,14 +3329,14 @@ async function st(n) {
     r.pause(), r.removeAttribute("src"), r.replaceChildren(), r.load(), o && URL.revokeObjectURL(o.url);
   }
 }
-const G = typeof MediaSource > "u" ? globalThis.ManagedMediaSource : MediaSource, rt = typeof MediaSource > "u";
-function nt(n, e) {
-  if (!G || !G.isTypeSupported(te))
+const G = typeof MediaSource > "u" ? globalThis.ManagedMediaSource : MediaSource, nt = typeof MediaSource > "u";
+function ot(n, e) {
+  if (!G || !G.isTypeSupported(ie))
     throw new Error("the probe clip needs Media Source Extensions");
-  const t = J.indexOf(","), i = atob(J.slice(t + 1)), s = new Uint8Array(i.length);
+  const t = ee.indexOf(","), i = atob(ee.slice(t + 1)), s = new Uint8Array(i.length);
   for (let a = 0; a < i.length; a++) s[a] = i.charCodeAt(a);
   const r = new G(), o = URL.createObjectURL(r);
-  if (rt) {
+  if (nt) {
     n.disableRemotePlayback = !0;
     const a = document.createElement("source");
     a.type = "video/mp4", a.src = o, n.append(a), n.load();
@@ -3260,31 +3344,31 @@ function nt(n, e) {
     n.src = o;
   const h = (async () => {
     await L(k(r, "sourceopen"), e);
-    const a = r.addSourceBuffer(te), c = L(k(a, "updateend"), e);
+    const a = r.addSourceBuffer(ie), c = L(k(a, "updateend"), e);
     a.appendBuffer(s), await c, r.endOfStream();
   })();
   return { url: o, ready: h };
 }
-async function ot(n, e, t) {
+async function ht(n, e, t) {
   if (t) {
     const i = performance.now();
-    for (; n.currentTime < ee && performance.now() - i < e; )
+    for (; n.currentTime < te && performance.now() - i < e; )
       await new Promise((s) => requestAnimationFrame(s));
     n.pause();
   } else
-    n.currentTime = ee, await L(k(n, "seeked"), e);
+    n.currentTime = te, await L(k(n, "seeked"), e);
 }
-function ht(n) {
+function At(n) {
   const e = n.videoHeight, t = document.createElement("canvas");
-  t.width = F, t.height = e;
+  t.width = R, t.height = e;
   const i = t.getContext("2d", { willReadFrequently: !0 });
   if (!i) throw new Error("there is no 2d context to read the clip with");
-  i.imageSmoothingEnabled = !1, i.drawImage(n, 0, 0, F, e);
-  const s = i.getImageData(0, 0, F, e).data, r = (A) => {
+  i.imageSmoothingEnabled = !1, i.drawImage(n, 0, 0, R, e);
+  const s = i.getImageData(0, 0, R, e).data, r = (A) => {
     let f = 0;
-    for (let m = 0; m < F; m++)
-      f += s[(A * F + m) * 4 + 1] ?? 0;
-    return f / F;
+    for (let m = 0; m < R; m++)
+      f += s[(A * R + m) * 4 + 1] ?? 0;
+    return f / R;
   };
   let o = 0;
   const h = 2, a = e - 3;
@@ -3318,14 +3402,14 @@ function L(n, e) {
     )
   ]);
 }
-Xe(ae);
+Xe(le);
 export {
-  at as Deinterlacer,
+  lt as Deinterlacer,
   De as YADIF_FRAGMENT_SHADER,
   Re as YADIF_UNIFORMS,
-  lt as decoderDeinterlaces,
-  ut as forgetDecoderProbe,
-  it as probeDecoder,
-  At as supportsDeinterlace
+  ut as decoderDeinterlaces,
+  ct as forgetDecoderProbe,
+  st as probeDecoder,
+  at as supportsDeinterlace
 };
 //# sourceMappingURL=index.js.map
