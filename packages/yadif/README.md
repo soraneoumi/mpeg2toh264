@@ -31,16 +31,16 @@ Worker への画像転送が追いつかない環境では入力が欠けるた�
 
 パッケージへ同梱した Worker の代わりに別のファイルを読み込む場合は、`workerUrl` へ URL を指定してください。
 
-Firefox では、メインスレッド描画の場合、リフレッシュごとに動画要素の画像を取り込み、直前の取り込みと GPU 上で比較して新しいフレームを判定します。  
-`mozPaintedFrames` は合成側の描画回数で、取り込める画像とは最大 1 リフレッシュずれるため、フィールド間隔の計測にだけ使います。  
-比較結果は 1 リフレッシュ以上遅れて得られるため、表示もその分だけ遅れます。  
-画素が直前と完全に同じフレームは区別できないため、再生中でも約 0.2 秒に 1 回しか渡さず、その間のフレームは統計の `missed` に数えます。  
-Worker 描画では `mozPaintedFrames` の増加から新しいフレームを取得します。  
+With main-thread rendering on Firefox, the video element's picture is uploaded on every refresh and compared on the GPU with the previous upload to find new frames.  
+`mozPaintedFrames` counts what the compositor painted and can be up to one refresh away from the picture that can be read, so it is used only to measure the field interval.  
+The comparison result arrives at least one refresh later, and the display is delayed by the same amount.  
+A frame whose pixels equal the previous frame's cannot be told apart from it. Such frames are passed on only about once every 0.2 seconds during playback, and the ones in between are counted in the `missed` statistic.  
+With Worker rendering, new frames are taken from increases of `mozPaintedFrames`.  
 他のブラウザーでは、通常速度でネイティブの `requestVideoFrameCallback()` を使用します。
 
 ### 倍速再生
 
-Firefox は倍速時も上記と同じ方法を使い、追加のデコーダーを起動せずに動画要素から画像を取得します。  
+Firefox uses the same method at higher playback rates and reads pictures from the video element without starting another decoder.  
 以下は Firefox 以外のブラウザーでの動作です。
 
 1倍を超えて 1.25 倍以下の再生では、`VideoFrame(video)` で短周期に画像を取得し、表示通知の間で変わる入力も保持します。  
@@ -61,14 +61,14 @@ Firefox は倍速時も上記と同じ方法を使い、追加のデコーダー
 
 `film` を有効にすると、GPU 上で 2:3 プルダウンの周期とフィールドの組み合わせを検出し、フィルム区間を 24000/1001fps 相当で表示します。  
 フィルム判定が確定していない区間は YADIF で処理します。  
-ただし、判定が外れてから約 3 秒 (90 フレーム) の間は、補間する代わりに、各フィールドを同じフィルムコマに由来する隣のフィールド (同じフレームのもう一方、または前後のフレームの隣接フィールド) と組み合わせます。  
-プルダウン後に編集された素材ではカットのたびに周期がずれ、再確定までの 10 フレームほどもフィルムのままであるためです。  
-どちらと組み合わせてもコーミングが残るブロックは、従来どおり YADIF で補間します。  
-この処理の対象になったフレーム数 (周期が未確定で、組み合わせを許可して処理したフレーム数) は統計の `matched` で確認できます。  
+For about 3 seconds (90 frames) after the cadence is lost, fields are not interpolated. Each field is woven with a neighbouring field from the same film frame: the other field of its own frame, or the adjacent field of the previous or next frame.  
+Material edited after pulldown changes its cycle at every cut, and the roughly 10 frames needed to confirm the new cycle are still film.  
+Blocks that stay combed with either partner are interpolated with YADIF.  
+The `matched` statistic counts the frames processed this way (no confirmed cadence, weaving with a neighbour allowed).  
 
-30p 素材や、フレーム単位の繰り返しで 24 コマを収めた素材のように、各フレームの 2 フィールドが同じ瞬間である区間も GPU 上で検出します。  
-動きがあるのにフレームをそのまま表示してもコーミングが出ない、という状態が続くことで判定し、判定中は 2 フィールドとも同じフレーム全体として表示するため、フィールドごとの補間によるちらつきが出ません。  
-判定の状態は統計の `oneInstant` で確認できます。  
+Stretches where both fields of each frame belong to the same instant are also detected on the GPU. Examples are 30p material and 24-frame film carried by repeating whole frames.  
+The condition is that the picture moves but showing the frame as it is leaves no combing, for a number of frames in a row. While it holds, both fields are shown as the same whole frame, which avoids the flicker of per-field interpolation.  
+The `oneInstant` statistic reports the current state.  
 `doubleRate` が有効なら 60000/1001fps 相当、無効なら入力フレームレートで表示するため、実写の 60i 区間はフィールドレートの動きを維持します。
 
 `film` の既定値は `false` です。  
