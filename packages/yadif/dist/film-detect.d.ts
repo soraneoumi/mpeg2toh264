@@ -41,13 +41,21 @@ export declare class FilmDetector {
     get combAheadTexture(): WebGLTexture | null;
     /** The size of the frames to be measured, which sizes the block grid. */
     resize(width: number, height: number): void;
-    /** Forget every measurement: the next frame starts a cycle from nothing. */
-    reset(): void;
+    /**
+     * Forget the measurements: the next frame starts a cycle from nothing.
+     * `keepInstant` leaves the one-instant score as it is, for a gap in the
+     * frames seen that does not mean the content has changed.
+     */
+    reset(keepInstant?: boolean): void;
     /**
      * Detect the pulldown phase of `cur`, the frame being filtered, against
      * `next`, and start reading it back. Only the two comparisons against the
      * next frame are measured; the rest are earlier ones moved along a frame.
      * `first` is the parity of the field that was captured first.
+     *
+     * Whether the frame's two fields are one instant is scored in the same
+     * pass, from the comb counts of the frame as it stands: `measureComb` for
+     * this frame has to have run before this.
      */
     detect(cur: WebGLTexture, next: WebGLTexture, first: number): void;
     /**
@@ -60,9 +68,12 @@ export declare class FilmDetector {
     /**
      * The phase of the last frame measured, once the GPU has handed it back,
      * and null while it is still on its way. It is handed back once.
+     * `instant` is whether the frames up to then were found to hold one
+     * instant each; the filter reads the same from `texture` without waiting.
      */
     poll(): (Phase & {
         age: number;
+        instant: boolean;
     }) | null;
     destroy(): void;
 }

@@ -18,6 +18,9 @@
  * neighbouring field it may have been captured with: the frame's own other
  * field, or the adjoining field of the frame before (for the first field) or
  * after (for the second). `combAhead` is `comb` for the frame after.
+ * `instant` allows the same wherever the detection has found each frame's
+ * two fields to be one instant (see INSTANT_ON in film-shader.ts), from the
+ * frame's own other field only.
  */
 export declare const YADIF_UNIFORMS: {
     readonly prev: "uPrev";
@@ -35,6 +38,7 @@ export declare const YADIF_UNIFORMS: {
     readonly comb: "uComb";
     readonly combAhead: "uCombAhead";
     readonly match: "uMatch";
+    readonly instant: "uInstant";
 };
 /**
  * The filter itself.

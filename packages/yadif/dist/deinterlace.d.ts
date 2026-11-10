@@ -82,9 +82,19 @@ export interface DeinterlaceStats {
     /** Whether 2:3 pulldown has been detected and the frames are shown at 24p. */
     film: boolean;
     /**
+     * Whether each frame's two fields have lately been found to be one
+     * instant, as in 30p material or film carried by repeating whole frames.
+     * This is the detection's verdict as last read back: while it holds, both
+     * fields of a frame are drawn as the same whole picture instead of two
+     * interpolated ones, except while a pulldown cadence is held and on the
+     * frame after a gap. Only looked for while `film` is on.
+     */
+    oneInstant: boolean;
+    /**
      * Frames filtered, with no cadence held, while a field was allowed to be
-     * woven with a neighbouring field that fits: the frames shortly after a
-     * cadence was lost. Blocks with no such partner are interpolated all the
+     * woven with a field of a neighbouring frame that fits: the frames shortly
+     * after a cadence was lost. Weaving on the `oneInstant` verdict is not
+     * counted here. Blocks with no such partner are interpolated all the
      * same, so on video inside that window this counts frames nothing was
      * woven in.
      */

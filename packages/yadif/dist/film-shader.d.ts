@@ -43,8 +43,48 @@ export declare const FIELD_METRICS: {
     /** The previous frame's first field was the one before's. */
     readonly previousFirstRepeated: 5;
     readonly phase: 6;
+    /**
+     * `(score, clean, combed blocks, on)`: how settled it is that both fields
+     * of each frame are one instant, and whether that is the verdict. See the
+     * `instant` function of METRICS.
+     */
+    readonly instant: 7;
 };
-export declare const FIELD_METRICS_SIZE = 7;
+export declare const FIELD_METRICS_SIZE = 8;
+/** The side of the square blocks the comb check counts in, in frame pixels. */
+export declare const COMB_BLOCK = 16;
+/**
+ * Combed pixels on a block's second-field lines at which the whole block is
+ * interpolated rather than woven. Half a block's lines are the second field's,
+ * so this is 8 of 128. A thin horizontal line lies on one of them and moves
+ * with the picture, so it takes more than one line's worth to trip the block,
+ * and a stray pixel of mismatch is not worth breaking up a woven block for.
+ */
+export declare const COMB_BLOCK_PIXELS = 8;
+/**
+ * Frames whose two fields are one instant -- 30p material, or film carried
+ * by repeating whole frames -- are told from video by what video cannot do:
+ * move and still be free of combing as the frame stands. Stills say nothing
+ * either way and are left out. The score goes up by one for a moving frame
+ * that is clean and down by INSTANT_PENALTY for one that is not, between 0
+ * and INSTANT_CAP. The content is taken to be such frames once the score
+ * reaches INSTANT_ON and until it falls below INSTANT_OFF: one bad frame, a
+ * cut into fine horizontal detail say, does not flip the whole picture
+ * between two ways of drawing it and back.
+ *
+ * Measured on broadcasts: of the moving frames of 60i video 0 to 5 % were
+ * clean and the score never reached INSTANT_ON; of progressive material 95 %
+ * were and it stayed there. 2:3 pulldown has two combed frames in five and
+ * never gets near it; its own detection deals with it.
+ */
+export declare const INSTANT_ON = 15;
+export declare const INSTANT_OFF = 6;
+export declare const INSTANT_PENALTY = 8;
+export declare const INSTANT_CAP = 30;
+/** Share of comb blocks that may be past COMB_BLOCK_PIXELS in a clean frame. */
+export declare const INSTANT_CLEAN_BLOCKS = 0.01;
+/** Mean block difference to the next frame above which a frame is moving. */
+export declare const INSTANT_MOTION = 0.002;
 /** Differing blocks tolerated when two fields repeat with encoder noise. */
 export declare const SAME_BLOCKS_MAX = 2;
 /** The phases whose frame holds two film frames; the first is the repeat. */
@@ -88,6 +128,7 @@ export declare const METRICS_UNIFORMS: {
     readonly previous: "uPrevious";
     readonly second: "uSecond";
     readonly first: "uFirst";
+    readonly comb: "uComb";
     readonly size: "uSize";
 };
 /**
@@ -101,16 +142,6 @@ export declare const METRICS_UNIFORMS: {
  * keeps the cycle's place but counts only once the cycle is believed.
  */
 export declare const METRICS_FRAGMENT_SHADER: string;
-/** The side of the square blocks the comb check counts in, in frame pixels. */
-export declare const COMB_BLOCK = 16;
-/**
- * Combed pixels on a block's second-field lines at which the whole block is
- * interpolated rather than woven. Half a block's lines are the second field's,
- * so this is 8 of 128. A thin horizontal line lies on one of them and moves
- * with the picture, so it takes more than one line's worth to trip the block,
- * and a stray pixel of mismatch is not worth breaking up a woven block for.
- */
-export declare const COMB_BLOCK_PIXELS = 8;
 export declare const COMB_UNIFORMS: {
     readonly prev: "uPrev";
     readonly cur: "uCur";
