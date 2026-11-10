@@ -47,11 +47,16 @@ import {
  *
  * With `film`, a frame whose pulldown phase `fieldMetrics` (see
  * film-shader.ts) gives is put back together into its film frame instead of
- * filtered; a frame's `second` field is always filtered. `phase` is the
+ * filtered; that is never done for a frame's `second` field. `phase` is the
  * phase the page expects, for the debug overlay only. `comb` is the detector's
  * count of the combing each way of weaving would leave, block by block (see
  * COMB_FRAGMENT_SHADER), and a block past COMB_BLOCK_PIXELS is filtered
  * instead of woven.
+ *
+ * With `match`, a line that would be filtered is first looked for in the
+ * neighbouring field it may have been captured with: the frame's own other
+ * field, or the adjoining field of the frame before (for the first field) or
+ * after (for the second). `combAhead` is `comb` for the frame after.
  */
 export const YADIF_UNIFORMS = {
   prev: "uPrev",
@@ -67,6 +72,8 @@ export const YADIF_UNIFORMS = {
   phase: "uPhase",
   fieldMetrics: "uFieldMetrics",
   comb: "uComb",
+  combAhead: "uCombAhead",
+  match: "uMatch",
 } as const;
 
 /**
@@ -95,6 +102,7 @@ uniform sampler2D uCur;
 uniform sampler2D uNext;
 uniform sampler2D uFieldMetrics;
 uniform sampler2D uComb;
+uniform sampler2D uCombAhead;
 /** The size of a frame in texels. */
 uniform ivec2 uSize;
 /** The parity of the lines that are kept; the others are interpolated. */
@@ -106,6 +114,8 @@ uniform bool uSpatialCheck;
 uniform bool uDebug;
 uniform bool uFilm;
 uniform bool uSecond;
+/** Whether a missing line may be taken from a neighbouring field that fits. */
+uniform bool uMatch;
 uniform int uPhase;
 
 out vec4 fragColor;
@@ -278,6 +288,38 @@ bool movingComb(vec3 pixel, int x, int y) {
   return any(greaterThan(comb, max(previousComb, vec3(0.0)) + vec3(8.0 / 255.0)));
 }
 
+/**
+ * Take a missing line from the field it was captured with, if there is one.
+ *
+ * Film keeps arriving as film when its cadence is lost: at a cut made after
+ * pulldown the cycle starts again somewhere else, and the phase is unknown
+ * until two cycles have gone by. Each field still has a partner from the same
+ * film frame all the while, and which one it is can be seen without knowing
+ * the phase: the other field of this frame, or the adjoining field of the
+ * neighbouring frame -- the second field of the one before for a first
+ * field, the first field of the one after for a second. Whichever leaves the
+ * block less combed is woven in, and a block neither leaves clean is left to
+ * the filter, as it is when a film weave would comb.
+ *
+ * Real video has no such partner, but a block that barely moves can look as
+ * if it had one, so the caller asks for this only shortly after film.
+ */
+bool matched(int x, int y, out vec3 rgb) {
+  ivec2 block = ivec2(x / ${COMB_BLOCK}, y / ${COMB_BLOCK});
+  float standing = texelFetch(uComb, block, 0)[0];
+  float adjoining = uSecond ? texelFetch(uCombAhead, block, 0)[1]
+                            : texelFetch(uComb, block, 0)[1];
+  if (min(standing, adjoining) > ${COMB_BLOCK_PIXELS}.0) return false;
+  if (standing <= adjoining) {
+    rgb = texelFetch(uCur, ivec2(x, y), 0).rgb;
+  } else if (uSecond) {
+    rgb = texelFetch(uNext, ivec2(x, y), 0).rgb;
+  } else {
+    rgb = texelFetch(uPrev, ivec2(x, y), 0).rgb;
+  }
+  return true;
+}
+
 const int DEBUG_BAR_CELL = 32;
 const int DEBUG_BAR_WIDTH = DEBUG_BAR_CELL * 7;
 const int DEBUG_BAR_HEIGHT = 16;
@@ -335,6 +377,8 @@ void main() {
       rgb = filterPixel(uPrev, uCur, x, y);
   } else if ((y & 1) == uParity) {
     rgb = texelFetch(uCur, ivec2(x, y), 0).rgb;
+  } else if (uMatch && matched(x, y, rgb)) {
+    // Woven from the field that fits.
   } else if ((uParity ^ uTff) != 0) {
     // The first field of the frame: the moment it holds sits between the
     // previous frame and the second field of this one.

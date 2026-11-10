@@ -123,6 +123,17 @@ const PRESENT_HYSTERESIS_MS = 1;
  */
 const DISPLAY_TIME_REACH = 4;
 
+/**
+ * Frames after the cadence was last held for which fields go on being woven
+ * with whichever neighbouring field fits. A cut made after pulldown restarts
+ * the cycle, and confirming the new one takes FILM_LOCK_FRAMES frames that
+ * are film all the same; measured on a broadcast episode these gaps were
+ * mostly under a second, and almost every moving field in them had a partner.
+ * Three seconds covers them and stops well short of trusting a partner in
+ * video, where a block that barely moves can pass for having one.
+ */
+const FILM_HOLD_FRAMES = 90;
+
 /** Broadcast frames in a pulldown cycle, and the film frames they hold. */
 const PULLDOWN_FRAMES = 5;
 const FILM_FRAMES = 4;
@@ -287,6 +298,14 @@ export interface DeinterlaceStats {
   gpuMs: number | undefined;
   /** Whether 2:3 pulldown has been detected and the frames are shown at 24p. */
   film: boolean;
+  /**
+   * Frames filtered, with no cadence held, while a field was allowed to be
+   * woven with a neighbouring field that fits: the frames shortly after a
+   * cadence was lost. Blocks with no such partner are interpolated all the
+   * same, so on video inside that window this counts frames nothing was
+   * woven in.
+   */
+  matched: number;
   /**
    * Why requested film reconstruction is currently unavailable, or null
    * while healthy. The requesting option (`film`) stays as the
@@ -578,6 +597,7 @@ export class Deinterlacer extends EventTarget {
     resynced: 0,
     late: 0,
     queueResetted: 0,
+    matched: 0,
   };
   /** `presentedFrames` of the last frame the callback saw; 0 before any. */
   #lastPresented = 0;
@@ -602,6 +622,16 @@ export class Deinterlacer extends EventTarget {
   /** The phase of the frame being filtered: #known advanced by #knownAge. */
   #phase: Phase = NO_PHASE;
   #filmLocked = false;
+  /** Frames of FILM_HOLD_FRAMES left since the cadence was last held. */
+  #filmHold = 0;
+  /** Whether the frame being filtered may have its fields matched. See #render. */
+  #matching = false;
+  /** Whether the comb counts of the frame after it were made as well. */
+  #aheadMeasured = false;
+  /** Whether the frame before the newest followed a gap in the frames seen. */
+  #gapBehind = false;
+  /** Whether the frames just before this one were progressive. */
+  #afterProgressive = false;
   #debugRenderState: DebugRenderState | null = null;
   #debugText = "";
   /** Debug only: frames given each phase (0 for none), and repeats dropped. */
@@ -893,6 +923,8 @@ export class Deinterlacer extends EventTarget {
       // requested, so nothing is degraded.
       if (!this.#recoverFilm()) return;
       this.#filmLocked = false;
+      this.#filmHold = 0;
+      this.#matching = false;
       this.#phase = NO_PHASE;
       this.#resetFieldMetrics();
       this.#detector?.destroy();
@@ -1158,6 +1190,8 @@ export class Deinterlacer extends EventTarget {
     if (this.#filmDegraded === reason) return;
     this.#filmDegraded = reason;
     this.#filmLocked = false;
+    this.#filmHold = 0;
+    this.#matching = false;
     this.#phase = NO_PHASE;
     this.#resetFieldMetrics();
     // A detector that threw once would throw every frame; drop it so the
@@ -1604,6 +1638,29 @@ export class Deinterlacer extends EventTarget {
   }
 
   /**
+   * Count the combing of the frame after the one being filtered, which says
+   * whether its first field belongs between this frame's second-field lines.
+   * Returns whether the count was made.
+   */
+  #measureAhead(): boolean {
+    const { cur, next } = this.#neighbours(false);
+    const curTexture = this.#textures[cur];
+    const nextTexture = this.#textures[next];
+    const detector = this.#detector;
+    if (!curTexture || !nextTexture || !detector) return false;
+    const first = this.#scan?.topFieldFirst !== false ? 0 : 1;
+    try {
+      detector.measureComb(curTexture, nextTexture, first, true);
+    } catch (error) {
+      this.#degradeFilm(
+        `film detection failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return false;
+    }
+    return true;
+  }
+
+  /**
    * Read back the previous frame's phase if it has arrived, and advance it
    * to the frame being filtered. The run is not advanced: only the GPU
    * counts observed frames.
@@ -1806,6 +1863,10 @@ export class Deinterlacer extends EventTarget {
         const at = performance.now();
         this.#restartReportAfterIdle(at);
         this.#lastFrameAt = at;
+        // Soft and hard telecine alternate within film, so a short stretch
+        // of these does not end the hold; a long one runs it down.
+        if (this.#filmHold > 0) this.#filmHold--;
+        this.#afterProgressive = true;
         this.#showVideo();
         this.#renderMsSinceReport += performance.now() - at;
         this.#renderFramesSinceReport++;
@@ -1840,7 +1901,12 @@ export class Deinterlacer extends EventTarget {
         // place. Both start again from where playback actually is.
         this.#dropQueue();
         this.#resetFieldMetrics();
+        // What comes next need not be film. A progressive stretch is the
+        // exception: no media time is kept through one, so the frame after
+        // it always looks like a jump, and it has run the hold down itself.
+        if (seekFrame || !this.#afterProgressive) this.#filmHold = 0;
       }
+      this.#afterProgressive = false;
       const missed = this.#count(metadata.presentedFrames, stale);
       // The same picture presented again, which the compositor does whenever
       // nothing new has been decoded: paused, stalled, or stopped at the end
@@ -1894,14 +1960,18 @@ export class Deinterlacer extends EventTarget {
         if (!this.#destroyed) this.#endGpuTimer(q);
         return;
       }
+      this.#matching = false;
+      this.#aheadMeasured = false;
       if (this.#film && !this.#filmDegraded) {
         // GPU pulldown detection (otya): a missed frame leaves a gap in the
         // held frames, so the comparisons carried over would be between
         // frames that were never neighbours.
+        let measured = false;
         if (this.#frames === HISTORY && missed === 0) {
           try {
             this.#collectPhase();
             this.#detect();
+            measured = true;
           } catch (error) {
             // A GPU failure must not stop the frame loop (e.g. an
             // incomplete RGBA32F framebuffer despite the extension being
@@ -1919,9 +1989,28 @@ export class Deinterlacer extends EventTarget {
           (this.#phaseCounts[this.#phase.phase] ?? 0) + 1;
         this.#filmLocked =
           this.#phase.phase !== 0 && this.#phase.run >= FILM_LOCK_FRAMES;
+        if (this.#filmLocked) this.#filmHold = FILM_HOLD_FRAMES;
+        else if (this.#filmHold > 0) this.#filmHold--;
+        // While the cadence holds the filter weaves by its phase and this
+        // only covers the frames the page learns of a loss late. The counts
+        // are of this frame and the frames either side of it, so a frame
+        // they were not measured for is filtered, and so is one whose
+        // previous frame is not its neighbour: the frame after a gap is
+        // measured again, against the frame from before the gap.
+        this.#matching = measured && !this.#gapBehind && this.#filmHold > 0;
+        // Only a second field looks to the frame after, and only the field
+        // path draws one.
+        this.#aheadMeasured =
+          this.#matching &&
+          !this.#filmLocked &&
+          this.#doubleRate &&
+          this.#scheduling() &&
+          this.#measureAhead();
+        if (this.#matching && !this.#filmLocked) this.#stats.matched++;
         if (this.#debug)
           this.#debugText = this.#describePhase(metadata.presentedFrames);
       }
+      this.#gapBehind = missed > 0;
       if (!this.#frameIsCurrent(revision)) {
         if (!this.#destroyed) this.#endGpuTimer(q);
         return;
@@ -2730,6 +2819,20 @@ export class Deinterlacer extends EventTarget {
       gl.bindTexture(gl.TEXTURE_2D, comb);
       gl.uniform1i(this.#location.comb, 4);
     }
+    // The comb counts belong to the frame behind the newest and the frames
+    // either side of it, which is not what a flush filters. A second field
+    // needs the counts of the frame after as well.
+    const combAhead = this.#aheadMeasured
+      ? (this.#detector?.combAheadTexture ?? null)
+      : null;
+    const match =
+      film && this.#matching && !flush && (!second || combAhead !== null);
+    gl.activeTexture(gl.TEXTURE0 + 5);
+    gl.bindTexture(gl.TEXTURE_2D, combAhead);
+    gl.uniform1i(this.#location.combAhead, 5);
+    // Textures made or uploaded after this bind on whichever unit is active;
+    // leave it on one every draw binds again.
+    gl.activeTexture(gl.TEXTURE0);
     gl.uniform2i(this.#location.size, this.#width, this.#height);
     // The lines that survive are the ones of the field being shown: the first
     // field is the top one when the top field leads, and the second is the
@@ -2741,6 +2844,7 @@ export class Deinterlacer extends EventTarget {
     gl.uniform1i(this.#location.spatialCheck, this.#spatialCheck ? 1 : 0);
     gl.uniform1i(this.#location.debug, this.#debug ? 1 : 0);
     gl.uniform1i(this.#location.film, film ? 1 : 0);
+    gl.uniform1i(this.#location.match, match ? 1 : 0);
     gl.uniform1i(this.#location.phase, this.#phase.phase);
     gl.viewport(0, 0, this.#width, this.#height);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
@@ -2808,6 +2912,7 @@ export class Deinterlacer extends EventTarget {
     this.#width = width;
     this.#height = height;
     this.#frames = 0;
+    this.#filmHold = 0;
     this.#presentedPicture = null;
     this.#dropQueue();
     this.#layout();
@@ -2977,6 +3082,7 @@ export class Deinterlacer extends EventTarget {
     this.#lastPresentedFrames = 0;
     this.#dropQueue();
     this.#resetFieldMetrics();
+    this.#filmHold = 0;
     this.#periodMs = 0;
     // The counts belong to the stream that has just gone; the next one starts
     // its own. The element resets its own dropped count for the same reason.
@@ -2994,6 +3100,7 @@ export class Deinterlacer extends EventTarget {
       resynced: 0,
       late: 0,
       queueResetted: 0,
+      matched: 0,
     };
     this.#phaseCounts.fill(0);
     this.#filmDropped = 0;

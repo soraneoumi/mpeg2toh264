@@ -171,7 +171,7 @@ class WebGL2RenderingContext {
   fenceSync() { return {}; }
   deleteSync() {}
   clientWaitSync() { return this.ALREADY_SIGNALED; }
-  getBufferSubData() {}
+  getBufferSubData(target, offset, into) { __host.metrics(__realm, into); }
   flush() {}
   createQuery() { return { id: this.#nextId++ }; }
   deleteQuery() {}
@@ -185,14 +185,24 @@ class WebGL2RenderingContext {
     const picture = blit ? this.#texture?.picture : {
       mediaTime: current?.mediaTime,
       second: uniform("uSecond"),
+      match: uniform("uMatch"),
     };
     if (this.#framebuffer) this.#framebuffer.texture.picture = picture;
+    const fragment = (this.#program && this.#program.fragment) || "";
     __host.draw(__realm, {
       t: __host.now(),
       blit,
       toCanvas: this.#framebuffer === null,
       texture: this.#texture ? this.#texture.id : null,
       picture,
+      // The detector's comb count, with the frames it compared and where the
+      // counts went; and at a filter draw, the texture its ahead counts are
+      // read from.
+      filter: fragment.includes("uParity"),
+      comb: fragment.includes("woven += 1.0"),
+      prev: this.#textures.get(uniform("uPrev"))?.mediaTime,
+      target: this.#framebuffer ? this.#framebuffer.texture.id : null,
+      ahead: this.#textures.get(uniform("uCombAhead"))?.id ?? null,
     });
   }
 }
@@ -526,6 +536,7 @@ export async function run(bundles, options = {}) {
     beforeVsync = null,
     resourceAvailable = () => true,
     programAvailable = () => true,
+    filmMetrics = null,
     deinterlacerOptions = {},
     consoleOutput = console,
   } = options;
@@ -584,6 +595,10 @@ export async function run(bundles, options = {}) {
     },
     readback(realm, texture) {
       readbacks.push({ realm, t: clock.now, ...texture });
+    },
+    // What the film detector reads back: nothing unless the test supplies it.
+    metrics(realm, into) {
+      filmMetrics?.({ realm, t: clock.now, into });
     },
     draw(realm, record) {
       draws[realm].push(record);
