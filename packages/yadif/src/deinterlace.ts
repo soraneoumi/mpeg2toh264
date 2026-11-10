@@ -542,11 +542,11 @@ export class Deinterlacer extends EventTarget {
   #droppedBefore = 0;
   /** The last picture chained onto the schedule; a break restarts it. (otya) */
   #lastScheduled: Ready | null = null;
-  /** The lateness the schedule holds on purpose, in milliseconds. See #schedule. */
+  /** The lateness the schedule holds on purpose, in refreshes. See #schedule. */
   #scheduleLag = 0;
   /** Pictures in a row that arrived off the phase the lag stands for, all on one side of it. */
   #offPhase = 0;
-  /** The deviation nearest the lock among them. */
+  /** The phase nearest it among them, in refreshes. */
   #offPhaseNearest = 0;
 
   /**
@@ -2310,7 +2310,9 @@ export class Deinterlacer extends EventTarget {
    * Frames arrive on refreshes, so whichever phase one arrives at, what is
    * left of its distance from the chain after whole refreshes is the
    * chain's own drift against the refresh grid, and every frame nudges that
-   * out.
+   * out. The lag is kept in whole refreshes for the same reason: a chain
+   * held half a refresh off the grid has each pair of fields come due
+   * together, and one of every pair is dropped for as long as it stays.
    *
    * The lag follows what frames actually do. When none has arrived at the
    * phase it stands for in SCHEDULE_WINDOW pictures, it moves to the nearest
@@ -2328,12 +2330,13 @@ export class Deinterlacer extends EventTarget {
     if (last !== null && last.cadence === cadence) {
       const chain = last.at + last.duration;
       // How long after its own moment this picture goes up on the chain,
-      // and how far that is from the lateness the chain holds on purpose.
+      // in refreshes beyond the lateness the chain holds on purpose, and
+      // what is left over: the chain's drift against the grid.
       const wait = chain - ideal;
-      const deviation = wait - this.#scheduleLag;
-      if (wait > -refresh / 2 && deviation < refresh * 1.5) {
-        const phase = Math.round(deviation / refresh);
-        const drift = deviation - phase * refresh;
+      const refreshes = Math.round(wait / refresh);
+      const phase = refreshes - this.#scheduleLag;
+      const drift = wait - refreshes * refresh;
+      if (refreshes >= 0 && phase <= 1) {
         const at =
           chain +
           Math.max(
@@ -2348,9 +2351,9 @@ export class Deinterlacer extends EventTarget {
         // chain. One such frame says nothing about where frames arrive.
         if (this.#offPhase === 0 || phase > 0 !== this.#offPhaseNearest > 0) {
           this.#offPhase = 0;
-          this.#offPhaseNearest = deviation;
-        } else if (Math.abs(deviation) < Math.abs(this.#offPhaseNearest)) {
-          this.#offPhaseNearest = deviation;
+          this.#offPhaseNearest = phase;
+        } else if (Math.abs(phase) < Math.abs(this.#offPhaseNearest)) {
+          this.#offPhaseNearest = phase;
         }
         if (++this.#offPhase < SCHEDULE_WINDOW) return at;
         const nearest = this.#offPhaseNearest;
@@ -2363,12 +2366,11 @@ export class Deinterlacer extends EventTarget {
         }
         // All early: the chain runs later than any frame needs.
         this.#stats.resynced++;
-        return this.#restart(chain - nearest);
+        return this.#restart(at - nearest * refresh);
       }
-      const lag = this.#scheduleLag - wait;
-      if (wait <= -refresh / 2 && lag < refresh * 1.5) {
+      if (refreshes < 0 && this.#scheduleLag - refreshes <= 1) {
         // Late by a refresh against the phase the chain allowed for.
-        this.#scheduleLag = lag;
+        this.#scheduleLag -= refreshes;
         this.#offPhase = 0;
         this.#stats.resynced++;
         return this.#restart(ideal);
