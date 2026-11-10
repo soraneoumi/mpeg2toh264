@@ -186,6 +186,7 @@ class WebGL2RenderingContext {
       mediaTime: current?.mediaTime,
       second: uniform("uSecond"),
       match: uniform("uMatch"),
+      instant: uniform("uInstant"),
     };
     if (this.#framebuffer) this.#framebuffer.texture.picture = picture;
     const fragment = (this.#program && this.#program.fragment) || "";
@@ -200,6 +201,10 @@ class WebGL2RenderingContext {
       // read from.
       filter: fragment.includes("uParity"),
       comb: fragment.includes("woven += 1.0"),
+      // The detector's last pass, which scores the frame from its comb
+      // counts, and the texture it reads them from.
+      metrics: fragment.includes("vec4 instant("),
+      combInput: this.#textures.get(uniform("uComb"))?.id ?? null,
       prev: this.#textures.get(uniform("uPrev"))?.mediaTime,
       target: this.#framebuffer ? this.#framebuffer.texture.id : null,
       ahead: this.#textures.get(uniform("uCombAhead"))?.id ?? null,
@@ -537,6 +542,7 @@ export async function run(bundles, options = {}) {
     resourceAvailable = () => true,
     programAvailable = () => true,
     filmMetrics = null,
+    arrival = null,
     deinterlacerOptions = {},
     consoleOutput = console,
   } = options;
@@ -821,7 +827,10 @@ export async function run(bundles, options = {}) {
       serve("worker", workerTimeOrigin);
       for (const [name, window] of views)
         serve(name, window.performance.timeOrigin);
-      if (vsync % 2 !== 0 || !deliverFrames) return;
+      // A frame every other refresh, unless the test says which refreshes
+      // frames arrive on.
+      const arrives = arrival ? arrival(vsync) : vsync % 2 === 0;
+      if (!arrives || !deliverFrames) return;
       const index = frameIndex++;
       const step = beforeFrame?.(index, control) ?? undefined;
       if (step?.acquisitionTimeOrigin !== undefined) {

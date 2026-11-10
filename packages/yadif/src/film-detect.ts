@@ -166,15 +166,20 @@ export class FilmDetector {
     this.#freeBlocks();
   }
 
-  /** Forget every measurement: the next frame starts a cycle from nothing. */
-  reset(): void {
+  /**
+   * Forget the measurements: the next frame starts a cycle from nothing.
+   * `keepInstant` leaves the one-instant score as it is, for a gap in the
+   * frames seen that does not mean the content has changed.
+   */
+  reset(keepInstant = false): void {
     const gl = this.#gl;
     gl.deleteSync(this.#fence);
     this.#fence = null;
     this.#frame = 0;
     const newest = this.#metrics?.[this.#head];
     if (!newest) return;
-    const metrics = new Float32Array(FIELD_METRICS_SIZE * 4);
+    const texels = keepInstant ? FIELD_METRICS.instant : FIELD_METRICS_SIZE;
+    const metrics = new Float32Array(texels * 4);
     for (let index = 0; index < FIELD_METRICS.phase; index++)
       metrics[index * 4 + 1] = 1;
     gl.bindTexture(gl.TEXTURE_2D, newest.textures[0] ?? null);
@@ -183,7 +188,7 @@ export class FilmDetector {
       0,
       0,
       0,
-      FIELD_METRICS_SIZE,
+      texels,
       1,
       gl.RGBA,
       gl.FLOAT,
@@ -196,6 +201,10 @@ export class FilmDetector {
    * `next`, and start reading it back. Only the two comparisons against the
    * next frame are measured; the rest are earlier ones moved along a frame.
    * `first` is the parity of the field that was captured first.
+   *
+   * Whether the frame's two fields are one instant is scored in the same
+   * pass, from the comb counts of the frame as it stands: `measureComb` for
+   * this frame has to have run before this.
    */
   detect(cur: WebGLTexture, next: WebGLTexture, first: number): void {
     const gl = this.#gl;
@@ -234,6 +243,9 @@ export class FilmDetector {
     this.#bind(0, previous.textures[0], this.#metricsLocation.previous);
     this.#bind(1, reduced.textures[0], this.#metricsLocation.second);
     this.#bind(2, reduced.textures[1], this.#metricsLocation.first);
+    // The counts `measureComb` made for this frame, which it has to have
+    // made first.
+    this.#bind(3, this.#comb?.textures[0], this.#metricsLocation.comb);
     gl.uniform2i(this.#metricsLocation.size, reduced.width, reduced.height);
     gl.viewport(0, 0, FIELD_METRICS_SIZE, 1);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
@@ -285,8 +297,10 @@ export class FilmDetector {
   /**
    * The phase of the last frame measured, once the GPU has handed it back,
    * and null while it is still on its way. It is handed back once.
+   * `instant` is whether the frames up to then were found to hold one
+   * instant each; the filter reads the same from `texture` without waiting.
    */
-  poll(): (Phase & { age: number }) | null {
+  poll(): (Phase & { age: number; instant: boolean }) | null {
     const gl = this.#gl;
     const fence = this.#fence;
     if (fence === null || this.#pixelBuffer === null) return null;
@@ -301,6 +315,7 @@ export class FilmDetector {
         return {
           phase: this.metrics[FIELD_METRICS.phase * 4] ?? 0,
           run: this.metrics[FIELD_METRICS.phase * 4 + 1] ?? 0,
+          instant: (this.metrics[FIELD_METRICS.instant * 4 + 3] ?? 0) > 0.5,
           age: this.#frame - this.#pendingFrame,
         };
       default:

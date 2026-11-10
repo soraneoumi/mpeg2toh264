@@ -57,6 +57,9 @@ import {
  * neighbouring field it may have been captured with: the frame's own other
  * field, or the adjoining field of the frame before (for the first field) or
  * after (for the second). `combAhead` is `comb` for the frame after.
+ * `instant` allows the same wherever the detection has found each frame's
+ * two fields to be one instant (see INSTANT_ON in film-shader.ts), from the
+ * frame's own other field only.
  */
 export const YADIF_UNIFORMS = {
   prev: "uPrev",
@@ -74,6 +77,7 @@ export const YADIF_UNIFORMS = {
   comb: "uComb",
   combAhead: "uCombAhead",
   match: "uMatch",
+  instant: "uInstant",
 } as const;
 
 /**
@@ -116,6 +120,8 @@ uniform bool uFilm;
 uniform bool uSecond;
 /** Whether a missing line may be taken from a neighbouring field that fits. */
 uniform bool uMatch;
+/** Whether it may where the frames have been found to be one instant each. */
+uniform bool uInstant;
 uniform int uPhase;
 
 out vec4 fragColor;
@@ -302,11 +308,20 @@ bool movingComb(vec3 pixel, int x, int y) {
  * the filter, as it is when a film weave would comb.
  *
  * Real video has no such partner, but a block that barely moves can look as
- * if it had one, so the caller asks for this only shortly after film.
+ * if it had one, so the neighbouring frames are looked to only shortly
+ * after film (neighbours). Where the frames have been found to hold one
+ * instant each the partner is the frame's own other field and nothing else:
+ * both fields of a frame then come out as the same whole picture, apart
+ * from blocks that comb as the frame stands, which are filtered.
  */
-bool matched(int x, int y, out vec3 rgb) {
+bool matched(int x, int y, bool neighbours, out vec3 rgb) {
   ivec2 block = ivec2(x / ${COMB_BLOCK}, y / ${COMB_BLOCK});
   float standing = texelFetch(uComb, block, 0)[0];
+  if (!neighbours) {
+    if (standing > ${COMB_BLOCK_PIXELS}.0) return false;
+    rgb = texelFetch(uCur, ivec2(x, y), 0).rgb;
+    return true;
+  }
   float adjoining = uSecond ? texelFetch(uCombAhead, block, 0)[1]
                             : texelFetch(uComb, block, 0)[1];
   if (min(standing, adjoining) > ${COMB_BLOCK_PIXELS}.0) return false;
@@ -318,6 +333,11 @@ bool matched(int x, int y, out vec3 rgb) {
     rgb = texelFetch(uPrev, ivec2(x, y), 0).rgb;
   }
   return true;
+}
+
+/** Whether the detection has settled that both fields of a frame are one instant. */
+bool oneInstant() {
+  return texelFetch(uFieldMetrics, ivec2(${FIELD_METRICS.instant}, 0), 0)[3] > 0.5;
 }
 
 const int DEBUG_BAR_CELL = 32;
@@ -377,7 +397,7 @@ void main() {
       rgb = filterPixel(uPrev, uCur, x, y);
   } else if ((y & 1) == uParity) {
     rgb = texelFetch(uCur, ivec2(x, y), 0).rgb;
-  } else if (uMatch && matched(x, y, rgb)) {
+  } else if ((uMatch || (uInstant && oneInstant())) && matched(x, y, uMatch, rgb)) {
     // Woven from the field that fits.
   } else if ((uParity ^ uTff) != 0) {
     // The first field of the frame: the moment it holds sits between the

@@ -107,6 +107,14 @@ const PERIOD_SHORTER = 0.75;
 const DRIFT_GAIN = 0.1;
 const DRIFT_STEP_MS = 1;
 
+/**
+ * Pictures in a row that have to miss the phase the schedule allows for
+ * before that is taken to have moved: two seconds of video frames. While
+ * the frame period drifts past the refresh, one frame in three still
+ * arrives at the old phase, so this never fires there.
+ */
+const SCHEDULE_WINDOW = 60;
+
 /** How much of each animation frame's error the refresh grid takes. (otya) */
 const GRID_PERIOD_GAIN = 0.02;
 const GRID_PHASE_GAIN = 0.1;
@@ -299,9 +307,19 @@ export interface DeinterlaceStats {
   /** Whether 2:3 pulldown has been detected and the frames are shown at 24p. */
   film: boolean;
   /**
+   * Whether each frame's two fields have lately been found to be one
+   * instant, as in 30p material or film carried by repeating whole frames.
+   * This is the detection's verdict as last read back: while it holds, both
+   * fields of a frame are drawn as the same whole picture instead of two
+   * interpolated ones, except while a pulldown cadence is held and on the
+   * frame after a gap. Only looked for while `film` is on.
+   */
+  oneInstant: boolean;
+  /**
    * Frames filtered, with no cadence held, while a field was allowed to be
-   * woven with a neighbouring field that fits: the frames shortly after a
-   * cadence was lost. Blocks with no such partner are interpolated all the
+   * woven with a field of a neighbouring frame that fits: the frames shortly
+   * after a cadence was lost. Weaving on the `oneInstant` verdict is not
+   * counted here. Blocks with no such partner are interpolated all the
    * same, so on video inside that window this counts frames nothing was
    * woven in.
    */
@@ -524,6 +542,12 @@ export class Deinterlacer extends EventTarget {
   #droppedBefore = 0;
   /** The last picture chained onto the schedule; a break restarts it. (otya) */
   #lastScheduled: Ready | null = null;
+  /** The lateness the schedule holds on purpose, in milliseconds. See #schedule. */
+  #scheduleLag = 0;
+  /** Pictures in a row that arrived off the phase the lag stands for, all on one side of it. */
+  #offPhase = 0;
+  /** The deviation nearest the lock among them. */
+  #offPhaseNearest = 0;
 
   /**
    * Drop the presentation queue and restart the schedule from the clock.
@@ -535,6 +559,8 @@ export class Deinterlacer extends EventTarget {
   #dropQueue(): void {
     this.#queue.length = 0;
     this.#lastScheduled = null;
+    this.#scheduleLag = 0;
+    this.#offPhase = 0;
     this.#droppedBefore = 0;
   }
   /** The `<div>` this put around the element, so it can be taken away again. */
@@ -624,8 +650,12 @@ export class Deinterlacer extends EventTarget {
   #filmLocked = false;
   /** Frames of FILM_HOLD_FRAMES left since the cadence was last held. */
   #filmHold = 0;
+  /** Whether the comb counts are of the frame being filtered and its neighbours. */
+  #measured = false;
   /** Whether the frame being filtered may have its fields matched. See #render. */
   #matching = false;
+  /** Whether the frames lately read back were found to hold one instant each. */
+  #oneInstant = false;
   /** Whether the comb counts of the frame after it were made as well. */
   #aheadMeasured = false;
   /** Whether the frame before the newest followed a gap in the frames seen. */
@@ -1616,12 +1646,18 @@ export class Deinterlacer extends EventTarget {
     );
   }
 
-  #resetFieldMetrics(): void {
+  /**
+   * Start the detection again. `gap` is for frames that went unseen in a
+   * stream that carries on: the cadence has to be found again, but whether
+   * its frames hold one instant each has not changed.
+   */
+  #resetFieldMetrics(gap = false): void {
     this.#phase = NO_PHASE;
     this.#known = NO_PHASE;
     this.#knownAge = 0;
+    if (!gap) this.#oneInstant = false;
     this.#filmLocked = false;
-    this.#detector?.reset();
+    this.#detector?.reset(gap);
   }
 
   /** Detect the pulldown phase of the frame being filtered on the GPU. */
@@ -1632,9 +1668,10 @@ export class Deinterlacer extends EventTarget {
     const nextTexture = this.#textures[next];
     if (!prevTexture || !curTexture || !nextTexture) return;
     const first = this.#scan?.topFieldFirst !== false ? 0 : 1;
-    this.#detector?.detect(curTexture, nextTexture, first);
-    // The same two frames the film branch of the filter weaves from.
+    // The same two frames the film branch of the filter weaves from. Counted
+    // first: the detection scores the frame as it stands from these.
     this.#detector?.measureComb(prevTexture, curTexture, first);
+    this.#detector?.detect(curTexture, nextTexture, first);
   }
 
   /**
@@ -1670,6 +1707,7 @@ export class Deinterlacer extends EventTarget {
     if (known !== null) {
       this.#known = known;
       this.#knownAge = known.age;
+      this.#oneInstant = known.instant;
     }
     this.#knownAge++;
     const { phase, run } = this.#known;
@@ -1960,6 +1998,7 @@ export class Deinterlacer extends EventTarget {
         if (!this.#destroyed) this.#endGpuTimer(q);
         return;
       }
+      this.#measured = false;
       this.#matching = false;
       this.#aheadMeasured = false;
       if (this.#film && !this.#filmDegraded) {
@@ -1983,7 +2022,7 @@ export class Deinterlacer extends EventTarget {
             );
           }
         } else {
-          this.#resetFieldMetrics();
+          this.#resetFieldMetrics(true);
         }
         this.#phaseCounts[this.#phase.phase] =
           (this.#phaseCounts[this.#phase.phase] ?? 0) + 1;
@@ -1997,9 +2036,11 @@ export class Deinterlacer extends EventTarget {
         // they were not measured for is filtered, and so is one whose
         // previous frame is not its neighbour: the frame after a gap is
         // measured again, against the frame from before the gap.
-        this.#matching = measured && !this.#gapBehind && this.#filmHold > 0;
-        // Only a second field looks to the frame after, and only the field
-        // path draws one.
+        this.#measured = measured && !this.#gapBehind;
+        this.#matching = this.#measured && this.#filmHold > 0;
+        // Only a second field looks to the frame after, only the field path
+        // draws one, and only matching after film looks beyond the frame's
+        // own fields.
         this.#aheadMeasured =
           this.#matching &&
           !this.#filmLocked &&
@@ -2250,35 +2291,104 @@ export class Deinterlacer extends EventTarget {
 
   /**
    * When a picture goes up: one duration after the last one of its cadence,
-   * nudged towards `ideal` by a fraction of the gap so that the schedule
-   * follows the clock without a picture ever moving across a refresh. It
-   * restarts from `ideal` when the gap has grown to a whole picture or the
-   * cadence has changed. (otya)
+   * nudged towards the clock by a fraction of the gap so that the schedule
+   * follows it without a picture ever moving across a refresh. (otya)
+   *
+   * `ideal` is when this frame would go up were it the only one, and frames
+   * do not arrive evenly: where the frame period and the refresh nearly
+   * divide, a frame comes a refresh early or late now and then, and for
+   * seconds at a time while the two drift past each other. An early frame
+   * is no trouble, its pictures wait. A late one has missed its moment, and
+   * the chain can only start again from where the frame is -- a refresh
+   * with nothing new to show, which nothing can avoid. What can be avoided
+   * is paying for it twice: the frames after it arrive on time, which is
+   * now a refresh early, and pulling the chain back to them skips a picture
+   * to undo a delay nobody sees. So the chain keeps the lateness it was
+   * pushed to (`#scheduleLag`), treats the frames that arrive at that phase
+   * as on time, and takes the next late frame in its stride.
+   *
+   * Frames arrive on refreshes, so whichever phase one arrives at, what is
+   * left of its distance from the chain after whole refreshes is the
+   * chain's own drift against the refresh grid, and every frame nudges that
+   * out.
+   *
+   * The lag follows what frames actually do. When none has arrived at the
+   * phase it stands for in SCHEDULE_WINDOW pictures, it moves to the nearest
+   * phase they did arrive at; if that was earlier than the chain allows for,
+   * the chain moves up to it, which skips a picture once. Anything further
+   * out than a refresh either way is not jitter, and the chain restarts from
+   * the clock.
    */
   #schedule(cadence: Cadence, ideal: number, duration: number): number {
     // A non-positive duration cannot anchor a chain; schedule at the ideal
     // instead of resyncing on every picture (G1).
     if (!(duration > 0)) return ideal;
     const last = this.#lastScheduled;
+    const refresh = this.#refreshMs;
     if (last !== null && last.cadence === cadence) {
       const chain = last.at + last.duration;
-      const error = ideal - chain;
-      if (Math.abs(error) < duration) {
-        const step = Math.max(
-          -DRIFT_STEP_MS,
-          Math.min(DRIFT_STEP_MS, error * DRIFT_GAIN),
-        );
-        return chain + step;
+      // How long after its own moment this picture goes up on the chain,
+      // and how far that is from the lateness the chain holds on purpose.
+      const wait = chain - ideal;
+      const deviation = wait - this.#scheduleLag;
+      if (wait > -refresh / 2 && deviation < refresh * 1.5) {
+        const phase = Math.round(deviation / refresh);
+        const drift = deviation - phase * refresh;
+        const at =
+          chain +
+          Math.max(
+            -DRIFT_STEP_MS,
+            Math.min(DRIFT_STEP_MS, -drift * DRIFT_GAIN),
+          );
+        if (phase === 0) {
+          this.#offPhase = 0;
+          return at;
+        }
+        // Early, or late by no more than the lag covers: it goes up on the
+        // chain. One such frame says nothing about where frames arrive.
+        if (this.#offPhase === 0 || phase > 0 !== this.#offPhaseNearest > 0) {
+          this.#offPhase = 0;
+          this.#offPhaseNearest = deviation;
+        } else if (Math.abs(deviation) < Math.abs(this.#offPhaseNearest)) {
+          this.#offPhaseNearest = deviation;
+        }
+        if (++this.#offPhase < SCHEDULE_WINDOW) return at;
+        const nearest = this.#offPhaseNearest;
+        this.#offPhase = 0;
+        if (nearest < 0) {
+          // All later than the lag stands for, but in time: it was more
+          // than is needed. The chain itself is where it should be.
+          this.#scheduleLag += nearest;
+          return at;
+        }
+        // All early: the chain runs later than any frame needs.
+        this.#stats.resynced++;
+        return this.#restart(chain - nearest);
+      }
+      const lag = this.#scheduleLag - wait;
+      if (wait <= -refresh / 2 && lag < refresh * 1.5) {
+        // Late by a refresh against the phase the chain allowed for.
+        this.#scheduleLag = lag;
+        this.#offPhase = 0;
+        this.#stats.resynced++;
+        return this.#restart(ideal);
       }
     }
+    this.#scheduleLag = 0;
+    this.#offPhase = 0;
     if (last !== null) this.#stats.resynced++;
+    return this.#restart(ideal);
+  }
+
+  /** Start the chain again at `at`, which is where the caller's picture goes. */
+  #restart(at: number): number {
     // Pictures queued after the new moment would never be shown in order.
-    for (let tail = this.#queue.at(-1); tail && tail.at >= ideal;) {
+    for (let tail = this.#queue.at(-1); tail && tail.at >= at;) {
       this.#queue.pop();
       this.#stats.late++;
       tail = this.#queue.at(-1);
     }
-    return ideal;
+    return at;
   }
 
   /** Make room without treating ordinary capacity pressure as clock divergence. */
@@ -2723,6 +2833,7 @@ export class Deinterlacer extends EventTarget {
       outputFps: (this.#outputSinceReport * 1000) / elapsed,
       gpuMs,
       film: this.#filmLocked,
+      oneInstant: this.#oneInstant,
       filmError: this.#filmDegraded,
     };
     // Main-thread reports use the same observation paths as worker
@@ -2825,8 +2936,7 @@ export class Deinterlacer extends EventTarget {
     const combAhead = this.#aheadMeasured
       ? (this.#detector?.combAheadTexture ?? null)
       : null;
-    const match =
-      film && this.#matching && !flush && (!second || combAhead !== null);
+    const drawable = film && !flush;
     gl.activeTexture(gl.TEXTURE0 + 5);
     gl.bindTexture(gl.TEXTURE_2D, combAhead);
     gl.uniform1i(this.#location.combAhead, 5);
@@ -2844,7 +2954,14 @@ export class Deinterlacer extends EventTarget {
     gl.uniform1i(this.#location.spatialCheck, this.#spatialCheck ? 1 : 0);
     gl.uniform1i(this.#location.debug, this.#debug ? 1 : 0);
     gl.uniform1i(this.#location.film, film ? 1 : 0);
-    gl.uniform1i(this.#location.match, match ? 1 : 0);
+    gl.uniform1i(
+      this.#location.match,
+      drawable && this.#matching && (!second || combAhead !== null) ? 1 : 0,
+    );
+    // Whether the frames hold one instant each is the detection's verdict,
+    // which the filter reads for itself; this only says the counts it would
+    // weave by are those of the frame being drawn.
+    gl.uniform1i(this.#location.instant, drawable && this.#measured ? 1 : 0);
     gl.uniform1i(this.#location.phase, this.#phase.phase);
     gl.viewport(0, 0, this.#width, this.#height);
     gl.drawArrays(gl.TRIANGLES, 0, 3);

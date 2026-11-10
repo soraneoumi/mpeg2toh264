@@ -185,3 +185,53 @@ for (const [frames, expected] of [
   }
   console.log(`ok ${frames} progressive frames: ${after} matched after them`);
 }
+
+// Whether the frames hold one instant each is decided on the GPU, so the
+// filter is allowed to act on it whenever the comb counts are those of the
+// frame it is drawing, cadence or no cadence. It weaves from the frame's own
+// fields only, so nothing is counted for the frame after. The detection
+// scores a frame from its comb counts, which therefore have to be made first.
+// With film off there are no counts.
+for (const rendering of ["main", "worker"]) {
+  const result = await run(bundles, {
+    rendering,
+    vsyncs: 400,
+    deinterlacerOptions: { doubleRate: true, film: true },
+  });
+  const filters = result.draws.filter(
+    (draw) => draw.filter && draw.t > BASE_MS + 1000,
+  );
+  assert.ok(filters.length > 300);
+  assert.ok(
+    filters.every((draw) => draw.picture.instant === 1),
+    `${rendering}: the detection's verdict was not allowed through`,
+  );
+  assert.ok(filters.every((draw) => draw.picture.match === 0));
+  assert.ok(filters.some((draw) => draw.picture.second === 1));
+  const combs = result.draws.filter((draw) => draw.comb);
+  assert.equal(
+    new Set(combs.map((comb) => comb.target)).size,
+    1,
+    `${rendering}: counts made for the frame after with nothing to use them`,
+  );
+  let scored = 0;
+  for (const [index, draw] of result.draws.entries()) {
+    if (!draw.metrics) continue;
+    const counts = result.draws.findLast((comb, at) => at < index && comb.comb);
+    assert.ok(counts, `${rendering}: scored before any counts were made`);
+    assert.equal(counts.t, draw.t, `${rendering}: scored from stale counts`);
+    assert.equal(draw.combInput, counts.target);
+    scored++;
+  }
+  assert.ok(scored > 150, `${rendering}: ${scored} frames scored`);
+  const off = await run(bundles, {
+    rendering,
+    vsyncs: 200,
+    deinterlacerOptions: { doubleRate: true, film: false },
+  });
+  assert.ok(
+    off.draws.every((draw) => !draw.filter || draw.picture.instant !== 1),
+    `${rendering}: allowed without film`,
+  );
+  console.log(`ok ${rendering}: the one-instant verdict reaches the filter`);
+}
