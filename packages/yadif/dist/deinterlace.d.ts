@@ -14,11 +14,16 @@ export interface DeinterlaceStats {
     filtered: number;
     /**
      * Frames the element presented that the filter never saw, counted from the
-     * gaps in `presentedFrames` (`mozPaintedFrames` on Firefox). The neighbours
-     * of the frames either side of a gap are further apart in time than the
-     * filter believes, so its idea of what moved is wrong. A page that sees
-     * this climbing is asking the filter
+     * gaps in `presentedFrames`. The neighbours of the frames either side of a
+     * gap are further apart in time than the filter believes, so its idea of
+     * what moved is wrong. A page that sees this climbing is asking the filter
      * to keep up with more than it can.
+     *
+     * Firefox reports no such count. With main-thread rendering the gaps are
+     * taken from the time between new pictures, which also counts a frame whose
+     * pixels match the one before it: the two cannot be told apart, and a still
+     * scene raises this without anything being wrong. With Worker rendering
+     * they are the gaps in `mozPaintedFrames`.
      */
     missed: number;
     /**
@@ -55,7 +60,9 @@ export interface DeinterlaceStats {
     /**
      * Average rendering-thread time per input frame spent uploading, filtering
      * and presenting during the last report. Excludes GPU execution time and,
-     * when rendering in a Worker, time spent on the main thread.
+     * when rendering in a Worker, time spent on the main thread. On Firefox
+     * with main-thread rendering it also excludes the upload, which is made
+     * once a refresh while looking for new pictures rather than once a frame.
      */
     frameMs: number;
     /**
