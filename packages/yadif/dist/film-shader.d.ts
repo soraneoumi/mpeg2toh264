@@ -44,9 +44,10 @@ export declare const FIELD_METRICS: {
     readonly previousFirstRepeated: 5;
     readonly phase: 6;
     /**
-     * `(score, clean, combed blocks, on)`: how settled it is that both fields
-     * of each frame are one instant, and whether that is the verdict. See the
-     * `instant` function of METRICS.
+     * `(score, clean, combed blocks, on)`: the one-instant score; whether this
+     * frame was clean and how many blocks were combed (both 0 for a still
+     * frame); and whether the verdict is on. See INSTANT_ON and the `instant`
+     * function of METRICS.
      */
     readonly instant: 7;
 };
@@ -62,20 +63,23 @@ export declare const COMB_BLOCK = 16;
  */
 export declare const COMB_BLOCK_PIXELS = 8;
 /**
- * Frames whose two fields are one instant -- 30p material, or film carried
- * by repeating whole frames -- are told from video by what video cannot do:
- * move and still be free of combing as the frame stands. Stills say nothing
- * either way and are left out. The score goes up by one for a moving frame
- * that is clean and down by INSTANT_PENALTY for one that is not, between 0
- * and INSTANT_CAP. The content is taken to be such frames once the score
- * reaches INSTANT_ON and until it falls below INSTANT_OFF: one bad frame, a
- * cut into fine horizontal detail say, does not flip the whole picture
- * between two ways of drawing it and back.
+ * Detection of frames whose two fields are one instant: 30p material, or film
+ * carried by repeating whole frames. Video cannot move and also be free of
+ * combing as the frame stands, so a moving frame without combing indicates
+ * such content. Still frames carry no information and are not scored.
  *
- * Measured on broadcasts: of the moving frames of 60i video 0 to 5 % were
- * clean and the score never reached INSTANT_ON; of progressive material 95 %
- * were and it stayed there. 2:3 pulldown has two combed frames in five and
- * never gets near it; its own detection deals with it.
+ * The score goes up by 1 for a moving frame that is clean, goes down by
+ * INSTANT_PENALTY for a moving frame that is not, and stays between 0 and
+ * INSTANT_CAP. The verdict turns on when the score reaches INSTANT_ON and off
+ * when it falls below INSTANT_OFF. The gap between the two keeps a single bad
+ * frame, such as a cut into fine horizontal detail, from switching the
+ * drawing method back and forth.
+ *
+ * Measured on broadcasts: 0 to 5 % of the moving frames of 60i video were
+ * clean, and the score never reached INSTANT_ON. About 95 % of the moving
+ * frames of progressive material were clean, and the verdict stayed on. 2:3
+ * pulldown has two combed frames in five, so its score never comes near
+ * INSTANT_ON. Its own detection handles it.
  */
 export declare const INSTANT_ON = 15;
 export declare const INSTANT_OFF = 6;
@@ -83,7 +87,10 @@ export declare const INSTANT_PENALTY = 8;
 export declare const INSTANT_CAP = 30;
 /** Share of comb blocks that may be past COMB_BLOCK_PIXELS in a clean frame. */
 export declare const INSTANT_CLEAN_BLOCKS = 0.01;
-/** Mean block difference to the next frame above which a frame is moving. */
+/**
+ * Mean block luma difference from the previous frame, in either field, above
+ * which a frame is moving.
+ */
 export declare const INSTANT_MOTION = 0.002;
 /** Differing blocks tolerated when two fields repeat with encoder noise. */
 export declare const SAME_BLOCKS_MAX = 2;

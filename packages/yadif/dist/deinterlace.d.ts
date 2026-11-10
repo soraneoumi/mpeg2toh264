@@ -19,11 +19,11 @@ export interface DeinterlaceStats {
      * what moved is wrong. A page that sees this climbing is asking the filter
      * to keep up with more than it can.
      *
-     * Firefox reports no such count. With main-thread rendering the gaps are
-     * taken from the time between new pictures, which also counts a frame whose
-     * pixels match the one before it: the two cannot be told apart, and a still
-     * scene raises this without anything being wrong. With Worker rendering
-     * they are the gaps in `mozPaintedFrames`.
+     * Firefox does not report this count. With main-thread rendering the gaps
+     * are taken from the time between new pictures. A frame whose pixels equal
+     * the previous frame's cannot be told apart from a missed one, so a still
+     * scene raises this count although nothing is wrong. With Worker rendering
+     * the gaps are those in `mozPaintedFrames`.
      */
     missed: number;
     /**
@@ -61,8 +61,8 @@ export interface DeinterlaceStats {
      * Average rendering-thread time per input frame spent uploading, filtering
      * and presenting during the last report. Excludes GPU execution time and,
      * when rendering in a Worker, time spent on the main thread. On Firefox
-     * with main-thread rendering it also excludes the upload, which is made
-     * once a refresh while looking for new pictures rather than once a frame.
+     * with main-thread rendering it also excludes the upload, which happens
+     * once per refresh while polling for new pictures, not once per frame.
      */
     frameMs: number;
     /**
@@ -82,21 +82,21 @@ export interface DeinterlaceStats {
     /** Whether 2:3 pulldown has been detected and the frames are shown at 24p. */
     film: boolean;
     /**
-     * Whether each frame's two fields have lately been found to be one
-     * instant, as in 30p material or film carried by repeating whole frames.
-     * This is the detection's verdict as last read back: while it holds, both
-     * fields of a frame are drawn as the same whole picture instead of two
-     * interpolated ones, except while a pulldown cadence is held and on the
-     * frame after a gap. Only looked for while `film` is on.
+     * Whether the two fields of each frame were recently found to be one
+     * instant, as in 30p material or film carried by repeated whole frames.
+     * This is the detection's last verdict read back from the GPU. While it
+     * holds, both fields of a frame are drawn as the same whole picture instead
+     * of two interpolated ones, except while a pulldown cadence is held and on
+     * the frame after a gap. Only evaluated while `film` is on.
      */
     oneInstant: boolean;
     /**
-     * Frames filtered, with no cadence held, while a field was allowed to be
-     * woven with a field of a neighbouring frame that fits: the frames shortly
-     * after a cadence was lost. Weaving on the `oneInstant` verdict is not
-     * counted here. Blocks with no such partner are interpolated all the
-     * same, so on video inside that window this counts frames nothing was
-     * woven in.
+     * Frames filtered with no cadence held, in which a field could be woven
+     * with a matching field of a neighbouring frame. These are the frames
+     * shortly after a cadence is lost. Weaving because of the `oneInstant`
+     * verdict is not counted. Blocks without a matching partner are still
+     * interpolated, so on video inside this window the count includes frames
+     * in which nothing was woven.
      */
     matched: number;
     /**

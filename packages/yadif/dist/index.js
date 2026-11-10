@@ -1,4 +1,4 @@
-const le = "" + new URL("assets/worker-CC0S3qLS.js", import.meta.url).href, M = `#version 300 es
+const le = "" + new URL("assets/worker-C23YlvUA.js", import.meta.url).href, M = `#version 300 es
 void main() {
   // From the vertex index alone. There is no geometry here worth a buffer.
   vec2 corner = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
@@ -199,12 +199,13 @@ const p = {
   previousFirstRepeated: 5,
   phase: 6,
   /**
-   * `(score, clean, combed blocks, on)`: how settled it is that both fields
-   * of each frame are one instant, and whether that is the verdict. See the
-   * `instant` function of METRICS.
+   * `(score, clean, combed blocks, on)`: the one-instant score; whether this
+   * frame was clean and how many blocks were combed (both 0 for a still
+   * frame); and whether the verdict is on. See INSTANT_ON and the `instant`
+   * function of METRICS.
    */
   instant: 7
-}, y = 8, b = 16, B = 8, ve = 15, Ee = 6, be = 8, ge = 30, xe = 0.01, Te = 2e-3, se = 2, X = 1, we = 2, H = 10, ye = {
+}, y = 8, b = 16, k = 8, ve = 15, Ee = 6, be = 8, xe = 30, ge = 0.01, Te = 2e-3, se = 2, X = 1, we = 2, H = 10, ye = {
   a: "uA",
   b: "uB",
   fieldMetrics: "uFieldMetrics",
@@ -432,10 +433,10 @@ vec4 decide(vec4 last, vec4 dFirstRepeatsPrevious, vec4 dSecondRepeatsNext,
 }
 
 /**
- * The instant texel: see INSTANT_ON. The frame counts as moving by its
- * difference from the frame before, the same pair the comb count looks at:
- * that count only sees what changed since then, so a frame unchanged from
- * the one before has nothing to show however much the next one differs.
+ * The instant texel; see INSTANT_ON. A frame is moving if it differs from
+ * the frame before it. This is the pair the comb count uses, and the count
+ * only sees what changed since that frame. A frame equal to the one before
+ * it shows nothing, however much the next frame differs.
  */
 vec4 instant(vec4 last, vec4 dSecondPrevious, vec4 dFirstPrevious)
 {
@@ -445,11 +446,11 @@ vec4 instant(vec4 last, vec4 dSecondPrevious, vec4 dFirstPrevious)
   float combed = 0.0;
   for (int y = 0; y < blocks.y; ++y) {
     for (int x = 0; x < blocks.x; ++x) {
-      if (texelFetch(uComb, ivec2(x, y), 0)[0] > ${B}.0) combed += 1.0;
+      if (texelFetch(uComb, ivec2(x, y), 0)[0] > ${k}.0) combed += 1.0;
     }
   }
-  bool clean = combed <= ${xe} * float(blocks.x * blocks.y);
-  score = clean ? min(score + 1.0, ${ge}.0) : max(score - ${be}.0, 0.0);
+  bool clean = combed <= ${ge} * float(blocks.x * blocks.y);
+  score = clean ? min(score + 1.0, ${xe}.0) : max(score - ${be}.0, 0.0);
   bool on = last[3] > 0.5 ? score >= ${Ee}.0 : score >= ${ve}.0;
   return vec4(score, clean ? 1.0 : 0.0, combed, on ? 1.0 : 0.0);
 }
@@ -565,7 +566,7 @@ void main() {
   combAhead: "uCombAhead",
   match: "uMatch",
   instant: "uInstant"
-}, ke = `#version 300 es
+}, Be = `#version 300 es
 precision highp float;
 precision highp int;
 
@@ -588,7 +589,7 @@ uniform bool uFilm;
 uniform bool uSecond;
 /** Whether a missing line may be taken from a neighbouring field that fits. */
 uniform bool uMatch;
-/** Whether it may where the frames have been found to be one instant each. */
+/** Whether it may come from the frame's own other field where frames are one instant. */
 uniform bool uInstant;
 uniform int uPhase;
 
@@ -765,34 +766,33 @@ bool movingComb(vec3 pixel, int x, int y) {
 /**
  * Take a missing line from the field it was captured with, if there is one.
  *
- * Film keeps arriving as film when its cadence is lost: at a cut made after
- * pulldown the cycle starts again somewhere else, and the phase is unknown
- * until two cycles have gone by. Each field still has a partner from the same
- * film frame all the while, and which one it is can be seen without knowing
- * the phase: the other field of this frame, or the adjoining field of the
- * neighbouring frame -- the second field of the one before for a first
- * field, the first field of the one after for a second. Whichever leaves the
- * block less combed is woven in, and a block neither leaves clean is left to
- * the filter, as it is when a film weave would comb.
+ * A cut made after pulldown restarts the film cycle, and the phase is unknown
+ * until two cycles have passed. Each field still has a partner from the same
+ * film frame, and the partner can be found without knowing the phase. It is
+ * the other field of this frame, or the adjoining field of a neighbouring
+ * frame: the second field of the previous frame for a first field, the first
+ * field of the next frame for a second field. The block is woven from
+ * whichever candidate leaves it less combed. If neither leaves it clean, the
+ * block is left to the filter, as in the film branch.
  *
- * Real video has no such partner, but a block that barely moves can look as
- * if it had one, so the neighbouring frames are looked to only shortly
- * after film (neighbours). Where the frames have been found to hold one
- * instant each the partner is the frame's own other field and nothing else:
- * both fields of a frame then come out as the same whole picture, apart
- * from blocks that comb as the frame stands, which are filtered.
+ * Video has no partner, but a block that barely moves can look as if it had
+ * one. So the neighbouring frames are used only shortly after film
+ * (neighbours). Where the frames are found to hold one instant each, the
+ * partner is always the frame's own other field. Both fields of a frame then
+ * come out as the same picture, except in blocks that are combed as the frame
+ * stands, which are filtered.
  */
 bool matched(int x, int y, bool neighbours, out vec3 rgb) {
   ivec2 block = ivec2(x / ${b}, y / ${b});
   float standing = texelFetch(uComb, block, 0)[0];
   if (!neighbours) {
-    if (standing > ${B}.0) return false;
+    if (standing > ${k}.0) return false;
     rgb = texelFetch(uCur, ivec2(x, y), 0).rgb;
     return true;
   }
   float adjoining = uSecond ? texelFetch(uCombAhead, block, 0)[1]
                             : texelFetch(uComb, block, 0)[1];
-  if (min(standing, adjoining) > ${B}.0) return false;
+  if (min(standing, adjoining) > ${k}.0) return false;
   if (standing <= adjoining) {
     rgb = texelFetch(uCur, ivec2(x, y), 0).rgb;
   } else if (uSecond) {
@@ -803,7 +803,7 @@ bool matched(int x, int y, bool neighbours, out vec3 rgb) {
   return true;
 }
 
-/** Whether the detection has settled that both fields of a frame are one instant. */
+/** Whether the detection found the two fields of each frame to be one instant. */
 bool oneInstant() {
   return texelFetch(uFieldMetrics, ivec2(${p.instant}, 0), 0)[3] > 0.5;
 }
@@ -859,7 +859,7 @@ void main() {
     // A block the weave would leave combed -- a cut, a fade or a telop that
     // does not follow the cadence -- is filtered like video instead.
     vec4 comb = texelFetch(uComb, ivec2(x / ${b}, y / ${b}), 0);
-    bool combedBlock = (mixed ? comb[1] : comb[0]) > ${B}.0;
+    bool combedBlock = (mixed ? comb[1] : comb[0]) > ${k}.0;
     if ((y & 1) != uParity &&
         (combedBlock || (detectedPhase() == 4 && movingComb(rgb, x, y))))
       rgb = filterPixel(uPrev, uCur, x, y);
@@ -876,7 +876,7 @@ void main() {
   }
   fragColor = vec4(rgb, 1.0);
 }
-`, x = { phase: 0, run: 0 };
+`, g = { phase: 0, run: 0 };
 function C(n, e, t) {
   return Object.fromEntries(
     Object.entries(t).map(([i, s]) => [
@@ -900,7 +900,7 @@ class V {
   #T = null;
   /** Combed pixels per block of the frame being filtered, both ways of weaving it. */
   #v = null;
-  /** The same for the frame after it. */
+  /** Combed pixels per block of the frame after the one being filtered. */
   #E = null;
   /** The field metrics (see FIELD_METRICS) of this frame and the one before. */
   #c = null;
@@ -949,7 +949,10 @@ class V {
   get combTexture() {
     return this.#v?.textures[0] ?? null;
   }
-  /** Combed pixels per block of the frame last measured ahead, or null. */
+  /**
+   * Combed pixels per block of the frame last measured with `ahead`, or null
+   * before one has been.
+   */
   get combAheadTexture() {
     return this.#E?.textures[0] ?? null;
   }
@@ -959,8 +962,8 @@ class V {
   }
   /**
    * Forget the measurements: the next frame starts a cycle from nothing.
-   * `keepInstant` leaves the one-instant score as it is, for a gap in the
-   * frames seen that does not mean the content has changed.
+   * `keepInstant` keeps the one-instant score, for a gap in the frames when
+   * the content has not changed.
    */
   reset(e = !1) {
     const t = this.#t;
@@ -988,9 +991,9 @@ class V {
    * next frame are measured; the rest are earlier ones moved along a frame.
    * `first` is the parity of the field that was captured first.
    *
-   * Whether the frame's two fields are one instant is scored in the same
-   * pass, from the comb counts of the frame as it stands: `measureComb` for
-   * this frame has to have run before this.
+   * The same pass scores whether the two fields of a frame are one instant,
+   * from the comb counts of the frame as it stands. `measureComb` for this
+   * frame must have run before this.
    */
   detect(e, t, i) {
     const s = this.#t;
@@ -1008,8 +1011,9 @@ class V {
   /**
    * Count the combing each way of weaving `cur`, the frame being filtered,
    * would leave: as it stands, and with `prev`'s second field. `first` is the
-   * parity of the field that was captured first. With `ahead`, the two are
-   * the frame being filtered and the one after it, counted for the latter.
+   * parity of the field that was captured first. With `ahead`, `prev` is the
+   * frame being filtered and `cur` is the one after it, and the counts are
+   * those of `cur`.
    */
   measureComb(e, t, i, s = !1) {
     const r = this.#t;
@@ -1021,8 +1025,8 @@ class V {
   /**
    * The phase of the last frame measured, once the GPU has handed it back,
    * and null while it is still on its way. It is handed back once.
-   * `instant` is whether the frames up to then were found to hold one
-   * instant each; the filter reads the same from `texture` without waiting.
+   * `instant` is the one-instant verdict as of that frame. The filter reads
+   * the same verdict from `texture` without waiting for the readback.
    */
   poll() {
     const e = this.#t, t = this.#n;
@@ -1140,7 +1144,7 @@ function w(n, e = 0, t = n.length) {
   }
   return s;
 }
-function Be(n, e) {
+function ke(n, e) {
   for (const t of w(n, e.body, e.end).filter(
     (i) => i.type === "trak"
   )) {
@@ -1195,7 +1199,7 @@ class Le {
     try {
       for (const r of w(t)) {
         if (r.type === "moov") {
-          this.#i = Be(t, r);
+          this.#i = ke(t, r);
           const o = this.#i;
           o && VideoDecoder.isConfigSupported(o).then((h) => {
             this.#c.set(o, h.supported === !0);
@@ -1329,15 +1333,15 @@ uniform sampler2D uReference;
 out vec4 fragColor;
 
 void main() {
-  // The sizes are compared here as well as by the caller, which knows them
-  // only from the element: that can disagree with the picture actually
-  // uploaded for a moment when the stream changes resolution.
+  // The caller compares sizes taken from the element. Those can briefly differ
+  // from the uploaded picture when the stream changes resolution, so compare
+  // the texture sizes here too. Different sizes count as changed.
   if (textureSize(uTake, 0) != textureSize(uReference, 0)) {
     fragColor = vec4(1.0);
     return;
   }
-  // Every texel is read, so a picture that differs anywhere is seen to differ.
-  // The cells at the right and bottom edges read their last texels again.
+  // Each cell samples every texel it covers, so a change anywhere in the picture is detected.
+  // Edge cells clamp and re-read their last row or column.
   ivec2 last = textureSize(uTake, 0) - 1;
   ivec2 origin = ivec2(gl_FragCoord.xy) * ${P};
   vec3 difference = vec3(0.0);
@@ -1358,15 +1362,15 @@ class Ne {
   #i;
   #e = null;
   #h = null;
-  /** Textures free to take the next picture. */
+  /** Textures available for the next take. */
   #f = [];
   #A = 0;
-  /** Readback buffers free for the next comparison. */
+  /** Readback buffers available for the next comparison. */
   #s = [];
   #o = new Uint8Array(0);
-  /** Takes in order, from the oldest still held. */
+  /** Takes still held, oldest first. */
   #d = [];
-  /** The newest take, which the next one is compared with. */
+  /** The newest take. The next take is compared with it. */
   #r = null;
   #T = 0;
   constructor(e, t) {
@@ -1417,8 +1421,8 @@ class Ne {
     return t.reported = !0, { id: t.id, changed: t.changed };
   }
   /**
-   * Hand the texture of a take to the caller in exchange for one it no longer
-   * needs, which becomes free for a later take.
+   * Give the texture of a reported take to the caller and accept a texture in
+   * exchange. The replacement becomes available for later takes.
    */
   adopt(e, t) {
     const i = this.#d.findIndex((r) => r.id === e), s = this.#d[i];
@@ -1444,12 +1448,12 @@ class Ne {
     for (const { buffer: t } of this.#s) e.deleteBuffer(t);
     this.#s = [], this.#l(), this.#e !== null && e.deleteProgram(this.#e), this.#e = null;
   }
-  /** Draw the comparison of a take with the one before it and start its readback. */
+  /** Compare a take with the reference on the GPU and start reading back the result. */
   #v(e, t) {
     const i = this.#t, s = Math.ceil(e.width / P), r = Math.ceil(e.height / P), o = this.#n(s, r), h = this.#b(s * r * 4);
     this.#e ??= this.#a(), i.bindFramebuffer(i.FRAMEBUFFER, o.framebuffer), i.useProgram(this.#e), i.activeTexture(i.TEXTURE1), i.bindTexture(i.TEXTURE_2D, t.texture), i.activeTexture(i.TEXTURE0), i.bindTexture(i.TEXTURE_2D, e.texture), i.viewport(0, 0, s, r), i.drawArrays(i.TRIANGLES, 0, 3), i.bindBuffer(i.PIXEL_PACK_BUFFER, h.buffer), i.readPixels(0, 0, s, r, i.RGBA, i.UNSIGNED_BYTE, 0), i.bindBuffer(i.PIXEL_PACK_BUFFER, null), i.bindFramebuffer(i.FRAMEBUFFER, null), e.fence = i.fenceSync(i.SYNC_GPU_COMMANDS_COMPLETE, 0), e.buffer = h, i.flush();
   }
-  /** Give back what a comparison held, whether or not it was read. */
+  /** Release the fence and readback buffer of a comparison, whether or not it was read. */
   #E(e) {
     const t = this.#t;
     e.fence !== null && t.deleteSync(e.fence), e.fence = null;
@@ -1459,8 +1463,9 @@ class Ne {
     s !== null && i.bytes === s.width * s.height * 4 ? this.#s.push(i) : t.deleteBuffer(i.buffer);
   }
   /**
-   * Free the texture of a take that has left. By then a later take has
-   * replaced it as the reference, and the comparison that read it is issued.
+   * Return the texture of a removed take to the pool. This is safe because a
+   * later take has replaced it as the reference and the comparison that read
+   * it has been issued.
    */
   #c(e) {
     this.#f.push(e.texture);
@@ -1541,16 +1546,16 @@ class Ve {
   #i;
   #e;
   #h;
-  /** The watch the takes below belong to. */
+  /** The watch that owns the takes in #taken. */
   #f = null;
-  /** Takes awaiting their verdict, oldest first. */
+  /** Takes whose results are pending, oldest first. */
   #A = [];
-  /** Frames counted on the watched path, standing in for `presentedFrames`. */
+  /** Frame count on the picture-watching path, reported as `presentedFrames`. */
   #s = 0;
   #o = null;
-  /** Unchanged verdicts in a row on takes made at rest. */
+  /** Consecutive unchanged results for takes made at rest. */
   #d = 0;
-  /** When the take last delivered was made, and the painted count then. */
+  /** When the last delivered take was made, and the painted count when it was delivered. */
   #r = null;
   #T = null;
   #v = null;
@@ -1597,7 +1602,7 @@ class Ve {
   request(e) {
     if (this.#E === null) {
       if (this.#E = e, this.#p) {
-        this.#k();
+        this.#B();
         return;
       }
       this.#v = this.#e ? requestAnimationFrame(this.#N) : this.#t.requestVideoFrameCallback(this.#ee);
@@ -1627,7 +1632,7 @@ class Ve {
   /** Deliver pending input on the rendering window's refresh, before drawing. */
   flush(e) {
     if (this.#p)
-      for (this.#t.ownerDocument !== this.#z && (this.#m?.(), this.#m = null, this.#k()); this.#G.length > 0 && this.#E !== null; ) {
+      for (this.#t.ownerDocument !== this.#z && (this.#m?.(), this.#m = null, this.#B()); this.#G.length > 0 && this.#E !== null; ) {
         const t = this.#G.shift(), i = t.frame;
         try {
           this.#H(e, {
@@ -1656,9 +1661,9 @@ class Ve {
       this.cancel(), this.#p = t, i !== null && this.request(i);
       return;
     }
-    ["seeking", "seeked", "emptied", "ratechange"].includes(e.type) && (this.#I = null, this.#W = []), this.#p && ((e.type === "pause" || e.type === "ended") && this.flush(performance.now()), this.#Y(), this.#m?.(), this.#m = null, this.#E !== null && this.#k());
+    ["seeking", "seeked", "emptied", "ratechange"].includes(e.type) && (this.#I = null, this.#W = []), this.#p && ((e.type === "pause" || e.type === "ended") && this.flush(performance.now()), this.#Y(), this.#m?.(), this.#m = null, this.#E !== null && this.#B());
   };
-  #k() {
+  #B() {
     if (!this.#p || this.#m !== null || this.#E === null || (this.#t.paused || this.#t.ended) && this.#I !== null)
       return;
     this.#w === null && typeof this.#t.requestVideoFrameCallback == "function" && (this.#w = this.#t.requestVideoFrameCallback(
@@ -1681,21 +1686,21 @@ class Ve {
     const e = this.#t;
     if (this.#E === null) return;
     if (e.readyState < 2 || e.seeking) {
-      this.#k();
+      this.#B();
       return;
     }
     let t, i = !1;
     try {
       const s = this.#i?.();
       if (s === null) {
-        this.#k();
+        this.#B();
         return;
       }
       i = s !== void 0, t = s ?? new VideoFrame(e);
     } catch (s) {
       if (!(s instanceof DOMException) || s.name !== "InvalidStateError")
         throw s;
-      this.#k();
+      this.#B();
       return;
     }
     if (t.timestamp === this.#I)
@@ -1713,16 +1718,16 @@ class Ve {
       const r = performance.now() + (i ? (t.timestamp / 1e6 - e.currentTime) * 1e3 / e.playbackRate : 0);
       for (this.#G.push({ frame: t, at: r, count: this.#De }); this.#G.length > 4; ) this.#G.shift().frame.close();
     }
-    this.#k();
+    this.#B();
   };
   #U = () => {
     this.#n = null, this.#l = null, this.#b = 0;
   };
   #j = () => {
-    this.#c = null, this.#u = null, this.#a = !0, this.#B(), this.#U();
+    this.#c = null, this.#u = null, this.#a = !0, this.#k(), this.#U();
   };
-  /** Drop the takes in hand; the next one starts with nothing to compare to. */
-  #B() {
+  /** Discard all takes. The next take has no reference to compare with. */
+  #k() {
     this.#f?.reset(), this.#A = [], this.#d = 0;
   }
   /** Native acquisition: pass the report on, with the clock it was made on. */
@@ -1770,7 +1775,7 @@ class Ve {
     } else
       this.#v = requestAnimationFrame(this.#N);
   };
-  /** Fold the painted count into the cadence, on a poll that saw it advance. */
+  /** Update the cadence estimate from the painted count. Called on a poll where the count advanced. */
   #D(e, t) {
     if (t.paused || t.ended) return;
     const i = t.mozPaintedFrames, s = this.#l;
@@ -1785,13 +1790,13 @@ class Ve {
     this.#l ??= { at: e, frames: i };
   }
   /**
-   * The poll where the pictures themselves say what is new. Every refresh
-   * takes the element's picture; a take is delivered once its verdict is in,
-   * which is a refresh or more after it was made.
+   * Poll that finds new frames by comparing pictures. Every refresh takes the
+   * element's picture. A take is delivered once its result is known, one or
+   * more refreshes after it was made.
    */
   #y(e, t, i, s, r) {
     const o = t.mozPaintedFrames, h = this.#u !== null && o !== this.#u;
-    this.#o !== null && e - this.#o > N && (this.#B(), this.#U(), this.#a = !0), this.#o = e, h && this.#D(e, t);
+    this.#o !== null && e - this.#o > N && (this.#k(), this.#U(), this.#a = !0), this.#o = e, h && this.#D(e, t);
     const a = t.paused || t.ended;
     (!a || h) && (this.#d = 0), a && this.#r !== null && (this.#r = e);
     const c = a && this.#d >= He;
@@ -1835,12 +1840,12 @@ class Ve {
       this.#H(e, {
         width: A.width,
         height: A.height,
-        // As on the counted path, this only places the frame on the media
-        // timeline; it is the clock's value when the picture was taken.
+        // As on the counter path, this only places the frame on the media
+        // timeline. It is the clock value when the picture was taken.
         mediaTime: A.mediaTime,
         presentedFrames: this.#s,
-        // The picture is in hand now, not when it was taken, and the
-        // schedule is anchored to when a frame is handed over.
+        // The picture is delivered now, not when it was taken, and the
+        // schedule is anchored to the delivery time.
         expectedDisplayTime: e,
         timeOrigin: performance.timeOrigin,
         mozTiming: { periodMs: this.#b, discontinuity: m },
@@ -1855,7 +1860,7 @@ let Ae = null;
 function Qe(n) {
   Ae = n;
 }
-const Q = 0.5, g = 4, z = 5, T = z + 1, Y = 1e3, Z = 4, k = 200, Ye = 0.25, Ze = 1e3 / 60, je = `#version 300 es
+const Q = 0.5, x = 4, z = 5, T = z + 1, Y = 1e3, Z = 4, B = 200, Ye = 0.25, Ze = 1e3 / 60, je = `#version 300 es
 void main() {
   // One triangle over the whole viewport, from the vertex index alone. There
   // is no geometry here worth a buffer: every pixel is the fragment shader's.
@@ -1935,8 +1940,8 @@ class vt extends EventTarget {
   /** The lateness the schedule holds on purpose, in refreshes. See #schedule. */
   #Z = 0;
   /** Pictures in a row that arrived off the phase the lag stands for, all on one side of it. */
-  #k = 0;
-  /** The phase nearest it among them, in refreshes. */
+  #B = 0;
+  /** Of those, the phase closest to the lag's phase, in refreshes. */
   #he = 0;
   /**
    * Drop the presentation queue and restart the schedule from the clock.
@@ -1946,12 +1951,12 @@ class vt extends EventTarget {
    * as late. Restart accounting for cadence changes lives in #schedule.
    */
   #S() {
-    this.#l.length = 0, this.#Y = null, this.#Z = 0, this.#k = 0, this.#G = 0;
+    this.#l.length = 0, this.#Y = null, this.#Z = 0, this.#B = 0, this.#G = 0;
   }
   /** The `<div>` this put around the element, so it can be taken away again. */
   #U = null;
   #j;
-  #B;
+  #k;
   #ee;
   #H = 0;
   /** otya GPU pulldown path: enabled by the `film` option (see below). */
@@ -1963,7 +1968,7 @@ class vt extends EventTarget {
   #X = 0;
   #q = 0;
   /** Where the newest frame is. The two before it follow round the ring. */
-  #O = g - 1;
+  #O = x - 1;
   /** How many of the held frames are consecutive, up to HISTORY. */
   #_ = 0;
   #_e = 0;
@@ -1985,8 +1990,8 @@ class vt extends EventTarget {
   #fe;
   #te;
   #ht;
-  #g = null;
-  #x;
+  #x = null;
+  #g;
   #Se = !1;
   #At = 0;
   #at = !1;
@@ -2008,41 +2013,41 @@ class vt extends EventTarget {
     matched: 0
   };
   /** `presentedFrames` of the last frame the callback saw; 0 before any. */
-  #ke = 0;
+  #Be = 0;
   /** When the last frame the filter took arrived, to see the gaps between. */
   #Ve = 0;
   #Qe = 0;
   #ie = 0;
   #me = 0;
   #pe = 0;
-  #Be = 0;
+  #ke = 0;
   #ve = 0;
   #Ee;
   #Ye = [];
   #be = [];
   #Le = 0;
-  #ge = 0;
-  #Ie = 0;
   #xe = 0;
+  #Ie = 0;
+  #ge = 0;
   /** The last phase read back from the GPU, and how many frames ago it was for. */
-  #Ue = x;
+  #Ue = g;
   #Te = 0;
   /** The phase of the frame being filtered: #known advanced by #knownAge. */
-  #L = x;
+  #L = g;
   #$ = !1;
-  /** Frames of FILM_HOLD_FRAMES left since the cadence was last held. */
+  /** Frames left of the FILM_HOLD_FRAMES window that starts when the cadence is held. */
   #V = 0;
-  /** Whether the comb counts are of the frame being filtered and its neighbours. */
+  /** Whether the comb counts were made for the frame being filtered and its neighbours. */
   #Ze = !1;
   /** Whether the frame being filtered may have its fields matched. See #render. */
   #ae = !1;
-  /** Whether the frames lately read back were found to hold one instant each. */
+  /** Whether the last detection read back found each frame to be one instant. */
   #lt = !1;
-  /** Whether the comb counts of the frame after it were made as well. */
+  /** Whether comb counts were also made for the frame after it. */
   #ct = !1;
-  /** Whether the frame before the newest followed a gap in the frames seen. */
+  /** Whether the frame behind the newest (the one being filtered) came after a gap in the frames seen. */
   #Pt = !1;
-  /** Whether the frames just before this one were progressive. */
+  /** Whether the previous frame was progressive. */
   #ut = !1;
   #we = null;
   #Ct = "";
@@ -2059,7 +2064,7 @@ class vt extends EventTarget {
   #dt = null;
   #mt = 0;
   constructor(e, t = {}, i = null) {
-    super(), this.#e = e, this.#B = t.doubleRate ?? !1, this.#ee = t.spatialCheck ?? !0, this.#N = t.debug ?? !1, this.#D = t.film ?? !1, this.#nt = t.onStats, this.#ot = t.onFailure, this.#P = i, this.#te = i ? "main" : t.rendering ?? "main", this.#ht = t.workerUrl ?? Ae, this.#x = this.#te === "main" ? "main" : "idle", this.#i = i ? i.canvas : document.createElement("canvas"), this.#t = i?.canvas ?? (this.#te === "main" ? this.#i : document.createElement("canvas")), this.#fe = e, i || (this.#i.style.cssText = "position:absolute;pointer-events:none;visibility:hidden");
+    super(), this.#e = e, this.#k = t.doubleRate ?? !1, this.#ee = t.spatialCheck ?? !0, this.#N = t.debug ?? !1, this.#D = t.film ?? !1, this.#nt = t.onStats, this.#ot = t.onFailure, this.#P = i, this.#te = i ? "main" : t.rendering ?? "main", this.#ht = t.workerUrl ?? Ae, this.#g = this.#te === "main" ? "main" : "idle", this.#i = i ? i.canvas : document.createElement("canvas"), this.#t = i?.canvas ?? (this.#te === "main" ? this.#i : document.createElement("canvas")), this.#fe = e, i || (this.#i.style.cssText = "position:absolute;pointer-events:none;visibility:hidden");
     const s = this.#t.getContext("webgl2", {
       // Keep the underlying video in Chromium's compositor to receive frame notifications at the source rate.
       alpha: !0,
@@ -2071,7 +2076,7 @@ class vt extends EventTarget {
     });
     if (!(s instanceof WebGL2RenderingContext))
       throw new Error("this browser has no WebGL2");
-    this.#s = s, this.#D && (this.#It(), this.#o = new V(s)), this.#d = K(s, ke);
+    this.#s = s, this.#D && (this.#It(), this.#o = new V(s)), this.#d = K(s, Be);
     const r = this.#d;
     this.#r = Object.fromEntries(
       Object.entries(Ce).map(([o, h]) => [
@@ -2088,7 +2093,7 @@ class vt extends EventTarget {
     }), this.encodedVideo = !i && typeof VideoDecoder < "u" ? new Le(e) : null, this.#f = i ? null : new Ne(s, e), this.#h = new Ve(
       e,
       () => this.encodedVideo?.take(),
-      () => this.#x === "main" ? this.#f : null
+      () => this.#g === "main" ? this.#f : null
     ), e.addEventListener("emptied", this.#Jt), e.addEventListener("resize", this.#Kt), e.addEventListener("pause", this.#oe), e.addEventListener("ended", this.#oe), e.addEventListener("seeking", this.#ti), e.addEventListener("seeked", this.#oe), e.addEventListener("ratechange", this.#oe);
   }
   get running() {
@@ -2099,13 +2104,13 @@ class vt extends EventTarget {
     return this.#i;
   }
   /** Field order for the current scan state, defaulting to top-field-first. */
-  get #kt() {
+  get #Bt() {
     return this.#F?.topFieldFirst !== !1;
   }
   /** The same public filter options for either rendering target. */
-  #Bt() {
+  #kt() {
     return {
-      doubleRate: this.#B,
+      doubleRate: this.#k,
       spatialCheck: this.#ee,
       film: this.#D,
       debug: this.#N
@@ -2116,7 +2121,7 @@ class vt extends EventTarget {
     return this.#He;
   }
   set enabled(e) {
-    this.#He = e, this.#pt(), this.#g?.postMessage({
+    this.#He = e, this.#pt(), this.#x?.postMessage({
       type: "enabled",
       enabled: e
     });
@@ -2124,13 +2129,13 @@ class vt extends EventTarget {
   /** Update whether the source needs filtering and which field comes first. */
   set scan(e) {
     const t = this.#F?.interlaced !== e?.interlaced, i = t || this.#F?.topFieldFirst !== e?.topFieldFirst;
-    this.#F = e, !(i && (!this.#Fe() || this.#F !== e)) && (this.#g?.postMessage({ type: "scan", scan: e }), i && (this.#_ = 0, this.#S(), this.#J(), t && (this.#y = 0), this.#n = null, this.#ne(!1)), this.#pt(), i && ((e?.interlaced ?? !0) && (this.#P || this.#x === "main") ? this.#Xe() : this.#wt()));
+    this.#F = e, !(i && (!this.#Fe() || this.#F !== e)) && (this.#x?.postMessage({ type: "scan", scan: e }), i && (this.#_ = 0, this.#S(), this.#J(), t && (this.#y = 0), this.#n = null, this.#ne(!1)), this.#pt(), i && ((e?.interlaced ?? !0) && (this.#P || this.#g === "main") ? this.#Xe() : this.#wt()));
   }
   get scan() {
     return this.#F;
   }
   set videoTimeline(e) {
-    this.#ue = e, this.#g?.postMessage({
+    this.#ue = e, this.#x?.postMessage({
       type: "timeline",
       videoTimeline: e
     }), e.length === 0 && (this.#F = null), this.#pt();
@@ -2149,10 +2154,10 @@ class vt extends EventTarget {
   }
   /** Whether a picture goes up for every field rather than every frame. */
   get doubleRate() {
-    return this.#B;
+    return this.#k;
   }
   set doubleRate(e) {
-    e !== this.#B && (this.#B = e, this.#ye(), this.#S(), this.#Lt());
+    e !== this.#k && (this.#k = e, this.#ye(), this.#S(), this.#Lt());
   }
   get spatialCheck() {
     return this.#ee;
@@ -2164,9 +2169,9 @@ class vt extends EventTarget {
     return this.#D;
   }
   set film(e) {
-    const t = this.#g ? this.#dt : this.#le;
+    const t = this.#x ? this.#dt : this.#le;
     if (!(e === this.#D && (e === !1 || t === null))) {
-      if (this.#g) {
+      if (this.#x) {
         this.#D = e, this.#ye(e ? "film" : void 0);
         return;
       }
@@ -2183,7 +2188,7 @@ class vt extends EventTarget {
       }
       if (this.#D = e, this.#ye(), !e) {
         if (!this.#Fe()) return;
-        this.#$ = !1, this.#V = 0, this.#ae = !1, this.#L = x, this.#J(), this.#o?.destroy(), this.#o = null;
+        this.#$ = !1, this.#V = 0, this.#ae = !1, this.#L = g, this.#J(), this.#o?.destroy(), this.#o = null;
       }
       this.#Lt();
     }
@@ -2196,16 +2201,16 @@ class vt extends EventTarget {
   }
   /** Whether pictures are queued for presentation by the frame loop. */
   get #ni() {
-    return this.#B || this.#D;
+    return this.#k || this.#D;
   }
   #Lt() {
-    this.#K || (this.#ni ? (this.#X > 0 && this.#qt(), (this.#F?.interlaced ?? !0) && (this.#P || this.#x === "main") && this.#Xe()) : this.#D || (this.#n = null, this.#ne(!1), this.#We()));
+    this.#K || (this.#ni ? (this.#X > 0 && this.#qt(), (this.#F?.interlaced ?? !0) && (this.#P || this.#g === "main") && this.#Xe()) : this.#D || (this.#n = null, this.#ne(!1), this.#We()));
   }
   /** Apply mutable filter settings to the existing Worker and canvas. */
   #ye(e) {
-    this.#g?.postMessage({
+    this.#x?.postMessage({
       type: "settings",
-      options: this.#Bt(),
+      options: this.#kt(),
       retryFilm: e
     });
   }
@@ -2222,11 +2227,11 @@ class vt extends EventTarget {
   }
   /** Start the bundled Worker when the required transfer APIs are available. */
   #oi() {
-    return this.#P || this.#te === "main" ? !1 : this.#x === "starting" || this.#x === "active" ? !0 : typeof Worker < "u" && typeof VideoFrame < "u" && typeof OffscreenCanvas < "u" && this.#ht !== null && "transferControlToOffscreen" in HTMLCanvasElement.prototype ? (this.#Nt(), !0) : this.#te === "auto" ? (this.#Ke(), !1) : (this.#x = "failed", this.#M = !1, !0);
+    return this.#P || this.#te === "main" ? !1 : this.#g === "starting" || this.#g === "active" ? !0 : typeof Worker < "u" && typeof VideoFrame < "u" && typeof OffscreenCanvas < "u" && this.#ht !== null && "transferControlToOffscreen" in HTMLCanvasElement.prototype ? (this.#Nt(), !0) : this.#te === "auto" ? (this.#Ke(), !1) : (this.#g = "failed", this.#M = !1, !0);
   }
   /** Transfer the display canvas to a new Worker, replacing it if already transferred. */
   #Nt() {
-    this.#se(), this.#g?.terminate(), this.#g = null, this.#Pe = !1, this.#$e = !1, this.#dt = null, this.#mt = 0;
+    this.#se(), this.#x?.terminate(), this.#x = null, this.#Pe = !1, this.#$e = !1, this.#dt = null, this.#mt = 0;
     let e = this.#i;
     if (this.#at) {
       e = document.createElement("canvas"), e.className = this.#i.className;
@@ -2234,7 +2239,7 @@ class vt extends EventTarget {
       r === null ? e.removeAttribute("style") : e.setAttribute("style", r), e.style.visibility = "hidden", this.#i.parentElement && this.#i.replaceWith(e), this.#i = e;
     }
     const t = ++this.#At;
-    this.#x = "starting";
+    this.#g = "starting";
     let i, s;
     try {
       s = e.transferControlToOffscreen(), this.#at = !0, i = new Worker(this.#ht, { type: "module" });
@@ -2244,7 +2249,7 @@ class vt extends EventTarget {
       );
       return;
     }
-    this.#g = i, i.onmessage = (r) => {
+    this.#x = i, i.onmessage = (r) => {
       t === this.#At && this.#hi(r.data);
     }, i.onerror = (r) => {
       t === this.#At && (r.preventDefault(), this.#Ne(r.message || "the deinterlacer worker failed"));
@@ -2252,7 +2257,7 @@ class vt extends EventTarget {
       {
         type: "initialize",
         canvas: s,
-        options: this.#Bt(),
+        options: this.#kt(),
         scan: this.#F,
         videoTimeline: this.#ue,
         enabled: this.#M,
@@ -2265,7 +2270,7 @@ class vt extends EventTarget {
   #hi(e) {
     switch (e.type) {
       case "ready":
-        this.#x = "active", this.#M && (this.#Oe(), this.#st());
+        this.#g = "active", this.#M && (this.#Oe(), this.#st());
         break;
       case "failed":
         this.#Ne(e.message);
@@ -2332,7 +2337,7 @@ class vt extends EventTarget {
    * the engine stands down.
    */
   #qe(e) {
-    this.#le !== e && (this.#le = e, this.#$ = !1, this.#V = 0, this.#ae = !1, this.#L = x, this.#J(), this.#o?.destroy(), this.#o = null, this.#vt(e));
+    this.#le !== e && (this.#le = e, this.#$ = !1, this.#V = 0, this.#ae = !1, this.#L = g, this.#J(), this.#o?.destroy(), this.#o = null, this.#vt(e));
   }
   /**
    * Re-arm film reconstruction at a resource-reallocation point (start, scan
@@ -2340,11 +2345,11 @@ class vt extends EventTarget {
    * repeated failure degrades again and notifies as a new episode.
    */
   #Fe() {
-    return this.#K ? !1 : (this.#g || (this.#le = null), !0);
+    return this.#K ? !1 : (this.#x || (this.#le = null), !0);
   }
   /** Retry a transient Worker failure once, then show the media element if it fails again. */
   #Ne(e) {
-    if (this.#x === "starting" && this.#te === "auto" && !this.#Se) {
+    if (this.#g === "starting" && this.#te === "auto" && !this.#Se) {
       this.#Ke();
       return;
     }
@@ -2352,14 +2357,14 @@ class vt extends EventTarget {
       this.#Se = !0, this.#Nt();
       return;
     }
-    console.error(`Deinterlacer Worker stopped: ${e}`), this.#x = "failed", this.#g?.terminate(), this.#g = null, this.#se(), this.#vt(`deinterlacer worker stopped: ${e}`), this.stop();
+    console.error(`Deinterlacer Worker stopped: ${e}`), this.#g = "failed", this.#x?.terminate(), this.#x = null, this.#se(), this.#vt(`deinterlacer worker stopped: ${e}`), this.stop();
   }
   /** Restore the main-thread canvas when automatic Worker selection fails. */
   #Ke() {
     const e = this.#t;
     e.className = this.#i.className;
     const t = this.#i.getAttribute("style");
-    t === null ? e.removeAttribute("style") : e.setAttribute("style", t), e.style.visibility = "hidden", this.#i.parentElement && this.#i.replaceWith(e), this.#i = e, this.#at = !1, this.#g?.terminate(), this.#g = null, this.#x = "main", this.#se(), this.#M && (this.#Oe(), this.#st(), (this.#F?.interlaced ?? !0) && this.#Xe());
+    t === null ? e.removeAttribute("style") : e.setAttribute("style", t), e.style.visibility = "hidden", this.#i.parentElement && this.#i.replaceWith(e), this.#i = e, this.#at = !1, this.#x?.terminate(), this.#x = null, this.#g = "main", this.#se(), this.#M && (this.#Oe(), this.#st(), (this.#F?.interlaced ?? !0) && this.#Xe());
   }
   /** Close the queued frame still owned by the page when switching renderers. */
   #se() {
@@ -2374,10 +2379,10 @@ class vt extends EventTarget {
   start() {
     if (!(this.#M || this.#K || this.#Q) && (this.#Ae++, this.#M = !0, this.#ei(), !!this.#Fe())) {
       if (this.#yi(), this.#st(), this.#oi()) {
-        this.#g?.postMessage({
+        this.#x?.postMessage({
           type: "enabled",
           enabled: !0
-        }), this.#x === "active" && this.#Oe();
+        }), this.#g === "active" && this.#Oe();
         return;
       }
       this.#Oe(), (this.#F?.interlaced ?? !0) && this.#Xe();
@@ -2385,14 +2390,14 @@ class vt extends EventTarget {
   }
   /** Take the deinterlaced picture away, leaving the element's own showing. */
   stop() {
-    this.#Ae++, this.#M && (this.#M = !1, this.#h.cancel(), this.encodedVideo?.suspend(), this.#$t(), this.#wt(), this.#_ = 0, this.#n = null, this.#ne(!1), this.#se(), this.#g?.postMessage({
+    this.#Ae++, this.#M && (this.#M = !1, this.#h.cancel(), this.encodedVideo?.suspend(), this.#$t(), this.#wt(), this.#_ = 0, this.#n = null, this.#ne(!1), this.#se(), this.#x?.postMessage({
       type: "enabled",
       enabled: !1
     }));
   }
   destroy() {
     if (!this.#K) {
-      this.#K = !0, this.#He = !1, this.stop(), this.#g?.postMessage({ type: "destroy" }), this.#g?.terminate(), this.#g = null, this.#se(), this.#Ot("the deinterlacer was destroyed"), this.#m?.removeEventListener(
+      this.#K = !0, this.#He = !1, this.stop(), this.#x?.postMessage({ type: "destroy" }), this.#x?.terminate(), this.#x = null, this.#se(), this.#Ot("the deinterlacer was destroyed"), this.#m?.removeEventListener(
         "visibilitychange",
         this.#Rt
       ), this.#m = null, this.#z?.disconnect(), this.#t.removeEventListener(
@@ -2418,18 +2423,18 @@ class vt extends EventTarget {
    * permanent cost of `preserveDrawingBuffer` on ordinary playback.
    */
   capture() {
-    if (this.#x === "active" && this.#i.style.visibility === "visible" && this.#g) {
+    if (this.#g === "active" && this.#i.style.visibility === "visible" && this.#x) {
       const s = ++this.#ri, r = new Promise((o, h) => {
         this.#Ce.set(s, { resolve: o, reject: h });
       });
-      return this.#g.postMessage({
+      return this.#x.postMessage({
         type: "capture",
         id: s,
         width: this.#e.videoWidth,
         height: this.#e.videoHeight
       }), r;
     }
-    if (this.#x === "starting" || this.#x === "failed")
+    if (this.#g === "starting" || this.#g === "failed")
       return createImageBitmap(this.#e);
     const e = this.#n;
     if (this.#P && (!this.#M || this.#Q || !e))
@@ -2500,8 +2505,8 @@ class vt extends EventTarget {
   }
   /** Transfer the selected frame once the Worker has released the previous input. */
   #Gt(e) {
-    const t = this.#g;
-    if (!t || this.#x !== "active") {
+    const t = this.#x;
+    if (!t || this.#g !== "active") {
       e.frame.close();
       return;
     }
@@ -2535,19 +2540,19 @@ class vt extends EventTarget {
       ({ q: t, isField: i }) => {
         if (this.#s.getQueryParameter(t, this.#s.QUERY_RESULT_AVAILABLE)) {
           const s = this.#s.getQueryParameter(t, this.#s.QUERY_RESULT);
-          return i ? (this.#Ie += s, this.#xe++) : (this.#Le += s, this.#ge++), this.#Ye.push(t), !1;
+          return i ? (this.#Ie += s, this.#ge++) : (this.#Le += s, this.#xe++), this.#Ye.push(t), !1;
         }
         return !0;
       }
     ));
   }
   /**
-   * Start the detection again. `gap` is for frames that went unseen in a
-   * stream that carries on: the cadence has to be found again, but whether
-   * its frames hold one instant each has not changed.
+   * Restart the detection. `gap` is for frames that went unseen in a stream
+   * that carries on: the cadence must be found again, but the one-instant
+   * verdict is kept because it has not changed.
    */
   #J(e = !1) {
-    this.#L = x, this.#Ue = x, this.#Te = 0, e || (this.#lt = !1), this.#$ = !1, this.#o?.reset(e);
+    this.#L = g, this.#Ue = g, this.#Te = 0, e || (this.#lt = !1), this.#$ = !1, this.#o?.reset(e);
   }
   /** Detect the pulldown phase of the frame being filtered on the GPU. */
   #li() {
@@ -2557,9 +2562,9 @@ class vt extends EventTarget {
     this.#o?.measureComb(s, r, h), this.#o?.detect(r, o, h);
   }
   /**
-   * Count the combing of the frame after the one being filtered, which says
-   * whether its first field belongs between this frame's second-field lines.
-   * Returns whether the count was made.
+   * Count the combing for the frame after the one being filtered. The count
+   * says whether that frame's first field fits between this frame's
+   * second-field lines. Returns whether the count was made.
    */
   #ci() {
     const { cur: e, next: t } = this.#Mt(!1), i = this.#c[e], s = this.#c[t], r = this.#o;
@@ -2583,7 +2588,7 @@ class vt extends EventTarget {
     const e = this.#o?.poll() ?? null;
     e !== null && (this.#Ue = e, this.#Te = e.age, this.#lt = e.instant), this.#Te++;
     const { phase: t, run: i } = this.#Ue;
-    t === 0 || this.#Te > Math.ceil(O * Math.max(1, this.#e.playbackRate)) ? this.#L = x : this.#L = {
+    t === 0 || this.#Te > Math.ceil(O * Math.max(1, this.#e.playbackRate)) ? this.#L = g : this.#L = {
       phase: (t - 1 + this.#Te) % O + 1,
       run: i
     };
@@ -2649,11 +2654,11 @@ ${s} dropped:${this.#ft}`;
    * `now` is the ingestion time on this realm's clock.
    */
   #pi(e, t, i) {
-    if (this.#x === "active") {
+    if (this.#g === "active") {
       this.#Ai(e, t, i);
       return;
     }
-    this.#x !== "starting" && this.#et(e, t);
+    this.#g !== "starting" && this.#et(e, t);
   }
   /**
    * @internal Feed Worker input through the same history and rendering decisions
@@ -2675,7 +2680,7 @@ ${s} dropped:${this.#ft}`;
     if (this.#re(i) && (this.#vi(t.mediaTime), !!this.#re(i) && t.width > 0 && t.height > 0)) {
       let s = !1;
       if (!this.#Me && this.#e.seeking) {
-        const l = this.#e.buffered, d = this.#y >= Z ? this.#y / 1e3 : k / 1e3;
+        const l = this.#e.buffered, d = this.#y >= Z ? this.#y / 1e3 : B / 1e3;
         for (let v = 0; v < l.length; v++)
           if (t.mediaTime >= l.start(v) && t.mediaTime < l.end(v) && Math.abs(t.mediaTime - this.#e.currentTime) <= d) {
             s = !0;
@@ -2718,7 +2723,7 @@ ${s} dropped:${this.#ft}`;
       }
       if (this.#Ze = !1, this.#ae = !1, this.#ct = !1, this.#D && !this.#le) {
         let l = !1;
-        if (this.#_ === g && a === 0)
+        if (this.#_ === x && a === 0)
           try {
             this.#ui(), this.#li(), l = !0;
           } catch (d) {
@@ -2728,7 +2733,7 @@ ${s} dropped:${this.#ft}`;
           }
         else
           this.#J(!0);
-        this.#je[this.#L.phase] = (this.#je[this.#L.phase] ?? 0) + 1, this.#$ = this.#L.phase !== 0 && this.#L.run >= H, this.#$ ? this.#V = st : this.#V > 0 && this.#V--, this.#Ze = l && !this.#Pt, this.#ae = this.#Ze && this.#V > 0, this.#ct = this.#ae && !this.#$ && this.#B && this.#Ge() && this.#ci(), this.#ae && !this.#$ && this.#C.matched++, this.#N && (this.#Ct = this.#fi(t.presentedFrames));
+        this.#je[this.#L.phase] = (this.#je[this.#L.phase] ?? 0) + 1, this.#$ = this.#L.phase !== 0 && this.#L.run >= H, this.#$ ? this.#V = st : this.#V > 0 && this.#V--, this.#Ze = l && !this.#Pt, this.#ae = this.#Ze && this.#V > 0, this.#ct = this.#ae && !this.#$ && this.#k && this.#Ge() && this.#ci(), this.#ae && !this.#$ && this.#C.matched++, this.#N && (this.#Ct = this.#fi(t.presentedFrames));
       }
       if (this.#Pt = a > 0, !this.#re(i)) {
         this.#K || this.#Je(f);
@@ -2745,21 +2750,21 @@ ${s} dropped:${this.#ft}`;
             this.#tt(
               "film",
               !1,
-              this.#gt("film", U, d),
+              this.#xt("film", U, d),
               d
             );
           }
         } else
           this.#ce(!1, !1, null);
-      else if (this.#B && this.#Ge()) {
-        const l = this.#y / 2, v = this.#Tt(2, e, l) || this.#Y === null ? u + l * 2 : u, E = this.#gt("field", v, l);
+      else if (this.#k && this.#Ge()) {
+        const l = this.#y / 2, v = this.#Tt(2, e, l) || this.#Y === null ? u + l * 2 : u, E = this.#xt("field", v, l);
         this.#tt("field", !1, E, l), this.#tt("field", !0, E + l, l);
       } else if (this.#Ge()) {
         const l = this.#y, v = this.#Tt(1, e, l) || this.#Y === null ? u + l : u;
         this.#tt(
           "frame",
           !1,
-          this.#gt("frame", v, l),
+          this.#xt("frame", v, l),
           l
         ) || (this.#C.late++, this.#ce(!1, !1, null));
       } else
@@ -2788,7 +2793,7 @@ ${s} dropped:${this.#ft}`;
     if (!s || this.#F?.interlaced === s.interlaced && this.#F.topFieldFirst === s.topFieldFirst)
       return;
     const r = this.#F?.interlaced;
-    this.#F = s, this.#_ = 0, this.#S(), this.#Fe() && (r !== s.interlaced && (this.#y = 0), s.interlaced && (this.#P || this.#x === "main") ? this.#Xe() : this.#wt(), this.#J());
+    this.#F = s, this.#_ = 0, this.#S(), this.#Fe() && (r !== s.interlaced && (this.#y = 0), s.interlaced && (this.#P || this.#g === "main") ? this.#Xe() : this.#wt(), this.#J());
   }
   /**
    * Whether pictures are being filtered ahead of time and queued, rather than
@@ -2799,7 +2804,7 @@ ${s} dropped:${this.#ft}`;
    * frames go by, since until then there is no idea how long a frame lasts.
    */
   #Ge() {
-    return (this.#B || this.#D) && this.#y > 0 && this.#u.length === T;
+    return (this.#k || this.#D) && this.#y > 0 && this.#u.length === T;
   }
   /**
    * How long a frame lasts in wall time, kept as a smoothed estimate.
@@ -2814,7 +2819,7 @@ ${s} dropped:${this.#ft}`;
    */
   #zt(e, t) {
     const s = e * 1e3 / (this.#e.playbackRate || 1) / t;
-    s < Z || s > k || (this.#y = this.#y > 0 && s > this.#y * qe ? this.#y + (s - this.#y) * Ye : s);
+    s < Z || s > B || (this.#y = this.#y > 0 && s > this.#y * qe ? this.#y + (s - this.#y) * Ye : s);
   }
   /**
    * Filter one field into an output texture and put it in the queue.
@@ -2847,34 +2852,34 @@ ${s} dropped:${this.#ft}`;
    * nudged towards the clock by a fraction of the gap so that the schedule
    * follows it without a picture ever moving across a refresh. (otya)
    *
-   * `ideal` is when this frame would go up were it the only one, and frames
-   * do not arrive evenly: where the frame period and the refresh nearly
-   * divide, a frame comes a refresh early or late now and then, and for
-   * seconds at a time while the two drift past each other. An early frame
-   * is no trouble, its pictures wait. A late one has missed its moment, and
-   * the chain can only start again from where the frame is -- a refresh
-   * with nothing new to show, which nothing can avoid. What can be avoided
-   * is paying for it twice: the frames after it arrive on time, which is
-   * now a refresh early, and pulling the chain back to them skips a picture
-   * to undo a delay nobody sees. So the chain keeps the lateness it was
-   * pushed to (`#scheduleLag`), treats the frames that arrive at that phase
-   * as on time, and takes the next late frame in its stride.
+   * `ideal` is when this frame would go up if it were the only one. Frames
+   * do not arrive evenly. Where the frame period and the refresh nearly
+   * divide, a frame arrives a refresh early or late now and then, and for
+   * seconds at a time while the two drift past each other. An early frame is
+   * harmless because its pictures wait. A late frame has missed its moment,
+   * so the chain restarts from where the frame is. That costs a refresh with
+   * nothing new to show, which cannot be avoided. The cost should be paid
+   * only once. The frames after it arrive on time, which now counts as a
+   * refresh early, and pulling the chain back to them would skip a picture to
+   * undo a delay nobody sees. So the chain keeps the lateness it was pushed
+   * to (`#scheduleLag`), treats frames that arrive at that phase as on time,
+   * and puts frames that are late by no more than the lag covers on the chain.
    *
-   * Frames arrive on refreshes, so whichever phase one arrives at, what is
-   * left of its distance from the chain after whole refreshes is the
-   * chain's own drift against the refresh grid, and every frame nudges that
-   * out. The lag is kept in whole refreshes for the same reason: a chain
-   * held half a refresh off the grid has each pair of fields come due
-   * together, and one of every pair is dropped for as long as it stays.
+   * Frames arrive on refreshes. At whatever phase a frame arrives, the
+   * remainder of its distance from the chain after removing whole refreshes
+   * is the chain's own drift against the refresh grid, and each frame
+   * corrects part of it. The lag is kept in whole refreshes for the same
+   * reason. A chain held half a refresh off the grid makes each pair of
+   * fields come due together, and one of each pair is dropped.
    *
-   * The lag follows what frames actually do. When none has arrived at the
-   * phase it stands for in SCHEDULE_WINDOW pictures, it moves to the nearest
-   * phase they did arrive at; if that was earlier than the chain allows for,
-   * the chain moves up to it, which skips a picture once. Anything further
-   * out than a refresh either way is not jitter, and the chain restarts from
+   * The lag follows what frames actually do. If no frame arrives at the
+   * lag's phase within SCHEDULE_WINDOW pictures, the lag moves to the nearest
+   * phase they did arrive at. If that phase is earlier than the chain allows
+   * for, the chain moves up to it, which skips one picture. A frame more than
+   * a refresh off on either side is not jitter, and the chain restarts from
    * the clock.
    */
-  #gt(e, t, i) {
+  #xt(e, t, i) {
     if (!(i > 0)) return t;
     const s = this.#Y, r = this.#w;
     if (s !== null && s.cadence === e) {
@@ -2885,18 +2890,18 @@ ${s} dropped:${this.#ft}`;
           Math.min(j, -A * Ke)
         );
         if (c === 0)
-          return this.#k = 0, f;
-        if (this.#k === 0 || c > 0 != this.#he > 0 ? (this.#k = 0, this.#he = c) : Math.abs(c) < Math.abs(this.#he) && (this.#he = c), ++this.#k < Je) return f;
+          return this.#B = 0, f;
+        if (this.#B === 0 || c > 0 != this.#he > 0 ? (this.#B = 0, this.#he = c) : Math.abs(c) < Math.abs(this.#he) && (this.#he = c), ++this.#B < Je) return f;
         const m = this.#he;
-        return this.#k = 0, m < 0 ? (this.#Z += m, f) : (this.#C.resynced++, this.#xt(f - m * r));
+        return this.#B = 0, m < 0 ? (this.#Z += m, f) : (this.#C.resynced++, this.#gt(f - m * r));
       }
       if (a < 0 && this.#Z - a <= 1)
-        return this.#Z -= a, this.#k = 0, this.#C.resynced++, this.#xt(t);
+        return this.#Z -= a, this.#B = 0, this.#C.resynced++, this.#gt(t);
     }
-    return this.#Z = 0, this.#k = 0, s !== null && this.#C.resynced++, this.#xt(t);
+    return this.#Z = 0, this.#B = 0, s !== null && this.#C.resynced++, this.#gt(t);
   }
   /** Start the chain again at `at`, which is where the caller's picture goes. */
-  #xt(e) {
+  #gt(e) {
     for (let t = this.#l.at(-1); t && t.at >= e; )
       this.#l.pop(), this.#C.late++, t = this.#l.at(-1);
     return e;
@@ -2945,7 +2950,7 @@ ${s} dropped:${this.#ft}`;
     if (this.#b = null, !this.#M || this.#Q) return;
     this.#Ei(e);
     const t = this.#Ae;
-    this.#h.flush(e), this.#re(t) && (this.#x === "main" && this.#gi(this.#I, e), this.#b = this.#Re(this.#yt));
+    this.#h.flush(e), this.#re(t) && (this.#g === "main" && this.#xi(this.#I, e), this.#b = this.#Re(this.#yt));
   };
   /**
    * Fit a grid of refreshes (period and phase) to the animation frames. rAF
@@ -2957,8 +2962,8 @@ ${s} dropped:${this.#ft}`;
     const t = e - this.#R;
     this.#R = e;
     const i = Math.max(1, Math.round(t / this.#w)), s = this.#I + i * this.#w, r = e - s;
-    if (this.#I === 0 || t <= 0 || t > k || Math.abs(r) > this.#w / 4) {
-      t >= 1 && t <= k && (this.#w = t), this.#I = e;
+    if (this.#I === 0 || t <= 0 || t > B || Math.abs(r) > this.#w / 4) {
+      t >= 1 && t <= B && (this.#w = t), this.#I = e;
       return;
     }
     this.#w += r / i * et, this.#I = s + r * tt;
@@ -3059,7 +3064,7 @@ ${s} dropped:${this.#ft}`;
    * so that the slip a cadence the refresh does not divide into must make
    * every so often happens once rather than flapping.
    */
-  #gi(e, t) {
+  #xi(e, t) {
     const i = this.#w / 2, s = (a) => {
       const c = a.at - e;
       return c <= i - q ? !0 : c > i + q ? !1 : this.#De > 0;
@@ -3070,10 +3075,10 @@ ${s} dropped:${this.#ft}`;
     if (!r || !s(r)) return;
     this.#l.shift(), this.#De = r.at - e;
     const o = performance.now(), h = this.#Xt(!0);
-    this.#Vt(r.slot), this.#Je(h), this.#Be += performance.now() - o, this.#pe++, this.#N && this.#xi(r, t), this.#W = t;
+    this.#Vt(r.slot), this.#Je(h), this.#ke += performance.now() - o, this.#pe++, this.#N && this.#gi(r, t), this.#W = t;
   }
   /** Preserve upstream's opt-in presentation timing log in either renderer. */
-  #xi(e, t) {
+  #gi(e, t) {
     const i = this.#W === 0 ? 0 : t - this.#W, s = i / this.#w, r = e.cadence === "film" ? `phase ${e.phase}` : e.cadence === "field" ? `field ${e.phase}` : "frame", o = e.phase === 0 ? "duplicate" : `phase ${X}`, h = e.droppedBefore > 0 ? `, ${o} dropped before it` + (e.droppedBefore > 1 ? ` (${e.droppedBefore})` : "") : "";
     console.log(
       `yadif: +${i.toFixed(2)} ms (${s.toFixed(2)} refreshes) ${e.cadence} ${r}, due ${(e.at - t).toFixed(2)} ms${h}`
@@ -3107,8 +3112,8 @@ ${s} dropped:${this.#ft}`;
    *
    * There is no event for a frame the callback was not run for; the only sign
    * of one is that the count of frames went up by more than one. That count
-   * is the compositor's where it gives one, and otherwise the one VideoFrames
-   * keeps. Frames thrown away either side of a discontinuity are not
+   * comes from the compositor where it provides one, and otherwise from
+   * VideoFrames. Frames thrown away either side of a discontinuity are not
    * counted: the held frames were being dropped anyway, and a seek presents
    * what it passes over.
    *
@@ -3116,7 +3121,7 @@ ${s} dropped:${this.#ft}`;
    */
   #wi(e, t) {
     let i = 0;
-    return this.#ke !== 0 && !t && (i = Math.max(0, e - this.#ke - 1), this.#C.missed += i), this.#ke = e, i;
+    return this.#Be !== 0 && !t && (i = Math.max(0, e - this.#Be - 1), this.#C.missed += i), this.#Be = e, i;
   }
   /**
    * Frames stopped arriving for a while -- a pause, a stall, a tab in the
@@ -3124,14 +3129,14 @@ ${s} dropped:${this.#ft}`;
    * filter says nothing about it. Begin the interval at this frame.
    */
   #Qt(e) {
-    e - this.#Ve <= Y || (this.#Qe = e, this.#ie = 0, this.#me = 0, this.#pe = 0, this.#Be = 0, this.#ve = 0, this.#H = 0, this.#Le = 0, this.#ge = 0, this.#Ie = 0, this.#xe = 0);
+    e - this.#Ve <= Y || (this.#Qe = e, this.#ie = 0, this.#me = 0, this.#pe = 0, this.#ke = 0, this.#ve = 0, this.#H = 0, this.#Le = 0, this.#xe = 0, this.#Ie = 0, this.#ge = 0);
   }
   #Yt(e) {
     const t = e - this.#Qe;
     if (t < Y) return;
-    const i = this.#Ge() && (this.#B || this.#$) ? this.#pe : this.#ie, s = this.#ie ? (this.#me + this.#Be) / this.#ie : 0;
+    const i = this.#Ge() && (this.#k || this.#$) ? this.#pe : this.#ie, s = this.#ie ? (this.#me + this.#ke) / this.#ie : 0;
     let r;
-    this.#Ee != null && (r = 0, this.#ge !== 0 && (r += this.#Le / 1e6 / this.#ge), this.#xe !== 0 && (r += this.#Ie / 1e6 / this.#xe / 2));
+    this.#Ee != null && (r = 0, this.#xe !== 0 && (r += this.#Le / 1e6 / this.#xe), this.#ge !== 0 && (r += this.#Ie / 1e6 / this.#ge / 2));
     const o = {
       ...this.#C,
       // The element's own count of what its decoder could not keep up with,
@@ -3146,12 +3151,12 @@ ${s} dropped:${this.#ft}`;
       oneInstant: this.#lt,
       filmError: this.#le
     };
-    this.dispatchEvent(new CustomEvent("stats", { detail: o })), this.#nt?.(o), this.#Qe = e, this.#ie = 0, this.#me = 0, this.#pe = 0, this.#Be = 0, this.#ve = 0, this.#H = 0, this.#Le = 0, this.#ge = 0, this.#Ie = 0, this.#xe = 0;
+    this.dispatchEvent(new CustomEvent("stats", { detail: o })), this.#nt?.(o), this.#Qe = e, this.#ie = 0, this.#me = 0, this.#pe = 0, this.#ke = 0, this.#ve = 0, this.#H = 0, this.#Le = 0, this.#xe = 0, this.#Ie = 0, this.#ge = 0;
   }
   /** Take the newest frame into the ring. */
   #Zt() {
     const e = this.#s;
-    this.#O = (this.#O + 1) % g;
+    this.#O = (this.#O + 1) % x;
     const t = this.#A, i = this.#c[this.#O];
     t !== null && this.#f !== null && i !== void 0 ? (this.#c[this.#O] = this.#f.adopt(t, i), this.#A = null) : (e.bindTexture(e.TEXTURE_2D, i ?? null), e.texImage2D(
       e.TEXTURE_2D,
@@ -3160,7 +3165,7 @@ ${s} dropped:${this.#ft}`;
       e.RGBA,
       e.UNSIGNED_BYTE,
       this.#fe
-    )), this.#_ = Math.min(this.#_ + 1, g);
+    )), this.#_ = Math.min(this.#_ + 1, x);
   }
   /**
    * Filter one frame, onto the canvas or into an output texture.
@@ -3179,7 +3184,7 @@ ${s} dropped:${this.#ft}`;
    */
   #ce(e, t, i, s = !0) {
     if (this.#_ === 0 || this.#Q) return;
-    s && (this.#_ === g && !e ? this.#C.filtered++ : this.#C.degraded++);
+    s && (this.#_ === x && !e ? this.#C.filtered++ : this.#C.degraded++);
     const r = this.#s, { prev: o, cur: h, next: a } = this.#Mt(e);
     r.bindFramebuffer(r.FRAMEBUFFER, i), r.useProgram(this.#d);
     for (const [d, v] of [o, h, a].entries())
@@ -3189,14 +3194,14 @@ ${s} dropped:${this.#ft}`;
     c !== null && A !== null && (r.activeTexture(r.TEXTURE0 + 3), r.bindTexture(r.TEXTURE_2D, c), r.uniform1i(this.#r.fieldMetrics, 3), r.activeTexture(r.TEXTURE0 + 4), r.bindTexture(r.TEXTURE_2D, A), r.uniform1i(this.#r.comb, 4));
     const m = this.#ct ? this.#o?.combAheadTexture ?? null : null, u = f && !e;
     r.activeTexture(r.TEXTURE0 + 5), r.bindTexture(r.TEXTURE_2D, m), r.uniform1i(this.#r.combAhead, 5), r.activeTexture(r.TEXTURE0), r.uniform2i(this.#r.size, this.#X, this.#q);
-    const l = this.#kt ? 0 : 1;
-    r.uniform1i(this.#r.parity, t ? 1 - l : l), r.uniform1i(this.#r.tff, this.#kt ? 1 : 0), r.uniform1i(this.#r.second, t ? 1 : 0), r.uniform1i(this.#r.spatialCheck, this.#ee ? 1 : 0), r.uniform1i(this.#r.debug, this.#N ? 1 : 0), r.uniform1i(this.#r.film, f ? 1 : 0), r.uniform1i(
+    const l = this.#Bt ? 0 : 1;
+    r.uniform1i(this.#r.parity, t ? 1 - l : l), r.uniform1i(this.#r.tff, this.#Bt ? 1 : 0), r.uniform1i(this.#r.second, t ? 1 : 0), r.uniform1i(this.#r.spatialCheck, this.#ee ? 1 : 0), r.uniform1i(this.#r.debug, this.#N ? 1 : 0), r.uniform1i(this.#r.film, f ? 1 : 0), r.uniform1i(
       this.#r.match,
       u && this.#ae && (!t || m !== null) ? 1 : 0
     ), r.uniform1i(this.#r.instant, u && this.#Ze ? 1 : 0), r.uniform1i(this.#r.phase, this.#L.phase), r.viewport(0, 0, this.#X, this.#q), r.drawArrays(r.TRIANGLES, 0, 3), this.#N && f && this.#ai(this.#Ct, 0, 90), i === null && (this.#n = { kind: "yadif", flush: e, second: t }, this.#ne(!0), s && this.#H++);
   }
   #Mt(e) {
-    const t = (i) => (this.#O + g - i) % g;
+    const t = (i) => (this.#O + x - i) % x;
     return this.#_ === 1 ? { prev: this.#O, cur: this.#O, next: this.#O } : e ? { prev: t(1), cur: this.#O, next: this.#O } : this.#_ === 2 ? { prev: t(1), cur: t(1), next: this.#O } : { prev: t(2), cur: t(1), next: this.#O };
   }
   /**
@@ -3225,7 +3230,7 @@ ${s} dropped:${this.#ft}`;
     this.#t.width = e, this.#t.height = t, this.#X = e, this.#q = t, this.#_ = 0, this.#V = 0, this.#n = null, this.#S(), this.#ze();
     for (const s of this.#c) i.deleteTexture(s);
     this.#c = [];
-    for (let s = 0; s < g; s++) {
+    for (let s = 0; s < x; s++) {
       const r = i.createTexture();
       i.bindTexture(i.TEXTURE_2D, r), i.texParameteri(i.TEXTURE_2D, i.TEXTURE_MIN_FILTER, i.NEAREST), i.texParameteri(i.TEXTURE_2D, i.TEXTURE_MAG_FILTER, i.NEAREST), i.texParameteri(i.TEXTURE_2D, i.TEXTURE_WRAP_S, i.CLAMP_TO_EDGE), i.texParameteri(i.TEXTURE_2D, i.TEXTURE_WRAP_T, i.CLAMP_TO_EDGE), i.texImage2D(
         i.TEXTURE_2D,
@@ -3239,7 +3244,7 @@ ${s} dropped:${this.#ft}`;
         null
       ), this.#c.push(r);
     }
-    this.#We(), (this.#B || this.#D) && this.#qt(), this.#o?.resize(e, t), this.#Fe();
+    this.#We(), (this.#k || this.#D) && this.#qt(), this.#o?.resize(e, t), this.#Fe();
   }
   /**
    * Somewhere to keep a filtered field until its moment comes.
@@ -3313,7 +3318,7 @@ ${s} dropped:${this.#ft}`;
   #Kt = () => this.#ze();
   /** Forward a media event with the page's playback state that gives it meaning. */
   #St(e) {
-    return !this.#g || this.#x === "main" ? !1 : (this.#g.postMessage({
+    return !this.#x || this.#g === "main" ? !1 : (this.#x.postMessage({
       type: "event",
       name: e,
       video: this.#Et()
@@ -3336,7 +3341,7 @@ ${s} dropped:${this.#ft}`;
       late: 0,
       queueResetted: 0,
       matched: 0
-    }, this.#je.fill(0), this.#ft = 0, this.#ke = 0, this.#Qe = 0, this.#Ve = 0, this.#ie = 0, this.#me = 0, this.#pe = 0, this.#Be = 0, this.#ve = 0, this.#H = 0, this.#S(), this.#Le = 0, this.#ge = 0, this.#Ie = 0, this.#xe = 0;
+    }, this.#je.fill(0), this.#ft = 0, this.#Be = 0, this.#Qe = 0, this.#Ve = 0, this.#ie = 0, this.#me = 0, this.#pe = 0, this.#ke = 0, this.#ve = 0, this.#H = 0, this.#S(), this.#Le = 0, this.#xe = 0, this.#Ie = 0, this.#ge = 0;
   }
   /**
    * A new seek invalidates any destination frame remembered for the last one.
@@ -3369,7 +3374,7 @@ ${s} dropped:${this.#ft}`;
       const i = this.#Wt(), s = i === null ? void 0 : this.#u[i];
       i !== null && s ? (this.#a = i, this.#ce(!0, !1, s.framebuffer), this.#Vt(i)) : this.#ce(!0, !1, null);
     }
-    t && (this.#_ = 0, this.#ke = 0, this.#J());
+    t && (this.#_ = 0, this.#Be = 0, this.#J());
   };
   /**
    * A lost context takes the textures and the program with it. Rebuilding
@@ -3381,7 +3386,7 @@ ${s} dropped:${this.#ft}`;
       this.#P.onFailure("the deinterlacer WebGL context was lost");
       return;
     }
-    this.#x !== "active" && (this.#Q = !0, this.#vt("the deinterlacer WebGL context was lost"), this.stop());
+    this.#g !== "active" && (this.#Q = !0, this.#vt("the deinterlacer WebGL context was lost"), this.stop());
   };
 }
 function K(n, e) {
@@ -3524,7 +3529,7 @@ function I(n, e) {
 Qe(le);
 export {
   vt as Deinterlacer,
-  ke as YADIF_FRAGMENT_SHADER,
+  Be as YADIF_FRAGMENT_SHADER,
   Ce as YADIF_UNIFORMS,
   Et as decoderDeinterlaces,
   bt as forgetDecoderProbe,
