@@ -34,6 +34,7 @@ import {
 import { YADIF_FRAGMENT_SHADER, YADIF_UNIFORMS } from "./shader.js";
 import { FilmDetector, NO_PHASE, type Phase } from "./film-detect.js";
 import { EncodedVideoFrames } from "./encoded-video.js";
+import { PictureWatch } from "./picture-watch.js";
 import {
   FIELD_METRICS,
   FILM_DUPLICATE_PHASE,
@@ -183,8 +184,8 @@ interface FrameObservation {
    * The display time reported by requestVideoFrameCallback(), which anchors
    * the presentation schedule (otya). Acquisition and rendering may use
    * different performance clocks, so carry `timeOrigin` with it and convert
-   * to the renderer's clock before scheduling. On the Firefox counter path,
-   * VideoFrames supplies the time of the poll instead.
+   * to the renderer's clock before scheduling. On Firefox, VideoFrames
+   * supplies the time of the poll that handed the frame over instead.
    */
   expectedDisplayTime: number;
   /** The performance.timeOrigin against which `expectedDisplayTime` was measured. */
@@ -192,9 +193,9 @@ interface FrameObservation {
   width: number;
   height: number;
   /**
-   * Firefox counter timing when the frame came through VideoFrames.
-   * mediaTime there is the coarse media clock (unsuited as frame identity
-   * or field clock); use presentedFrames and this instead.
+   * Firefox timing when the frame came through VideoFrames. mediaTime there
+   * is the coarse media clock (unsuited as frame identity or field clock);
+   * use presentedFrames and this instead.
    */
   mozTiming?: { periodMs: number; discontinuity: boolean };
 }
@@ -219,11 +220,16 @@ export interface DeinterlaceStats {
   filtered: number;
   /**
    * Frames the element presented that the filter never saw, counted from the
-   * gaps in `presentedFrames` (`mozPaintedFrames` on Firefox). The neighbours
-   * of the frames either side of a gap are further apart in time than the
-   * filter believes, so its idea of what moved is wrong. A page that sees
-   * this climbing is asking the filter
+   * gaps in `presentedFrames`. The neighbours of the frames either side of a
+   * gap are further apart in time than the filter believes, so its idea of
+   * what moved is wrong. A page that sees this climbing is asking the filter
    * to keep up with more than it can.
+   *
+   * Firefox reports no such count. With main-thread rendering the gaps are
+   * taken from the time between new pictures, which also counts a frame whose
+   * pixels match the one before it: the two cannot be told apart, and a still
+   * scene raises this without anything being wrong. With Worker rendering
+   * they are the gaps in `mozPaintedFrames`.
    */
   missed: number;
   /**
@@ -260,7 +266,9 @@ export interface DeinterlaceStats {
   /**
    * Average rendering-thread time per input frame spent uploading, filtering
    * and presenting during the last report. Excludes GPU execution time and,
-   * when rendering in a Worker, time spent on the main thread.
+   * when rendering in a Worker, time spent on the main thread. On Firefox
+   * with main-thread rendering it also excludes the upload, which is made
+   * once a refresh while looking for new pictures rather than once a frame.
    */
   frameMs: number;
   /**
@@ -454,6 +462,10 @@ export class Deinterlacer extends EventTarget {
 
   readonly #video: HTMLVideoElement;
   readonly #videoFrames: VideoFrames;
+  /** Finds Firefox's new pictures for the main-thread renderer. */
+  readonly #pictures: PictureWatch | null;
+  /** The take holding the picture of the frame being ingested, if any. */
+  #stagedPicture: number | null = null;
   readonly #gl: WebGL2RenderingContext;
   /** The pulldown detection, built only while the `film` option needs it. */
   #detector: FilmDetector | null = null;
@@ -695,7 +707,14 @@ export class Deinterlacer extends EventTarget {
       !externalHost && typeof VideoDecoder !== "undefined"
         ? new EncodedVideoFrames(video)
         : null;
-    this.#videoFrames = new VideoFrames(video, () => this.encodedVideo?.take());
+    // The watch shares this context, so it can serve only while the pictures
+    // are drawn here. A Worker renderer is sent frames instead of textures.
+    this.#pictures = externalHost ? null : new PictureWatch(gl, video);
+    this.#videoFrames = new VideoFrames(
+      video,
+      () => this.encodedVideo?.take(),
+      () => (this.#workerState === "main" ? this.#pictures : null),
+    );
     // A frame the filter has not seen the neighbours of is not worth holding:
     // whatever is next will have been somewhere else entirely.
     video.addEventListener("emptied", this.#onEmptied);
@@ -1288,6 +1307,7 @@ export class Deinterlacer extends EventTarget {
       this.#onContextLost,
     );
     this.#videoFrames.destroy();
+    this.#pictures?.destroy();
     this.encodedVideo?.destroy();
     this.#video.removeEventListener("emptied", this.#onEmptied);
     this.#video.removeEventListener("resize", this.#onResize);
@@ -1691,12 +1711,15 @@ export class Deinterlacer extends EventTarget {
     // origin so that a Worker renderer can convert it in turn.
     const at = this.#localTime(now, metadata.timeOrigin);
     // Pass frames only to their explicit transfer destination, excluding them from Worker metadata.
-    const { frame, ...observation } = metadata;
+    // A take likewise means nothing outside this context.
+    const { frame, picture, ...observation } = metadata;
     this.#frameSource = frame ?? this.#video;
+    this.#stagedPicture = picture ?? null;
     try {
       this.#ingestFrame(at, observation, frame);
     } finally {
       this.#frameSource = this.#video;
+      this.#stagedPicture = null;
     }
     this.#request();
   };
@@ -1796,10 +1819,10 @@ export class Deinterlacer extends EventTarget {
       // the neighbours are then further apart than they should be, which is
       // worth less than filtering nothing at all.
       const elapsed = metadata.mediaTime - this.#lastMediaTime;
-      // Firefox counters carry their own discontinuity signal and wall-clock
-      // cadence. The coarse media clock still guards the path: a forward
-      // media-time jump that keeps painting smoothly (MSE splice, live gap)
-      // is exactly the discontinuity VideoFrames cannot see.
+      // On Firefox, VideoFrames supplies its own discontinuity signal and
+      // wall-clock cadence. The coarse media clock still guards the path: a
+      // forward media-time jump that keeps painting smoothly (MSE splice,
+      // live gap) is exactly the discontinuity VideoFrames cannot see.
       const mozTiming = metadata.mozTiming;
       const stale =
         seekFrame ||
@@ -1826,8 +1849,8 @@ export class Deinterlacer extends EventTarget {
       // already holds the answer, and taking it into the ring would leave the
       // filter holding one moment twice over and calling it motion.
       // On the Firefox path mediaTime is the coarse media clock and repeats
-      // across distinct painted pictures, so only a repeated painted count
-      // means the same picture presented again.
+      // across distinct pictures, so only a repeated frame count means the
+      // same picture presented again.
       if (
         this.#frames > 0 &&
         metadata.mediaTime === this.#lastMediaTime &&
@@ -2529,8 +2552,9 @@ export class Deinterlacer extends EventTarget {
    * Account for the frames between this one and the last one seen.
    *
    * There is no event for a frame the callback was not run for; the only sign
-   * of one is that the count of frames the compositor has taken went up by
-   * more than one. Frames thrown away either side of a discontinuity are not
+   * of one is that the count of frames went up by more than one. That count
+   * is the compositor's where it gives one, and otherwise the one VideoFrames
+   * keeps. Frames thrown away either side of a discontinuity are not
    * counted: the held frames were being dropped anyway, and a seek presents
    * what it passes over.
    *
@@ -2634,16 +2658,26 @@ export class Deinterlacer extends EventTarget {
   #push(): void {
     const gl = this.#gl;
     this.#head = (this.#head + 1) % HISTORY;
-    gl.bindTexture(gl.TEXTURE_2D, this.#textures[this.#head] ?? null);
-    // texSubImage2D is very slow in WebKit (~7 ms), so use texImage2D instead (~1 ms).
-    gl.texImage2D(
-      gl.TEXTURE_2D,
-      0,
-      gl.RGBA,
-      gl.RGBA,
-      gl.UNSIGNED_BYTE,
-      this.#frameSource,
-    );
+    const staged = this.#stagedPicture;
+    const held = this.#textures[this.#head];
+    if (staged !== null && this.#pictures !== null && held !== undefined) {
+      // The frame's picture is already in a texture, uploaded when it was
+      // first seen. The element may show a later one by now, so that texture
+      // takes this place in the ring and the one it displaces goes back.
+      this.#textures[this.#head] = this.#pictures.adopt(staged, held);
+      this.#stagedPicture = null;
+    } else {
+      gl.bindTexture(gl.TEXTURE_2D, held ?? null);
+      // texSubImage2D is very slow in WebKit (~7 ms), so use texImage2D instead (~1 ms).
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.RGBA,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        this.#frameSource,
+      );
+    }
     this.#frames = Math.min(this.#frames + 1, HISTORY);
   }
 
@@ -2788,8 +2822,9 @@ export class Deinterlacer extends EventTarget {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      // Allocated once and written with texSubImage2D after this, which is a
-      // frame's worth of upload rather than a fresh allocation each time.
+      // Sized here so the ring is complete before its first frame. #push
+      // uploads with texImage2D again, or swaps in a texture already holding
+      // the picture.
       gl.texImage2D(
         gl.TEXTURE_2D,
         0,
