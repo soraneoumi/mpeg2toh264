@@ -32,6 +32,7 @@
     "test:film-failure-lifecycle": "node tools/test-film-failure-lifecycle.mjs",
     "test:film-hold": "node tools/test-film-hold.mjs",
     "test:schedule-jitter": "node tools/test-schedule-jitter.mjs",
+    "test:decoded-pictures": "node tools/test-decoded-pictures.mjs",
     "test:mse": "node tools/test-mse-reset.mjs",
     "test:range-eof": "node tools/test-range-eof.mjs && node tools/test-range-reading.mjs",
     "web:dev": "npm run packages:build && npm run dev --workspace @mpeg2toh264/demo",

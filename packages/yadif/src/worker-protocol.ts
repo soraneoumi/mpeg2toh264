@@ -1,3 +1,4 @@
+import type { DecodedPicture } from "./decoded-video.js";
 import type { DeinterlaceStats, Scan, VideoState } from "./deinterlace.js";
 
 /** What the page observed alongside one decoded frame. */
@@ -75,9 +76,28 @@ export type WorkerCommand =
   | { type: "scan"; scan: Scan | null }
   | { type: "timeline"; videoTimeline: readonly VideoState[] }
   | { type: "enabled"; enabled: boolean }
+  /** Start or stop showing decoded pictures, which `enabled` does not. */
+  | { type: "running"; running: boolean }
+  /** A decoded picture, its buffer transferred. `id` comes back with the buffer. */
+  | { type: "picture"; id: number; picture: DecodedPicture }
+  | { type: "pictures"; action: "reset" | "finish" }
+  /** A reading of the element's clock, taken at `at` on the page's clock. */
+  | {
+      type: "clock";
+      video: WorkerVideoState;
+      at: number;
+      timeOrigin: number;
+    }
   | {
       type: "event";
-      name: "emptied" | "pause" | "ended" | "seeking" | "seeked" | "ratechange";
+      name:
+        | "emptied"
+        | "pause"
+        | "ended"
+        | "seeking"
+        | "seeked"
+        | "ratechange"
+        | "waiting";
       video: WorkerVideoState;
     }
   | { type: "capture"; id: number; width: number; height: number }
@@ -94,4 +114,6 @@ export type WorkerNotification =
       /** Failed film attempts, including identical reasons between reports. */
       filmFailure: number;
     }
-  | { type: "capture"; id: number; image: ImageBitmap | null };
+  | { type: "capture"; id: number; image: ImageBitmap | null }
+  /** A decoded picture's buffer, transferred back. */
+  | { type: "release"; id: number; data: ArrayBuffer };

@@ -10,6 +10,7 @@ export type {
   DeinterlacerOptions,
   Scan,
 } from "./deinterlace.js";
+export type { DecodedPicture } from "./decoded-video.js";
 export {
   decoderDeinterlaces,
   forgetDecoderProbe,
