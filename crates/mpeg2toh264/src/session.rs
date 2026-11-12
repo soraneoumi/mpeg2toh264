@@ -335,9 +335,6 @@ pub struct Session {
     /// display slots empty without moving the decode clock, and the units
     /// after them have to keep their places all the same.
     group_lag: Option<u64>,
-    /// Ticks the next unit of the group gives up, because recovery copies that
-    /// ended the last one took their decode instants from it.
-    owed_ticks: u32,
     media_bytes_since_random_access: usize,
     initialized: bool,
     /// What the initialization segment that went out describes, and so what a
@@ -520,7 +517,6 @@ impl Session {
             gops_emitted: 0,
             slots_consumed: 0,
             group_lag: None,
-            owed_ticks: 0,
             media_bytes_since_random_access: 0,
             initialized: false,
             described: None,
@@ -926,21 +922,13 @@ impl Session {
     }
 
     /// Tell a unit's timeline where it sits in its group: how far its display
-    /// slots sit from the decode clock, what the unit before it left for it to
-    /// give up, and whether a unit after it will have to.
+    /// slots sit from the decode clock.
     ///
     /// This is set when the unit is planned, since what the fragment spans
     /// decides how much sound goes in it.
     fn place_in_group(&self, gop: &Mpeg2Gop, starts_at_idr: bool, plan: &mut UnitPlan) {
         let lag = Self::unit_lag(self.group_lag, gop, starts_at_idr, plan.timed());
-        let timeline = plan.timeline_mut();
-        timeline.lag_ticks = lag.ticks;
-        timeline.borrowed_ticks = if Self::follows_on(gop, starts_at_idr) {
-            self.owed_ticks
-        } else {
-            0
-        };
-        timeline.defer_recovery_borrow = gop.group_goes_on;
+        plan.timeline_mut().lag_ticks = lag.ticks;
     }
 
     /// Where a unit's display slots sit against the decode clock, given what
@@ -1402,9 +1390,6 @@ impl Session {
 
         self.sequence_number += 1;
         self.video_presentation_start += fragment.duration;
-        if fragment.sample_count > 0 {
-            self.owed_ticks = fragment.deferred_ticks;
-        }
         // Where the unit after this one is expected to open, read from this
         // one's own timestamp rather than accumulated, so that the presentation
         // and the source cannot creep apart. The hold at the front covered the
@@ -1501,8 +1486,6 @@ impl Session {
                     )?;
                     redrawn.unit.timeline.split_field_samples = timeline.split_field_samples;
                     redrawn.unit.timeline.hold_ticks = timeline.hold_ticks;
-                    redrawn.unit.timeline.borrowed_ticks = timeline.borrowed_ticks;
-                    redrawn.unit.timeline.defer_recovery_borrow = timeline.defer_recovery_borrow;
                     redrawn.unit.timeline.lag_ticks =
                         Self::unit_lag(self.group_lag, gop, starts_at_idr, &redrawn).ticks;
                     Some(redrawn)

@@ -68,8 +68,6 @@ pub struct Mpeg2Gop {
     /// Whether the unit carries on a group that earlier units opened. Only the
     /// splitter that cuts groups into anchor units produces these.
     pub continues_group: bool,
-    /// Whether another unit of the same group follows this one.
-    pub group_goes_on: bool,
 }
 
 /// Where a PES packet's payload landed in the stream, and one value it
@@ -196,7 +194,7 @@ impl Mpeg2GopStream {
                 return None;
             }
             let boundary = self.description_boundary(first_gop, boundary);
-            Some(self.unit_before(boundary, false))
+            Some(self.unit_before(boundary))
         });
         self.discard_pending();
         unit.into_iter().collect()
@@ -221,7 +219,7 @@ impl Mpeg2GopStream {
 
     /// The unit running from the start of the buffer to `boundary`, with the
     /// marks that cover its first byte.
-    fn unit_before(&mut self, boundary: usize, group_goes_on: bool) -> Mpeg2Gop {
+    fn unit_before(&mut self, boundary: usize) -> Mpeg2Gop {
         let pts = if self.continuing {
             Self::mark_exactly_at(&mut self.pts_marks, self.base)
         } else {
@@ -233,7 +231,6 @@ impl Mpeg2GopStream {
             pts,
             restart_offset,
             continues_group: self.continuing,
-            group_goes_on,
         }
     }
 
@@ -545,7 +542,7 @@ impl Mpeg2GopStream {
             } else {
                 self.group_matrices.clear();
             }
-            let unit = self.unit_before(boundary, anchor.is_some());
+            let unit = self.unit_before(boundary);
             output.push(unit);
             self.consume(boundary);
             self.continuing = anchor.is_some();
@@ -556,7 +553,7 @@ impl Mpeg2GopStream {
             }
         }
         if final_flush && !self.pictures.is_empty() {
-            let unit = self.unit_before(self.buffer.len(), false);
+            let unit = self.unit_before(self.buffer.len());
             output.push(unit);
             self.buffer.clear();
             self.prefix_length = 0;

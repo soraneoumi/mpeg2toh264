@@ -2634,6 +2634,76 @@ fn cutting_groups_changes_the_fragments_and_not_the_samples() {
     }
 }
 
+/// The samples of a recovery point, with the picture that displays last of
+/// those before them standing for the one they repeat.
+fn recovery_copies_after(
+    video: &[TrackSample],
+    at: usize,
+) -> (&TrackSample, &TrackSample, &TrackSample) {
+    let source = video[..at]
+        .iter()
+        .max_by_key(|sample| sample.composition_time)
+        .expect("a picture precedes the copies");
+    (source, &video[at], &video[at + 1])
+}
+
+#[test]
+fn periodic_recovery_copies_share_the_slot_of_the_picture_they_repeat() {
+    let stream = video_stream_from_fixture("open_gop_leading_bb.m2v", 4);
+    for recovery_interval in [1, 2, 3] {
+        let options = TranscodeOptions {
+            recovery_interval,
+            ..TranscodeOptions::default()
+        };
+        assert_eq!(options.open_gop_recovery, OpenGopRecovery::Idr);
+        assert_split_matches_whole(&format!("interval {recovery_interval}"), &stream, options);
+
+        let video = track_samples(&run_session_with_options(&stream, 64 * 1024, options)).video;
+        let restarts: Vec<usize> = (1..video.len()).filter(|&at| video[at].sync).collect();
+        assert!(
+            !restarts.is_empty(),
+            "interval {recovery_interval}: no recovery point"
+        );
+        for at in restarts {
+            let (source, idr, clone) = recovery_copies_after(&video, at);
+            let label = format!("interval {recovery_interval}, recovery at sample {at}");
+            // The picture and its copies follow each other and make up the
+            // slot the picture had.
+            assert_eq!(
+                idr.composition_time,
+                source.composition_time + i64::from(source.duration),
+                "{label}"
+            );
+            assert_eq!(
+                clone.composition_time,
+                idr.composition_time + i64::from(idr.duration),
+                "{label}"
+            );
+            assert_eq!(idr.duration, clone.duration, "{label}");
+            assert_eq!(
+                u64::from(source.duration + idr.duration + clone.duration),
+                FRAME_TICKS,
+                "{label}"
+            );
+            assert!(source.duration >= idr.duration, "{label}");
+        }
+        // The copies add samples and no time: the stream is as long as it is
+        // when the picture is a recovery point of its own.
+        let non_idr = TranscodeOptions {
+            open_gop_recovery: OpenGopRecovery::RecoveryPoint,
+            ..options
+        };
+        let reference = track_samples(&run_session_with_options(&stream, 64 * 1024, non_idr)).video;
+        let length =
+            |video: &[TrackSample]| video.iter().map(|s| u64::from(s.duration)).sum::<u64>();
+        assert_eq!(
+            length(&video),
+            length(&reference),
+            "interval {recovery_interval}"
+        );
+    }
+}
+
 #[test]
 fn cutting_groups_splits_them_into_an_anchor_and_the_b_pictures_after_it() {
     // The fixture codes I P B B P B B P B B P B B P B, so the units are the
@@ -2998,13 +3068,6 @@ fn cuts_a_group_before_each_anchor_that_follows_a_b_picture() {
             .collect::<Vec<_>>(),
         [false, true, true, true, true].repeat(2)
     );
-    assert_eq!(
-        units
-            .iter()
-            .map(|unit| unit.group_goes_on)
-            .collect::<Vec<_>>(),
-        [true, true, true, true, false].repeat(2)
-    );
 
     // A unit in the middle of a group is the sequence header put in front of
     // the pictures, which are the source's own bytes.
@@ -3067,9 +3130,7 @@ fn leaves_a_group_without_b_pictures_whole() {
         split.iter().map(|unit| &unit.data).collect::<Vec<_>>(),
         whole.iter().map(|unit| &unit.data).collect::<Vec<_>>()
     );
-    assert!(split
-        .iter()
-        .all(|unit| !unit.continues_group && !unit.group_goes_on));
+    assert!(split.iter().all(|unit| !unit.continues_group));
 }
 
 /// A picture header and one slice, with the bytes the splitter reads and

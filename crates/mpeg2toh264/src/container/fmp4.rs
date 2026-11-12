@@ -305,22 +305,6 @@ pub struct Mpeg2VideoTimeline {
     /// be told how far behind the display clock the decode clock has fallen,
     /// and this is that. Set by the caller, like `hold_ticks`; zero otherwise.
     pub lag_ticks: u32,
-    /// Ticks the unit's first sample gives up, because recovery copies of the
-    /// intra picture ending the unit before it took their decode instants
-    /// from the sample that follows them -- this one. See
-    /// [`Self::defer_recovery_borrow`]. Set by the caller; zero otherwise.
-    pub borrowed_ticks: u32,
-    /// Leave recovery copies that fall after the unit's last sample to the next
-    /// unit to pay for, instead of taking their instants from that sample.
-    ///
-    /// Sent whole, a group has its recovery copies take their instants from the
-    /// first sample after them, even when the unit ends on the intra picture
-    /// they repeat. A unit sent on its own has no such sample yet, and moving
-    /// the borrowing to the one before it would move every decode time after
-    /// it by the same ticks. So the copies are left to the unit that follows,
-    /// which is told through [`Self::borrowed_ticks`]. Set by the caller when
-    /// one will; false otherwise.
-    pub defer_recovery_borrow: bool,
 }
 
 impl Mpeg2VideoTimeline {
@@ -712,8 +696,6 @@ pub(crate) fn timed_mpeg2_unit(
             sample_aspect_ratio: sequence_sample_aspect_ratio(&first.sequence),
             hold_ticks: 0,
             lag_ticks: 0,
-            borrowed_ticks: 0,
-            defer_recovery_borrow: false,
         },
         samples,
         sequence_header_len: sequence_header_len(data),
@@ -815,79 +797,100 @@ pub struct SampleTiming {
     pub reorder_delay: i64,
 }
 
-/// Give the duplicate recovery picture a real decode instant and a display
-/// slot after the picture it repeats, without changing the unit's duration or
-/// any following presentation time.
+/// Place the recovery copies of a unit's intra picture inside the display slot
+/// that picture has.
+///
+/// The picture, its IDR copy and the clone share the slot in thirds, in that
+/// order, so each is on screen for a stretch a display can show. A split field
+/// pair and its IDR copy take two samples each, which divide their third in
+/// halves.
+///
+/// Samples decoded between the picture and the copies decode earlier by what
+/// the picture gave up and keep their presentation times. Nothing after the
+/// copies moves, so the unit lasts as long as before.
 fn insert_recovery_copy_timing(
     timing: &mut SampleTiming,
     index: usize,
     copies: usize,
 ) -> Result<()> {
-    place_recovery_copies(timing, index, copies, false).map(|_| ())
-}
-
-/// [`insert_recovery_copy_timing`], for a unit that may leave copies ending it
-/// to the unit after it, as `defer` says. Returns how many ticks were left for
-/// that unit to give up.
-fn place_recovery_copies(
-    timing: &mut SampleTiming,
-    index: usize,
-    copies: usize,
-    defer: bool,
-) -> Result<u32> {
-    let borrowed = copies as u32;
-    let mut deferred = 0;
-    if index == timing.durations.len() {
-        let Some(previous_duration) = timing.durations.last_mut() else {
-            bail!("recovery copy has no content sample to borrow from");
-        };
-        if defer {
-            deferred = borrowed;
-        } else {
-            if *previous_duration <= borrowed {
-                bail!("recovery copies cannot borrow time from their preceding sample");
-            }
-            *previous_duration -= borrowed;
-        }
-    } else {
-        let next_duration = &mut timing.durations[index];
-        let next_composition = &mut timing.compositions[index];
-        if *next_duration <= borrowed || *next_composition < borrowed {
-            bail!("recovery copies cannot borrow time from their following sample");
-        }
-        *next_duration -= borrowed;
-        *next_composition -= borrowed;
+    if index > timing.durations.len() {
+        bail!("recovery copies come after samples that do not exist");
     }
-    // Where the pictures already coded give way. The copies repeat the unit's
-    // intra picture, and everything decoded ahead of them are the leading
-    // pictures that display before it, so this is that picture's last sample.
-    let mut decode_time = 0u64;
-    let mut shown_until = 0u64;
-    for (&duration, &composition) in timing.durations[..index]
+    // The picture the copies repeat is the one displayed last of those decoded
+    // ahead of them. It takes as many samples as the IDR copy does, which is
+    // every copy but the clone.
+    let samples = copies - 1;
+    let mut decode_end = 0u64;
+    let mut last: Option<(u64, usize)> = None;
+    for (at, (&duration, &composition)) in timing.durations[..index]
         .iter()
-        .zip(timing.compositions.iter())
+        .zip(&timing.compositions)
+        .enumerate()
     {
-        shown_until = shown_until.max(decode_time + u64::from(composition));
-        decode_time += u64::from(duration);
+        let shown = decode_end + u64::from(composition);
+        if last.is_none_or(|(latest, _)| shown >= latest) {
+            last = Some((shown, at));
+        }
+        decode_end += u64::from(duration);
     }
-    // A tick after their own decode instant, so the browser sees strictly
-    // increasing timestamps rather than the source intra picture's own. And a
-    // tick after that picture leaves the screen, which is what a split field
-    // pair needs: its second field displays half a frame after the first,
-    // which is after these samples decode, so timing them from their decode
-    // instant alone lands them between the two fields and leaves the pair
-    // presented top, top, bottom, frame, bottom.
-    let start = shown_until.max(decode_time) + 1;
-    let Ok(composition) = u32::try_from(start - decode_time) else {
+    let Some((_, last)) = last else {
+        bail!("recovery copies have no picture to share a slot with");
+    };
+    let Some(first) = (last + 1).checked_sub(samples) else {
+        bail!("recovery copies repeat a picture that has too few samples");
+    };
+    let Some(slot) = timing.durations[first..=last]
+        .iter()
+        .try_fold(0u32, |total, &duration| total.checked_add(duration))
+    else {
+        bail!("recovery copies repeat a picture longer than the timeline can hold");
+    };
+    let share = slot / 3;
+    if share < samples as u32 {
+        bail!("recovery copies cannot share the slot of the picture they repeat");
+    }
+    let given = 2 * share;
+    let kept = slot - given;
+    // The copies decode back to back and end where the samples ahead of them
+    // ended, and display back to back from the end of what the picture kept,
+    // so one composition offset serves all of them.
+    let decode_start: u64 = timing.durations[..first]
+        .iter()
+        .map(|&d| u64::from(d))
+        .sum();
+    let slot_end = decode_start + u64::from(timing.compositions[first]) + u64::from(slot);
+    let Some(composition) = slot_end
+        .checked_sub(decode_end)
+        .and_then(|offset| u32::try_from(offset).ok())
+    else {
         bail!("recovery copies cannot reach the picture they repeat");
     };
-    for offset in 0..copies {
-        timing.durations.insert(index + offset, 1);
-        // Each copy decodes a tick after the one before it, so one offset
-        // carries them all and they stay a tick apart on screen too.
-        timing.compositions.insert(index + offset, composition);
+    for composition in &mut timing.compositions[last + 1..index] {
+        let Some(earlier) = composition.checked_add(given) else {
+            bail!("recovery copies move a sample past the end of the timeline");
+        };
+        *composition = earlier;
     }
-    Ok(deferred)
+    // The first half rounds down, as when the pair was timed.
+    let halves = |total: u32| {
+        let each = total / samples as u32;
+        (0..samples).map(move |at| {
+            if at + 1 == samples {
+                total - each * (samples as u32 - 1)
+            } else {
+                each
+            }
+        })
+    };
+    for (duration, half) in timing.durations[first..=last].iter_mut().zip(halves(kept)) {
+        *duration = half;
+    }
+    let inserted = halves(share).chain(std::iter::once(share));
+    timing.durations.splice(index..index, inserted);
+    timing
+        .compositions
+        .splice(index..index, std::iter::repeat_n(composition, copies));
+    Ok(())
 }
 
 /// What the sample that opens a unit has to stand in for.
@@ -976,13 +979,6 @@ pub fn mpeg2_sample_timing(timeline: &Mpeg2VideoTimeline, lead_in: UnitLeadIn) -
         .iter()
         .map(|offset| (offset + reorder_delay) as u32 + timeline.lag_ticks)
         .collect();
-    // The recovery copies behind the unit before this one are decoded in front
-    // of this unit's first sample, which gives the time back out of its own
-    // duration and out of its offset, as the copies would have taken it.
-    if let (Some(duration), Some(composition)) = (durations.first_mut(), compositions.first_mut()) {
-        *duration = duration.saturating_sub(timeline.borrowed_ticks);
-        *composition = composition.saturating_sub(timeline.borrowed_ticks);
-    }
     // The hole in front of the unit, which the sample covering its leading
     // slots is held over. A unit that has no such sample cannot hold anything,
     // and the caller keeps the hole for the next one that can.
@@ -1718,9 +1714,6 @@ pub struct Fmp4Fragment {
     pub sample_count: usize,
     /// Presentation time this fragment covers; see [`mpeg2_sample_timing`].
     pub duration: u64,
-    /// Ticks of recovery copies that end the fragment and that the fragment
-    /// after it has to give up; see [`Mpeg2VideoTimeline::defer_recovery_borrow`].
-    pub deferred_ticks: u32,
 }
 
 /// Package one independently transcoded GOP for incremental appending.
@@ -1774,14 +1767,8 @@ pub fn h264_gop_to_fmp4(
     if let Some(index) = recovery.filter(|&index| index < sync_samples.len()) {
         sync_samples[index] = true;
     }
-    let mut deferred_ticks = 0;
     if let Some(index) = recovery_copy.filter(|&index| index < sync_samples.len()) {
-        deferred_ticks = place_recovery_copies(
-            &mut timing,
-            index,
-            extra_samples,
-            timeline.defer_recovery_borrow,
-        )?;
+        insert_recovery_copy_timing(&mut timing, index, extra_samples)?;
     }
     if let (Some(index), Some(sei)) = (recovery, sei) {
         samples[index].insert(0, sei);
@@ -1792,7 +1779,7 @@ pub fn h264_gop_to_fmp4(
         (Some(sps), Some(pps)) => Some(VideoCodec::Avc { sps, pps }),
         _ => None,
     };
-    let mut fragment = make_fragment(
+    make_fragment(
         VideoPayload::avc(samples, &[]),
         timeline,
         &timing,
@@ -1802,9 +1789,7 @@ pub fn h264_gop_to_fmp4(
         presentation_start,
         audio,
         audio_track,
-    )?;
-    fragment.deferred_ticks = deferred_ticks;
-    Ok(fragment)
+    )
 }
 
 /// Package one unit of MPEG-2 video for incremental appending, carrying the
@@ -1898,7 +1883,6 @@ fn make_fragment(
         mime_codec,
         sample_count: video.len(),
         duration: timing.durations.iter().map(|&d| d as u64).sum(),
-        deferred_ticks: 0,
     })
 }
 
@@ -1981,8 +1965,6 @@ mod tests {
             sample_aspect_ratio: None,
             hold_ticks: 0,
             lag_ticks: 0,
-            borrowed_ticks: 0,
-            defer_recovery_borrow: false,
         }
     }
 
@@ -2030,61 +2012,242 @@ mod tests {
         assert_eq!(in_order.compositions, vec![FRAME; 4]);
     }
 
-    #[test]
-    fn recovery_samples_have_distinct_presentation_times() {
-        let mut timing = SampleTiming {
-            durations: vec![10, 10],
-            compositions: vec![0, 10],
-            reorder_delay: 0,
-        };
-        insert_recovery_copy_timing(&mut timing, 1, 2).expect("timing has room");
-
-        assert_eq!(timing.durations, vec![10, 1, 1, 8]);
-        assert_eq!(timing.compositions, vec![0, 1, 1, 8]);
-        let mut decode_time = 0u32;
-        let presentation_times: Vec<u32> = timing
+    /// Decode time and presentation time of every sample, in decode order.
+    fn sample_times(timing: &SampleTiming) -> Vec<(u64, u64)> {
+        let mut decode_time = 0u64;
+        timing
             .durations
             .iter()
             .zip(&timing.compositions)
             .map(|(&duration, &composition)| {
-                let presentation = decode_time + composition;
-                decode_time += duration;
-                presentation
+                let times = (decode_time, decode_time + u64::from(composition));
+                decode_time += u64::from(duration);
+                times
             })
-            .collect();
-        assert_eq!(presentation_times, vec![0, 11, 12, 20]);
+            .collect()
     }
 
-    /// A split field pair is still on screen when its copy decodes: the second
-    /// field displays half a frame after the first, and the copy decodes at
-    /// the first field's display instant. Timing the copies from their own
-    /// decode instant put them between the two fields, which presented the
-    /// frame as top, top, bottom, copy, bottom -- two fields of one parity in
-    /// a row, at every recovery point whose source intra picture was a pair.
+    /// Place `copies` recovery samples at `index` and check what holds for
+    /// every layout: the unit lasts as long as before, decode times only
+    /// increase, no two samples are presented at the same time, and what is
+    /// not part of the picture's slot is presented when it was. Returns the
+    /// timing as it was and as it is.
+    fn place(
+        mut timing: SampleTiming,
+        index: usize,
+        copies: usize,
+    ) -> (SampleTiming, SampleTiming) {
+        let before = timing.clone();
+        insert_recovery_copy_timing(&mut timing, index, copies).expect("timing has room");
+        assert_eq!(timing.durations.len(), before.durations.len() + copies);
+        assert_eq!(
+            timing.durations.iter().sum::<u32>(),
+            before.durations.iter().sum::<u32>()
+        );
+        assert!(timing.durations.iter().all(|&duration| duration > 0));
+        let times = sample_times(&timing);
+        assert!(times.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        let mut presentation: Vec<u64> = times.iter().map(|&(_, shown)| shown).collect();
+        presentation.sort_unstable();
+        assert!(presentation.windows(2).all(|pair| pair[0] < pair[1]));
+        let previous = sample_times(&before);
+        for (at, &(_, shown)) in previous.iter().enumerate().skip(index) {
+            assert_eq!(times[at + copies].1, shown, "sample {at} after the copies");
+        }
+        assert_eq!(timing.reorder_delay, before.reorder_delay);
+        (before, timing)
+    }
+
+    /// An IPPP group: nothing displays ahead of the intra picture.
+    fn in_order() -> SampleTiming {
+        mpeg2_sample_timing(&timeline(&IPPP, &[false; 4], false), UnitLeadIn::None)
+    }
+
+    /// An open group's intra picture, with the two B pictures that display
+    /// ahead of it coded after it.
+    fn open_group(pairs: bool) -> SampleTiming {
+        mpeg2_sample_timing(&timeline(&[3, 1, 2], &[pairs; 3], pairs), UnitLeadIn::None)
+    }
+
     #[test]
-    fn recovery_copies_of_a_field_pair_follow_its_second_field() {
-        let mut timing = SampleTiming {
-            // A field pair, then the leading pictures that display ahead of it.
-            durations: vec![5, 5, 10, 10, 10],
-            compositions: vec![30, 30, 0, 0, 40],
+    fn recovery_copies_share_the_slot_of_a_frame_picture_in_thirds() {
+        let (before, timing) = place(in_order(), 1, 2);
+        assert_eq!(before.durations, [3003; 4]);
+        // The picture and both copies are a third of a frame, and the pictures
+        // after them are presented when they were.
+        assert_eq!(timing.durations, [1001, 1001, 1001, 3003, 3003, 3003]);
+        assert_eq!(
+            sample_times(&timing),
+            [
+                (0, 3003),
+                (1001, 4004),
+                (2002, 5005),
+                (3003, 6006),
+                (6006, 9009),
+                (9009, 12012)
+            ]
+        );
+    }
+
+    #[test]
+    fn recovery_copies_ending_a_unit_take_nothing_from_the_next() {
+        let (_, timing) = place(in_order(), 4, 2);
+        // The last picture is the one they repeat.
+        assert_eq!(timing.durations, [3003, 3003, 3003, 1001, 1001, 1001]);
+        let times = sample_times(&timing);
+        assert_eq!(times[3].1, 12012);
+        assert_eq!(times[4].1, 13013);
+        assert_eq!(times[5].1, 14014);
+        assert_eq!(timing.durations.iter().sum::<u32>(), 4 * 3003);
+        let (_, alone) = place(
+            SampleTiming {
+                durations: vec![3003],
+                compositions: vec![3003],
+                reorder_delay: 3003,
+            },
+            1,
+            2,
+        );
+        assert_eq!(alone.durations, [1001, 1001, 1001]);
+        assert_eq!(
+            sample_times(&alone),
+            [(0, 3003), (1001, 4004), (2002, 5005)]
+        );
+    }
+
+    /// What is left of a slot that does not divide is the picture's.
+    #[test]
+    fn recovery_copies_leave_the_remainder_of_the_slot_to_the_picture() {
+        let (_, timing) = place(
+            SampleTiming {
+                durations: vec![4505, 3003],
+                compositions: vec![3003, 3003],
+                reorder_delay: 3003,
+            },
+            1,
+            2,
+        );
+        // Three fields are 1501 ticks each.
+        assert_eq!(timing.durations, [1503, 1501, 1501, 3003]);
+        assert_eq!(
+            sample_times(&timing),
+            [(0, 3003), (1503, 4506), (3004, 6007), (4505, 7508)]
+        );
+        let (_, timing) = place(
+            SampleTiming {
+                durations: vec![10, 10],
+                compositions: vec![10, 10],
+                reorder_delay: 10,
+            },
+            1,
+            2,
+        );
+        assert_eq!(timing.durations, [4, 3, 3, 10]);
+    }
+
+    /// The leading pictures decode between the intra picture and its copies.
+    /// They keep the times they display at and decode earlier, by what the
+    /// intra picture gave up.
+    #[test]
+    fn leading_pictures_between_a_picture_and_its_copies_keep_their_presentation_times() {
+        let (before, timing) = place(open_group(false), 3, 2);
+        assert_eq!(
+            sample_times(&before),
+            [(0, 9009), (3003, 3003), (6006, 6006)]
+        );
+        assert_eq!(timing.durations, [1001, 3003, 3003, 1001, 1001]);
+        assert_eq!(
+            sample_times(&timing),
+            [
+                (0, 9009),
+                (1001, 3003),
+                (4004, 6006),
+                (7007, 10010),
+                (8008, 11011)
+            ]
+        );
+        assert_eq!(timing.compositions, [9009, 2002, 2002, 3003, 3003]);
+    }
+
+    #[test]
+    fn leading_pictures_between_a_picture_and_its_copies_leave_what_follows_alone() {
+        let mut open = open_group(false);
+        // A following anchor picture, coded after the leading pictures.
+        open.durations.push(3003);
+        open.compositions.push(9009);
+        let (before, timing) = place(open, 3, 2);
+        assert_eq!(timing.durations, [1001, 3003, 3003, 1001, 1001, 3003]);
+        assert_eq!(sample_times(&timing)[5], (9009, 18018));
+        assert_eq!(sample_times(&before)[3], (9009, 18018));
+    }
+
+    /// A split pair spans two samples and so does its IDR copy, and the clone
+    /// is one more: three copies, which still make the pair's slot thirds.
+    #[test]
+    fn recovery_copies_of_a_field_pair_share_its_frame_slot_in_thirds() {
+        let (before, timing) = place(open_group(true), 6, 3);
+        assert_eq!(
+            before.durations,
+            [1501, 1502, 1501, 1502, 1501, 1502],
+            "the pair, then the leading pairs"
+        );
+        assert_eq!(
+            timing.durations,
+            [500, 501, 1501, 1502, 1501, 1502, 500, 501, 1001]
+        );
+        assert_eq!(
+            sample_times(&timing)
+                .iter()
+                .map(|&(_, shown)| shown)
+                .collect::<Vec<_>>(),
+            // The pair, the leading pairs where they were, then the copy of
+            // the pair and the clone, the last of which ends where the slot
+            // of the pair does.
+            [9009, 9509, 3003, 4504, 6006, 7507, 10010, 10510, 11011]
+        );
+        assert_eq!(timing.compositions[0], timing.compositions[1]);
+    }
+
+    #[test]
+    fn recovery_copies_of_a_field_pair_with_nothing_after_them_end_the_unit_on_its_slot() {
+        let pair = SampleTiming {
+            durations: vec![1501, 1502],
+            compositions: vec![3003, 3003],
+            reorder_delay: 3003,
+        };
+        let (_, timing) = place(pair, 2, 3);
+        assert_eq!(timing.durations, [500, 501, 500, 501, 1001]);
+        let times = sample_times(&timing);
+        assert_eq!(times[4], (2002, 5005));
+        assert_eq!(times[4].1 + 1001, 3003 + 3003);
+    }
+
+    #[test]
+    fn recovery_copies_that_cannot_share_a_slot_are_refused() {
+        let timing = |durations: &[u32], compositions: &[u32]| SampleTiming {
+            durations: durations.to_vec(),
+            compositions: compositions.to_vec(),
             reorder_delay: 0,
         };
-        insert_recovery_copy_timing(&mut timing, 4, 3).expect("timing has room");
-
-        let mut decode_time = 0u32;
-        let presentation_times: Vec<u32> = timing
-            .durations
-            .iter()
-            .zip(&timing.compositions)
-            .map(|(&duration, &composition)| {
-                let presentation = decode_time + composition;
-                decode_time += duration;
-                presentation
-            })
-            .collect();
-        // The pair displays at 30 and 35, and the three copies pick up from
-        // there rather than from 30, where the second field still follows.
-        assert_eq!(presentation_times, vec![30, 35, 10, 20, 36, 37, 38, 70]);
+        // No picture ahead of them, a slot too short to divide, a pair with
+        // only one sample ahead of it, and a unit shorter than the index.
+        let cases = [
+            (timing(&[3003], &[0]), 0, 2),
+            (timing(&[2], &[0]), 1, 2),
+            (timing(&[1, 3], &[0, 0]), 2, 3),
+            (timing(&[3003], &[0]), 1, 3),
+            (timing(&[3003], &[0]), 2, 2),
+            // The picture's slot ends before the samples ahead of the copies
+            // have decoded, which is no timeline the unit can make.
+            (timing(&[10, 100], &[50, 0]), 2, 2),
+            (timing(&[u32::MAX, u32::MAX], &[0, 0]), 2, 3),
+        ];
+        for (mut case, index, copies) in cases {
+            assert!(
+                insert_recovery_copy_timing(&mut case, index, copies).is_err(),
+                "{case:?} at {index}"
+            );
+        }
     }
 
     /// The clone in front of a unit holds the empty slots an open group's

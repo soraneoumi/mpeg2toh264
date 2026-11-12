@@ -57,7 +57,7 @@ I_PCM could avoid all but the inverse transform, but it caused QSV decoding prob
 
 Immediately after the opening IDR, a copy of the same image is emitted as a long-term reference to reserve the index used for subsequent constant predictions.
 
-Periodic random access is controlled by `--open-gop`. `idr` preserves the leading B pictures and the I picture that closes their GOP, then begins the next GOP with an IDR and long-term reference clone. `recovery-point` preserves the leading B pictures and uses a non-IDR I picture with a recovery-point SEI. `discard` drops the leading B pictures to close the GOP, then begins the next GOP with an IDR and clone as in `idr`. The interval defaults to 24 GOPs and can be changed with `--recovery-interval`.
+Periodic random access is controlled by `--open-gop`. `idr` preserves the leading B pictures and the I picture that closes their GOP, then begins the next GOP with an IDR and long-term reference clone. The I picture, the IDR and the clone share the display slot of the I picture in thirds, so that each is on screen for a stretch a display can show. `recovery-point` preserves the leading B pictures and uses a non-IDR I picture with a recovery-point SEI. `discard` drops the leading B pictures to close the GOP, then begins the next GOP with an IDR and clone as in `idr`. The interval defaults to 24 GOPs and can be changed with `--recovery-interval`.
 
 For example, the access units around an open-GOP boundary are arranged as follows. `B` is a leading B picture whose presentation time precedes the I picture, and `I(r)` is an independently coded non-IDR I picture carrying a recovery-point SEI.
 
@@ -244,7 +244,7 @@ MPEG-2のイントラマクロブロックをH.264のイントラ予測へその
 
 先頭IDRの直後には同じ画像の長期参照用コピーを置き、以後の一定値予測用インデックスを確保します。
 
-周期的なランダムアクセス点の処理は`--open-gop`で指定します。`idr`は先頭Bピクチャを保持してIピクチャを配置してclosed GOPにし、次のGOPにはIDRと長期参照用コピーを配置します。`recovery-point`は先頭Bピクチャを保持してnon-IDR IピクチャとリカバリーポイントSEIを使います。`discard`は先頭Bピクチャを捨てることでclosed GOPにし、`idr`同様IDRと長期参照用コピーを配置します。間隔の既定値は24 GOPで、`--recovery-interval`で変更できます。
+周期的なランダムアクセス点の処理は`--open-gop`で指定します。`idr`は先頭Bピクチャを保持してIピクチャを配置してclosed GOPにし、次のGOPにはIDRと長期参照用コピーを配置します。Iピクチャ、IDR、コピーはIピクチャの表示枠を3等分して使い、それぞれが表示可能な長さだけ画面に残ります。`recovery-point`は先頭Bピクチャを保持してnon-IDR IピクチャとリカバリーポイントSEIを使います。`discard`は先頭Bピクチャを捨てることでclosed GOPにし、`idr`同様IDRと長期参照用コピーを配置します。間隔の既定値は24 GOPで、`--recovery-interval`で変更できます。
 
 Open GOP境界付近のアクセスユニットは次のようになります。`B`はIピクチャより表示時刻が前の先頭Bピクチャ、`I(r)`はリカバリーポイントSEIを伴う独立符号化されたnon-IDR Iピクチャです。
 

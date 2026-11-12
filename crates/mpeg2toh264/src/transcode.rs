@@ -105,7 +105,10 @@ pub enum VideoMode {
 pub enum OpenGopRecovery {
     /// Preserve every leading picture, then emit a real IDR and its reference
     /// clone after them. This costs two additional samples at each recovery
-    /// boundary, but gives hardware decoders an unambiguous restart point.
+    /// boundary, but gives hardware decoders an unambiguous restart point. The
+    /// two samples are timed inside the source intra picture's display slot,
+    /// which the picture and they share in thirds so that each is on screen for
+    /// a stretch a display can show.
     #[default]
     Idr,
     /// Preserve every leading picture and use the independently coded source
