@@ -36,6 +36,12 @@ export declare const QUEUE_HIGH_WATER_FRAGMENTS = 2;
  * this in a fraction of the time it takes to watch it.
  */
 export declare const DEFAULT_MAX_AHEAD_SECONDS = 8;
+/**
+ * Seconds of media a live stream collects before playback begins. Network
+ * delivery was seen to fall up to 0.4 s behind for a moment, and playback
+ * stalls when the buffer runs out.
+ */
+export declare const LIVE_START_SECONDS = 0.8;
 /** Seconds of played media kept behind the playhead when evicting. */
 export declare const DEFAULT_KEEP_BEHIND_SECONDS = 10;
 /**
@@ -292,6 +298,12 @@ export type Notification = {
     type: "seek";
     id: number;
     time: number;
+}
+/** Collect this much media before the first append. See MseSink.holdStart. */
+ | {
+    type: "hold";
+    id: number;
+    seconds: number;
 } | {
     type: "progress";
     id: number;

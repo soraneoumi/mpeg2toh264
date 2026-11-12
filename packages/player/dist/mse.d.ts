@@ -29,6 +29,8 @@ export interface FragmentSink {
     /** Take the initialization segment and open the stream for `mimeCodec`. */
     open(mimeCodec: string, data: ArrayBuffer): Promise<void>;
     push(data: ArrayBuffer, start: number, randomAccess: boolean): void;
+    /** Collect this many seconds of media before the first append. */
+    holdStart(seconds: number): void;
     /**
      * Throw away everything buffered and everything queued, and expect the
      * fragments after this to belong somewhere else on the timeline.
@@ -98,6 +100,15 @@ export declare class MseSink implements FragmentSink {
      */
     open(mimeCodec: string, data: ArrayBuffer): Promise<void>;
     push(data: ArrayBuffer, start: number, randomAccess: boolean): void;
+    /**
+     * Keep the first media fragments queued until they span this many seconds,
+     * then append them together.
+     *
+     * Playback begins as soon as anything is buffered. A live stream arrives no
+     * faster than it plays, so whatever is buffered at that moment is all the
+     * margin playback will ever have. Has no effect once media has been appended.
+     */
+    holdStart(seconds: number): void;
     /**
      * How long the whole presentation is.
      *
