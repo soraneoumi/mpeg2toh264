@@ -1047,11 +1047,11 @@ impl Session {
             self.hold_over_hole(&gop, &mut plan)?;
             return Ok(Some(self.commit(gop, Vec::new(), plan)));
         }
-        // Keep one GOP pending so all AAC packets up to the next GOP boundary
-        // can share the same moof. MSE implementations then see both trafs per
-        // fragment.
-        let keep = usize::from(!final_flush);
-        if self.pending_gops.len() <= keep {
+        // A unit goes out as soon as the sound that belongs beside it has
+        // arrived, which the frame count below checks. Holding it until the
+        // unit after it is complete as well would add a whole unit of delay to
+        // a live stream and change nothing in the fragment.
+        if self.pending_gops.is_empty() {
             return Ok(None);
         }
         let Some(config) = self.audio_config.clone() else {

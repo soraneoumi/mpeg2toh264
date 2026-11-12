@@ -996,6 +996,37 @@ fn run_session_with_options(
     fragments
 }
 
+/// How many video PES packets had begun when the first media fragment came
+/// out, feeding one transport packet at a time.
+fn video_packets_begun_before_the_first_fragment(stream: &[u8]) -> usize {
+    let mut session = Session::new(TranscodeOptions::default());
+    let mut begun = 0;
+    for packet in stream.chunks(188) {
+        let pid = u16::from(packet[1] & 0x1f) << 8 | u16::from(packet[2]);
+        if pid == VIDEO_PID && packet[1] & 0x40 != 0 {
+            begun += 1;
+        }
+        let fragments = session.push(packet).expect("push succeeds");
+        if fragments
+            .iter()
+            .any(|fragment| matches!(fragment, Fragment::Media { .. }))
+        {
+            return begun;
+        }
+    }
+    panic!("no media fragment came out");
+}
+
+#[test]
+fn a_group_goes_out_without_waiting_for_the_one_after_it() {
+    // Each video PES here is one whole group, followed by the sound that
+    // belongs beside it. The first group is known to be complete when the
+    // second one's header arrives, and its sound is in by then, so nothing
+    // of the third is needed.
+    let stream = timed_av_stream(4);
+    assert_eq!(video_packets_begun_before_the_first_fragment(&stream), 3);
+}
+
 fn split_fragments(fragments: &[Fragment]) -> (Vec<&Fragment>, Vec<&Fragment>) {
     fragments
         .iter()
