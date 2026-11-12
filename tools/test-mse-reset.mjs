@@ -95,6 +95,55 @@ try {
   assert.equal(sourceBuffer.appended[1], newInit);
   sourceBuffer.complete();
   assert.equal(sourceBuffer.appended[2], newMedia);
+
+  // A start hold keeps media queued until it spans the time asked for, and
+  // the fragment limit does not close the door meanwhile.
+  const options = {
+    queueHighWaterMark: 1024 * 1024,
+    maxAheadSeconds: 8,
+    keepBehindSeconds: 10,
+    seek() {},
+  };
+  const fragment = (value) => new Uint8Array([value]).buffer;
+  const hasRoom = (target) =>
+    Promise.race([
+      target.ready().then(() => true),
+      new Promise((resolve) => setTimeout(() => resolve(false), 20)),
+    ]);
+  const held = new MseSink(options);
+  await held.open("video/mp4; codecs=avc1.640028", fragment(0));
+  held.holdStart(0.75);
+  const heldBuffer = held.mediaSource.sourceBuffer;
+  heldBuffer.complete();
+  const media = [];
+  for (let index = 0; index < 3; index++) {
+    media.push(fragment(10 + index));
+    held.push(media[index], 5 + index * 0.25, index === 0);
+  }
+  assert.equal(heldBuffer.appended.length, 1, "0.5 s queued is still held");
+  assert.equal(await hasRoom(held), true);
+  media.push(fragment(13));
+  held.push(media[3], 5.75, false);
+  for (let index = 0; index < media.length; index++) {
+    assert.equal(heldBuffer.appended[1 + index], media[index]);
+    heldBuffer.complete();
+  }
+  assert.equal(await hasRoom(held), true);
+  const later = fragment(30);
+  held.push(later, 6, false);
+  assert.equal(heldBuffer.appended[5], later, "the hold does not come back");
+
+  // The end of the input releases a hold that never filled.
+  const short = new MseSink(options);
+  await short.open("video/mp4; codecs=avc1.640028", fragment(0));
+  short.holdStart(0.8);
+  const shortBuffer = short.mediaSource.sourceBuffer;
+  shortBuffer.complete();
+  const only = fragment(40);
+  short.push(only, 5, true);
+  assert.equal(shortBuffer.appended.length, 1);
+  void short.finish();
+  assert.equal(shortBuffer.appended[1], only);
 } finally {
   delete globalThis.MediaSource;
   await unlink(output).catch(() => {});

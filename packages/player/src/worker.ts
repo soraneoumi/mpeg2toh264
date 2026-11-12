@@ -13,6 +13,7 @@
  */
 import { MseSink, ReadyGate, type FragmentSink } from "./mse.js";
 import {
+  LIVE_START_SECONDS,
   SEEK_LEAD_SECONDS,
   SEEK_PROBE_ATTEMPTS,
   SEEK_PROBE_BYTES,
@@ -176,6 +177,10 @@ class RemoteSink implements FragmentSink {
 
   push(data: ArrayBuffer, start: number, randomAccess: boolean): void {
     post({ type: "fragment", id: this.#id, data, start, randomAccess }, [data]);
+  }
+
+  holdStart(seconds: number): void {
+    post({ type: "hold", id: this.#id, seconds });
   }
 
   reset(): void {
@@ -601,6 +606,7 @@ class Playback {
         // without waiting for its whole group of pictures.
         this.#totalBytes === null,
       );
+      if (this.#totalBytes === null) this.#sink.holdStart(LIVE_START_SECONDS);
       converter.usePool(this.#pool);
       // A PID the program map has yet to name is remembered until it does, so
       // this can go in before a byte has been read.

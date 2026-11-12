@@ -739,6 +739,9 @@ export class Mpeg2TsPlayer extends EventTarget {
         if (this.video.currentTime < notification.time)
           this.video.currentTime = notification.time;
         break;
+      case "hold":
+        this.#sink?.holdStart(notification.seconds);
+        break;
       case "progress":
         this.#emit("progress", {
           bytesRead: notification.bytesRead,

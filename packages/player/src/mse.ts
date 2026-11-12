@@ -120,6 +120,8 @@ export interface FragmentSink {
   /** Take the initialization segment and open the stream for `mimeCodec`. */
   open(mimeCodec: string, data: ArrayBuffer): Promise<void>;
   push(data: ArrayBuffer, start: number, randomAccess: boolean): void;
+  /** Collect this many seconds of media before the first append. */
+  holdStart(seconds: number): void;
   /**
    * Throw away everything buffered and everything queued, and expect the
    * fragments after this to belong somewhere else on the timeline.
@@ -198,6 +200,8 @@ interface Pending {
   data: ArrayBuffer;
   /** The initialization segment buffers no media, so it places no playhead. */
   init: boolean;
+  /** Where a media fragment starts on the timeline, in seconds. */
+  start?: number;
 }
 
 type Operation =
@@ -257,6 +261,8 @@ export class MseSink implements FragmentSink {
   #randomAccessPoints: number[] = [];
   /** Whether the playhead has been put where the media starts; see #startAtMedia. */
   #playheadPlaced = false;
+  /** Seconds of media to collect before the first append; see `holdStart`. */
+  #holdSeconds = 0;
   #currentTime = 0;
   #closed = false;
   #ending = false;
@@ -323,7 +329,30 @@ export class MseSink implements FragmentSink {
   push(data: ArrayBuffer, start: number, randomAccess: boolean): void {
     if (this.#closed) return;
     if (randomAccess) this.#randomAccessPoints.push(start);
-    this.#enqueue({ data, init: false });
+    this.#enqueue({ data, init: false, start });
+  }
+
+  /**
+   * Keep the first media fragments queued until they span this many seconds,
+   * then append them together.
+   *
+   * Playback begins as soon as anything is buffered. A live stream arrives no
+   * faster than it plays, so whatever is buffered at that moment is all the
+   * margin playback will ever have. Has no effect once media has been appended.
+   */
+  holdStart(seconds: number): void {
+    if (!this.#playheadPlaced) this.#holdSeconds = seconds;
+  }
+
+  /** Whether the first media is still being collected. Ends the hold when not. */
+  #holding(): boolean {
+    if (this.#holdSeconds === 0) return false;
+    const media = this.#queue.filter((pending) => !pending.init);
+    const span =
+      media.length > 0 ? media[media.length - 1]!.start! - media[0]!.start! : 0;
+    if (span < this.#holdSeconds && !this.#ending) return true;
+    this.#holdSeconds = 0;
+    return false;
   }
 
   /**
@@ -446,6 +475,7 @@ export class MseSink implements FragmentSink {
       this.#settleDrain(false);
       return;
     }
+    if (!next.init && this.#holding()) return;
     if (this.#retype !== null) {
       const mimeCodec = this.#retype;
       this.#retype = null;
@@ -630,7 +660,9 @@ export class MseSink implements FragmentSink {
       this.#streaming &&
       this.#ahead() < this.#options.maxAheadSeconds &&
       this.#queuedBytes < this.#options.queueHighWaterMark &&
-      this.#queue.length < QUEUE_HIGH_WATER_FRAGMENTS;
+      // The fragment limit would stop the input before a start hold fills.
+      (this.#holdSeconds > 0 ||
+        this.#queue.length < QUEUE_HIGH_WATER_FRAGMENTS);
     if (this.#room.set(room)) this.#options.onReadyChange?.(room);
   }
 
