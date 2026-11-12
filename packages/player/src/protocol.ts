@@ -95,8 +95,48 @@ export const SEEK_PROBE_TOLERANCE_SECONDS = 0.5;
  */
 export const SEEK_LEAD_SECONDS = 1;
 
+/**
+ * How often the page asks for decoded pictures, in milliseconds, and how far
+ * ahead of the playhead at normal speed. See the `need` command.
+ */
+export const PICTURE_NEED_INTERVAL_MS = 40;
+export const PICTURE_NEED_AHEAD_SECONDS = 0.3;
+
 /** Which side of the wire owns the `MediaSource`. */
 export type SinkKind = "worker" | "main";
+
+/**
+ * What becomes of the pictures. `transcode` converts them to H.264 and
+ * `passthrough` carries the MPEG-2 into the MP4; `decode` decodes them in
+ * the worker for a deinterlacer that takes decoded pictures, and the MP4
+ * carries the sound alone.
+ */
+export type VideoMode = "transcode" | "passthrough" | "decode";
+
+/**
+ * One decoded picture, as a deinterlacer's `decodedVideo.push` takes it.
+ * Times are seconds on the media element's timeline; the planes are 4:2:0,
+ * 8-bit, limited range, each starting at its offset in `data` with its own
+ * row stride.
+ */
+export interface DecodedPicture {
+  timestamp: number;
+  duration: number;
+  width: number;
+  height: number;
+  displayWidth: number;
+  displayHeight: number;
+  data: ArrayBuffer;
+  planes: readonly [
+    { offset: number; stride: number },
+    { offset: number; stride: number },
+    { offset: number; stride: number },
+  ];
+  interlaced: boolean;
+  topFieldFirst: boolean;
+  repeatFirstField: boolean;
+  matrix: "bt709" | "bt601";
+}
 
 /**
  * How the source pictures were captured, as the MPEG-2 headers said.
@@ -167,11 +207,7 @@ export interface LoadCommand {
    */
   audioGainSteps: number;
   surroundAudioGainSteps: number;
-  /**
-   * Whether to carry the MPEG-2 video through as it stands rather than
-   * converting it, for a browser whose decoder takes MPEG-2.
-   */
-  passthrough: boolean;
+  video: VideoMode;
   /**
    * How many workers convert pictures alongside the one that owns the session.
    *
@@ -192,7 +228,7 @@ export interface LoadCommand {
    */
   serviceId: number | null;
   sink: SinkKind;
-  /** Also forward compressed video to a filter that decodes its own input before presentation. */
+  /** Also forward compressed video to a filter that decodes its own input before presentation. Never with `decode`. */
   encodedVideo: boolean;
   /**
    * Open a Managed Media Source where the browser has both. It reaches the
@@ -227,6 +263,14 @@ export type Command =
       pid: number | null;
       dualMonoSub: boolean | null;
     }
+  /**
+   * Decode mode: the pictures from `from` to `until`, in media seconds, are
+   * wanted. A request of a new epoch, or one that jumps, starts decoding
+   * again; one of an epoch older than the last `reset` is ignored.
+   */
+  | { type: "need"; id: number; epoch: number; from: number; until: number }
+  /** A picture's buffer back from the renderer, to be used again. */
+  | { type: "recycle"; id: number; data: ArrayBuffer }
   | { type: "stop"; id: number };
 
 export type Notification =
@@ -267,8 +311,21 @@ export type Notification =
    * ranges, never sends this.
    */
   | { type: "seekable"; id: number; duration: number }
-  /** Throw away everything buffered; a seek is about to refill it. */
+  /**
+   * Throw away everything buffered; a seek is about to refill it. In decode
+   * mode this comes whichever side holds the MediaSource, and requests of the
+   * epochs before it are ignored from here on.
+   */
   | { type: "reset"; id: number }
+  /** Decode mode: a picture decoded for a request of `epoch`. */
+  | { type: "picture"; id: number; epoch: number; picture: DecodedPicture }
+  /** Decode mode: every picture after the request of `epoch` has been sent. */
+  | { type: "pictures-end"; id: number; epoch: number }
+  /**
+   * Decode mode cannot play this stream: it has no AAC sound to keep the
+   * clock. No media went out before this, and the load has ended.
+   */
+  | { type: "no-aac-audio"; id: number }
   /**
    * What the source said about its fields, when it first says it and whenever
    * it changes. See `Scan`.
@@ -365,6 +422,11 @@ export interface Timing {
   sincePrevious: number;
 }
 
+/**
+ * In decode mode the rates and `videoFrames` describe the pictures decoded,
+ * `convertingMs` is the decoding and the session's own work together, and
+ * `errors` counts units that failed to decode as well.
+ */
 export interface Stats {
   dropped: number;
   scrambled: number;

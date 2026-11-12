@@ -7,8 +7,10 @@
 
 use js_sys::{Array, Object, Reflect, Uint8Array};
 use mpeg2toh264::job::PictureOutput;
+use mpeg2toh264::mpeg2::decode::{packed_planes, DecodedFrame, UnitDecoder};
 use mpeg2toh264::{
     AudioGain, DualMono, Fragment, OpenGopRecovery, Progress, TranscodeOptions, VideoMode,
+    YcbcrMatrix,
 };
 use wasm_bindgen::prelude::*;
 
@@ -51,6 +53,23 @@ export type Fragment =
       }[];
     }
   | {
+      /**
+       * One unit of MPEG-2 to decode with `PictureDecoder`, in decode mode
+       * only. It follows the `media` fragment carrying the unit's sound,
+       * where the unit has any.
+       */
+      kind: "video";
+      data: Uint8Array;
+      /** Where the unit starts on the presentation timeline, in seconds. */
+      start: number;
+      /** References decoded before this unit must not be used. */
+      restart: boolean;
+      /** Whether decoding can begin here after a jump. */
+      intra: boolean;
+      /** The coded frames to decode, in decode order. */
+      pictures: VideoPicture[];
+    }
+  | {
       kind: "private-stream";
       /** PES stream_id: 0xbd (private_stream_1) or 0xbf (private_stream_2). */
       streamId: number;
@@ -59,6 +78,44 @@ export type Fragment =
       /** Absolute 90 kHz timestamp, or null when no media clock is available. */
       pts: number | null;
     };
+
+/** One coded frame of a `video` fragment. */
+export type VideoPicture = {
+  /** Index of the frame picture, or of its first field, in the unit. */
+  picture: number;
+  /** Index of the second field, for a frame coded as two fields. */
+  secondField: number | null;
+  /** Presentation time in seconds on the media element's timeline. */
+  time: number;
+  /** How long it is shown, in seconds. */
+  duration: number;
+};
+
+/** A picture `PictureDecoder.next` decoded, and how to copy it out. */
+export type DecodedPictureInfo = {
+  time: number;
+  duration: number;
+  /** Visible luma size. */
+  width: number;
+  height: number;
+  /** Size after the sample aspect ratio. */
+  displayWidth: number;
+  displayHeight: number;
+  /** False when both fields are one instant (progressive_frame). */
+  interlaced: boolean;
+  topFieldFirst: boolean;
+  repeatFirstField: boolean;
+  matrix: "bt709" | "bt601";
+  /** Macroblocks not decoded from the stream but concealed. */
+  concealedMacroblocks: number;
+  /** Bytes `copy` writes: Y, Cb and Cr, each with its coded stride. */
+  byteLength: number;
+  planes: [
+    { offset: number; stride: number },
+    { offset: number; stride: number },
+    { offset: number; stride: number },
+  ];
+};
 
 /**
  * How far a session got, for a caller converting the pictures itself.
@@ -111,6 +168,10 @@ extern "C" {
     pub type ProgressObject;
     #[wasm_bindgen(typescript_type = "AudioStream[]")]
     pub type AudioStreamArray;
+    #[wasm_bindgen(typescript_type = "Extract<Fragment, { kind: \"video\" }>")]
+    pub type VideoFragment;
+    #[wasm_bindgen(typescript_type = "DecodedPictureInfo")]
+    pub type DecodedPictureInfoObject;
 }
 
 /// Streaming transcode of one transport stream.
@@ -164,12 +225,14 @@ impl Session {
     /// `undefined` leaves the pair in one sample, which is what more decoders
     /// accept.
     ///
-    /// `passthrough` carries the MPEG-2 video into the MP4 as it stands
-    /// instead of converting it, for a browser whose decoder takes MPEG-2.
-    /// Nothing is requantised, so the picture is the broadcast's own and the
-    /// conversion costs almost nothing -- but a browser that does not decode
-    /// MPEG-2 plays none of it. Ask `MediaSource.isTypeSupported` with the
-    /// `mimeCodec` the init fragment reports before relying on it.
+    /// `video` is what becomes of the pictures. `"transcode"`, the default,
+    /// converts them to H.264. `"passthrough"` carries the MPEG-2 into the MP4
+    /// as it stands, for a browser whose decoder takes MPEG-2: nothing is
+    /// requantised, but a browser that does not decode MPEG-2 plays none of
+    /// it, so ask `MediaSource.isTypeSupported` with the `mimeCodec` the init
+    /// fragment reports first. `"decode"` muxes only the sound and hands each
+    /// unit out as a `video` fragment for `PictureDecoder`; a stream without
+    /// AAC sound then fails with an error named `NoAacAudioError`.
     ///
     /// `splitGroups` cuts each group of pictures into fragments of one anchor
     /// picture and the B pictures coded after it, so that media reaches the
@@ -183,7 +246,7 @@ impl Session {
         service_id: Option<u16>,
         recovery_interval: Option<u32>,
         split_field_samples: Option<bool>,
-        passthrough: Option<bool>,
+        video: Option<String>,
         open_gop_recovery: Option<String>,
         split_groups: Option<bool>,
     ) -> Result<Session, JsError> {
@@ -203,6 +266,16 @@ impl Session {
             Some(ticks) => Some(ticks as u64),
             None => None,
         };
+        let video = match video.as_deref() {
+            None | Some("transcode") => VideoMode::Transcode,
+            Some("passthrough") => VideoMode::Passthrough,
+            Some("decode") => VideoMode::Decode,
+            Some(_) => {
+                return Err(JsError::new(
+                    "video must be 'transcode', 'passthrough' or 'decode'",
+                ))
+            }
+        };
         let open_gop_recovery = match open_gop_recovery.as_deref() {
             None | Some("idr") => OpenGopRecovery::Idr,
             Some("recovery-point") => OpenGopRecovery::RecoveryPoint,
@@ -221,11 +294,7 @@ impl Session {
                     open_gop_recovery,
                     split_field_samples: split_field_samples
                         .unwrap_or(defaults.split_field_samples),
-                    video: if passthrough.unwrap_or(false) {
-                        VideoMode::Passthrough
-                    } else {
-                        VideoMode::Transcode
-                    },
+                    video,
                     split_groups: split_groups.unwrap_or(defaults.split_groups),
                 },
                 origin,
@@ -447,6 +516,212 @@ impl Default for PictureEncoder {
     }
 }
 
+/// Decodes the `video` fragments of a session in decode mode.
+///
+/// Units go in in the order the session made them, each with `begin`, and
+/// their pictures come out one `next` at a time, so that a caller decides how
+/// much to decode and when:
+///
+/// ```js
+/// const decoder = new PictureDecoder();
+/// decoder.begin(unit);
+/// for (const picture of unit.pictures) {
+///   const info = decoder.next(true);
+///   if (info) decoder.copy(buffer.subarray(0, info.byteLength));
+/// }
+/// ```
+///
+/// References carry from one unit to the next. After `reset`, or a unit or
+/// picture that failed, nothing is decoded until a unit that opens with an
+/// intra picture; a B picture is decoded only with both references.
+#[wasm_bindgen]
+pub struct PictureDecoder {
+    inner: UnitDecoder,
+    /// The unit's bytes, copied out of the fragment into storage kept from
+    /// one unit to the next.
+    data: Vec<u8>,
+    /// Times of the unit's frames, as the fragment gave them.
+    timing: Vec<(f64, f64)>,
+    next: usize,
+    /// The picture `next` returned last, until `copy` or the next call.
+    shown: Option<DecodedFrame>,
+}
+
+#[wasm_bindgen]
+impl PictureDecoder {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self {
+            inner: UnitDecoder::new(),
+            data: Vec::new(),
+            timing: Vec::new(),
+            next: 0,
+            shown: None,
+        }
+    }
+
+    /// Forget the references, for a jump.
+    pub fn reset(&mut self) {
+        self.inner.reset();
+        self.timing.clear();
+        self.next = 0;
+        self.shown = None;
+    }
+
+    /// Take a `video` fragment and return how many frames it names. Throws
+    /// when the fragment is malformed or the unit does not parse.
+    pub fn begin(&mut self, unit: &VideoFragment) -> Result<u32, JsError> {
+        self.timing.clear();
+        self.next = 0;
+        self.shown = None;
+        let unit: &JsValue = unit;
+        let data: Uint8Array = get(unit, "data")?
+            .dyn_into()
+            .map_err(|_| JsError::new("a video fragment's data is a Uint8Array"))?;
+        let restart = get(unit, "restart")?
+            .as_bool()
+            .ok_or_else(|| JsError::new("a video fragment says whether it restarts"))?;
+        let pictures: Array = get(unit, "pictures")?
+            .dyn_into()
+            .map_err(|_| JsError::new("a video fragment's pictures are an array"))?;
+        let mut frames = Vec::with_capacity(pictures.length() as usize);
+        for item in pictures.iter() {
+            let picture = index(&get(&item, "picture")?)?;
+            let second_field = match get(&item, "secondField")? {
+                field if field.is_null() => None,
+                field => Some(index(&field)?),
+            };
+            frames.push((picture, second_field));
+            self.timing.push((
+                number(&get(&item, "time")?)?,
+                number(&get(&item, "duration")?)?,
+            ));
+        }
+        self.data.resize(data.length() as usize, 0);
+        data.copy_to(&mut self.data);
+        let count = self
+            .inner
+            .begin(&self.data, restart, frames)
+            .map_err(|error| {
+                self.timing.clear();
+                to_js_error(error)
+            })?;
+        Ok(count as u32)
+    }
+
+    /// Decode the unit's next frame. `show` is false for a picture needed
+    /// only as a reference. Returns the picture to show, or `undefined` when
+    /// there is none: not asked for, or skipped for want of references.
+    /// Throws on a picture the decoder refuses.
+    pub fn next(&mut self, show: bool) -> Result<Option<DecodedPictureInfoObject>, JsError> {
+        self.shown = None;
+        let Some(&(time, duration)) = self.timing.get(self.next) else {
+            return Err(JsError::new("the unit has no frames left to decode"));
+        };
+        self.next += 1;
+        let Some(shown) = self.inner.next(show).map_err(to_js_error)? else {
+            return Ok(None);
+        };
+        let frame = &shown.frame;
+        let info = frame.info();
+        let object = Object::new();
+        set(&object, "time", &time.into())?;
+        set(&object, "duration", &duration.into())?;
+        set(&object, "width", &(info.width as f64).into())?;
+        set(&object, "height", &(info.height as f64).into())?;
+        set(
+            &object,
+            "displayWidth",
+            &f64::from(shown.display_width).into(),
+        )?;
+        set(
+            &object,
+            "displayHeight",
+            &f64::from(shown.display_height).into(),
+        )?;
+        set(&object, "interlaced", &(!info.progressive_frame).into())?;
+        set(&object, "topFieldFirst", &info.top_field_first.into())?;
+        set(&object, "repeatFirstField", &info.repeat_first_field.into())?;
+        set(
+            &object,
+            "matrix",
+            &match shown.matrix {
+                YcbcrMatrix::Bt709 => "bt709",
+                YcbcrMatrix::Bt601 => "bt601",
+            }
+            .into(),
+        )?;
+        set(
+            &object,
+            "concealedMacroblocks",
+            &(info.concealed_macroblocks as f64).into(),
+        )?;
+        let planes = packed_planes(frame);
+        let last = planes[2];
+        set(
+            &object,
+            "byteLength",
+            &((last.offset + last.len) as f64).into(),
+        )?;
+        let layout = Array::new_with_length(3);
+        for (component, plane) in planes.iter().enumerate() {
+            let item = Object::new();
+            set(&item, "offset", &(plane.offset as f64).into())?;
+            set(&item, "stride", &(plane.stride as f64).into())?;
+            layout.set(component as u32, item.into());
+        }
+        set(&object, "planes", &layout.into())?;
+        self.shown = Some(shown.frame);
+        Ok(Some(JsValue::from(object).unchecked_into()))
+    }
+
+    /// Copy the planes of the picture `next` returned last into `target`,
+    /// which holds at least its `byteLength`.
+    pub fn copy(&self, target: &Uint8Array) -> Result<(), JsError> {
+        let Some(frame) = &self.shown else {
+            return Err(JsError::new("no decoded picture to copy"));
+        };
+        let planes = packed_planes(frame);
+        let last = planes[2];
+        if (target.length() as usize) < last.offset + last.len {
+            return Err(JsError::new("the target is smaller than the picture"));
+        }
+        for (component, plane) in planes.iter().enumerate() {
+            let start = plane.offset as u32;
+            target
+                .subarray(start, start + plane.len as u32)
+                .copy_from(&frame.plane(component).data[..plane.len]);
+        }
+        Ok(())
+    }
+}
+
+impl Default for PictureDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn get(object: &JsValue, key: &str) -> Result<JsValue, JsError> {
+    Reflect::get(object, &key.into())
+        .map_err(|_| JsError::new(&format!("could not read '{key}' of a video fragment")))
+}
+
+fn number(value: &JsValue) -> Result<f64, JsError> {
+    value
+        .as_f64()
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| JsError::new("a video picture's time and duration are numbers"))
+}
+
+fn index(value: &JsValue) -> Result<usize, JsError> {
+    value
+        .as_f64()
+        .filter(|value| value.fract() == 0.0 && (0.0..=u32::MAX as f64).contains(value))
+        .map(|value| value as usize)
+        .ok_or_else(|| JsError::new("a video picture's indices are integers"))
+}
+
 /// The last presentation timestamp in a slice of transport stream, in 90 kHz
 /// units, or `undefined` when it carries none.
 ///
@@ -538,6 +813,35 @@ fn to_js_fragment(fragment: Fragment) -> Result<JsValue, JsError> {
             }
             set(&object, "scans", &js_scans.into())?;
         }
+        Fragment::Video {
+            data,
+            start,
+            restart,
+            intra,
+            pictures,
+        } => {
+            set(&object, "kind", &"video".into())?;
+            set(&object, "data", &copy_out(&data))?;
+            set(&object, "start", &start.into())?;
+            set(&object, "restart", &restart.into())?;
+            set(&object, "intra", &intra.into())?;
+            let js_pictures = Array::new_with_length(pictures.len() as u32);
+            for (index, picture) in pictures.iter().enumerate() {
+                let item = Object::new();
+                set(&item, "picture", &(picture.picture as f64).into())?;
+                set(
+                    &item,
+                    "secondField",
+                    &picture
+                        .second_field
+                        .map_or(JsValue::NULL, |field| (field as f64).into()),
+                )?;
+                set(&item, "time", &picture.time.into())?;
+                set(&item, "duration", &picture.duration.into())?;
+                js_pictures.set(index as u32, item.into());
+            }
+            set(&object, "pictures", &js_pictures.into())?;
+        }
         Fragment::PrivateStream {
             stream_id,
             pid,
@@ -574,7 +878,15 @@ fn set(object: &Object, key: &str, value: &JsValue) -> Result<(), JsError> {
 }
 
 /// Every failure here is "this stream is not something we can handle", so the
-/// message is the whole of what a caller can act on.
+/// message is the whole of what a caller can act on -- except for a stream
+/// decode mode cannot play, which is named so that a caller can transcode it
+/// instead.
 fn to_js_error(error: mpeg2toh264::Error) -> JsError {
-    JsError::new(&error.to_string())
+    let js_error = JsError::new(&error.to_string());
+    if error.is_no_aac_audio() {
+        let value = JsValue::from(js_error.clone());
+        // Failing to name it leaves an ordinary error, which is still one.
+        let _ = Reflect::set(&value, &"name".into(), &"NoAacAudioError".into());
+    }
+    js_error
 }

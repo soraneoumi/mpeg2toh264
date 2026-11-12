@@ -8,7 +8,11 @@ import { createProgram, VERTEX_SHADER } from "./utils.js";
 export interface DecodedPicture {
   /** Presentation time of the picture's first field, in seconds on the media element's timeline. */
   timestamp: number;
-  /** How long the picture is presented, in seconds: two field periods, or three with a repeated first field. */
+  /**
+   * How long the picture is presented, in seconds: up to the timestamp of
+   * the picture after it, where one follows on. Normally two field periods.
+   * Its fields are spread evenly over it.
+   */
   duration: number;
   /** Visible luma size in samples. */
   width: number;

@@ -6,7 +6,8 @@
 //! returned: a frame picture, or the two field pictures of a frame. The
 //! caller chooses which pictures to decode. Frames come back in decode
 //! order; [`DisplayOrder`] puts them in display order. [`StreamDecoder`]
-//! does all of that for a whole elementary stream.
+//! does all of that for a whole elementary stream, and [`UnitDecoder`] for
+//! the units a decode-mode [`Session`](crate::Session) hands out.
 //!
 //! Damaged input never stops decoding. A macroblock is concealed when its
 //! slice failed to parse before reaching it, when no slice covered it, when
@@ -28,6 +29,7 @@ mod order;
 mod picture;
 mod quant;
 mod stream;
+mod unit;
 
 use std::sync::Arc;
 
@@ -38,6 +40,7 @@ use crate::mpeg2::headers::Picture;
 pub use frame::{DecodedFrame, FrameInfo, Plane};
 pub use order::DisplayOrder;
 pub use stream::{StreamDecoder, StreamStats};
+pub use unit::{packed_planes, PackedPlane, ShownFrame, UnitDecoder};
 
 use frame::FrameBuffer;
 use picture::{conceal, Params, References, Work};

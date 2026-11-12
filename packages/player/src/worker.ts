@@ -10,6 +10,10 @@
  * a seek abandons whatever leg is running and opens another one partway in,
  * with a session anchored to the same timeline, so what it produces belongs
  * where the viewer asked to be. See `Playback`.
+ *
+ * In decode mode the sink gets the sound alone, and the units of MPEG-2 wait
+ * in a `PictureSchedule` until the page asks for their pictures: what is read
+ * ahead is bounded by the sink as before, and decoding by the requests.
  */
 import { MseSink, ReadyGate, type FragmentSink } from "./mse.js";
 import {
@@ -27,6 +31,12 @@ import {
   type Services,
   type TimingMark,
 } from "./protocol.js";
+import {
+  PictureBuffers,
+  PictureSchedule,
+  shows,
+  type DecodeStep,
+} from "./pictures.js";
 import { defaultPoolSize, PicturePool } from "./pool.js";
 import {
   isRangeExhaustion,
@@ -41,8 +51,10 @@ import {
   firstTimestamp,
   lastTimestamp,
   loadWasm,
+  PictureDecoder,
   Transcoder,
   type Fragment,
+  type VideoFragment,
 } from "./transcoder.js";
 
 /** The presentation clock the timestamps in a transport stream are counted in. */
@@ -282,9 +294,19 @@ class Playback {
   #index: Sample[] = [];
   /** Observed GOPs and the program-table-safe byte that can reach them. */
   #restarts: Sample[] = [];
+  /** Decode mode's units and where decoding stands in them; null otherwise. */
+  readonly #pictures: PictureSchedule<VideoFragment> | null;
+  /** Made once the module is loaded, and kept across legs. */
+  #decoder: PictureDecoder | null = null;
+  readonly #buffers = new PictureBuffers();
+  #decodingPictures = false;
 
   constructor(command: LoadCommand) {
     this.#command = command;
+    this.#pictures =
+      command.video === "decode"
+        ? new PictureSchedule(command.keepBehindSeconds)
+        : null;
     const sink =
       command.sink === "worker"
         ? createWorkerSink(command)
@@ -328,6 +350,12 @@ class Playback {
     const leg = this.#nextLeg();
     const signal = this.#leg!.signal;
     this.#sink.reset();
+    if (this.#pictures) {
+      this.#pictures.clear();
+      this.#decoder?.reset();
+      // A sink on the page says so itself when it is reset.
+      if (this.#mseSink) post({ type: "reset", id: this.#command.id });
+    }
     if (this.#command.encodedVideo && this.#command.sink === "worker")
       post({ type: "video-data", id: this.#command.id, data: null });
     const restart = this.#restartBefore(time);
@@ -454,6 +482,106 @@ class Playback {
 
   setCurrentTime(currentTime: number): void {
     this.#mseSink?.setCurrentTime(currentTime);
+    this.#pictures?.playhead(currentTime);
+  }
+
+  /** The page wants the pictures from `from` to `until`. */
+  need(epoch: number, from: number, until: number): void {
+    if (!this.#pictures) throw new Error("this load does not decode pictures");
+    if (
+      !Number.isSafeInteger(epoch) ||
+      !Number.isFinite(from) ||
+      !Number.isFinite(until) ||
+      until < from
+    )
+      throw new TypeError(`invalid picture request ${epoch}: ${from}-${until}`);
+    if (!this.#pictures.need(epoch, from, until)) return;
+    // The sound is still buffered there but the units are gone: read the
+    // input again, as for a seek the buffer does not reach.
+    if (this.#pictures.dropped(from)) void this.seek(from);
+    else void this.#decodePictures();
+  }
+
+  /** A picture's buffer is back from the page. */
+  recycle(data: unknown): void {
+    this.#buffers.recycle(data);
+  }
+
+  /**
+   * Decode what the last request reaches, one unit per task so that reading
+   * the input goes on in between. Whatever is waiting comes back here: a
+   * request, a unit, the end of the input.
+   */
+  async #decodePictures(): Promise<void> {
+    const schedule = this.#pictures;
+    if (!schedule || this.#decodingPictures) return;
+    this.#decodingPictures = true;
+    try {
+      for (;;) {
+        const step = schedule.next();
+        if (step === null) break;
+        this.#decodeStep(step);
+        await breathe();
+        if (this.#life.signal.aborted) return;
+      }
+      const epoch = schedule.takeEnd();
+      if (epoch !== null)
+        post({ type: "pictures-end", id: this.#command.id, epoch });
+    } finally {
+      this.#decodingPictures = false;
+    }
+  }
+
+  /**
+   * Decode one unit and send its pictures. A unit that fails is counted and
+   * passed over; decoding takes up again at the next one it can begin at.
+   */
+  #decodeStep(step: DecodeStep<VideoFragment>): void {
+    const decoder = this.#decoder!;
+    const id = this.#command.id;
+    const started = performance.now();
+    let pictures = 0;
+    let failures = 0;
+    try {
+      if (step.reset) decoder.reset();
+      decoder.begin(step.unit);
+      for (const picture of step.unit.pictures) {
+        const info = decoder.next(shows(picture, step.from));
+        if (info === undefined) continue;
+        const data = this.#buffers.take(info.byteLength);
+        decoder.copy(new Uint8Array(data));
+        post(
+          {
+            type: "picture",
+            id,
+            epoch: step.epoch,
+            picture: {
+              timestamp: info.time,
+              duration: info.duration,
+              width: info.width,
+              height: info.height,
+              displayWidth: info.displayWidth,
+              displayHeight: info.displayHeight,
+              data,
+              planes: info.planes,
+              interlaced: info.interlaced,
+              topFieldFirst: info.topFieldFirst,
+              repeatFirstField: info.repeatFirstField,
+              matrix: info.matrix,
+            },
+          },
+          [data],
+        );
+        pictures++;
+      }
+    } catch {
+      this.#pictures!.failed();
+      failures++;
+    }
+    const converter = this.#transcoder;
+    if (!converter) return;
+    converter.countDecoded(pictures, performance.now() - started, failures);
+    this.#report(converter);
   }
 
   /** Drop everything this load holds. */
@@ -467,6 +595,9 @@ class Playback {
     this.#pool?.terminate();
     this.#pool = null;
     this.#private = [];
+    this.#pictures?.clear();
+    this.#decoder?.free();
+    this.#decoder = null;
     this.#sink.close();
   }
 
@@ -568,7 +699,9 @@ class Playback {
       const module = await loadWasm(this.#command.wasmUrl);
       if (!this.#running(leg)) return;
       mark(id, "wasm");
-      await this.#openPool(module);
+      // Nothing is converted in decode mode, so there is no pool.
+      if (this.#pictures) this.#decoder ??= new PictureDecoder();
+      else await this.#openPool(module);
       if (!this.#running(leg)) return;
       let source: Source;
       try {
@@ -600,7 +733,7 @@ class Playback {
         this.#origin,
         this.#command.serviceId,
         this.#command.splitFieldSamples,
-        this.#command.passthrough,
+        this.#command.video,
         this.#command.openGopRecovery,
         // Live input: send small fragments so media reaches the buffer
         // without waiting for its whole group of pictures.
@@ -620,7 +753,10 @@ class Playback {
       await this.#convert(leg, source, converter);
     } catch (error) {
       if (!this.#running(leg) || signal.aborted) return;
-      post({ type: "error", id: this.#command.id, message: describe(error) });
+      if (error instanceof Error && error.name === "NoAacAudioError")
+        post({ type: "no-aac-audio", id: this.#command.id });
+      else
+        post({ type: "error", id: this.#command.id, message: describe(error) });
       abandon();
     }
   }
@@ -788,9 +924,15 @@ class Playback {
     this.#place(converter);
     if (!(await this.#deliver(leg, final))) return;
     this.#report(converter);
+    if (this.#pictures) {
+      this.#pictures.end();
+      void this.#decodePictures();
+    }
     await this.#sink.finish();
     if (!this.#running(leg)) return;
     post({ type: "completed", id });
+    // Decoding goes on after the input ends, and counts itself here.
+    if (this.#pictures) return;
     converter.free();
     this.#transcoder = null;
   }
@@ -836,12 +978,16 @@ class Playback {
           fragment.start,
           fragment.randomAccess,
         );
+      } else if (fragment.kind === "video") {
+        // Only decode mode makes these.
+        this.#pictures!.add(fragment);
       } else if (fragment.pts === null || this.#origin !== null) {
         this.#postPrivate(fragment);
       } else {
         this.#private.push(fragment);
       }
     }
+    if (this.#pictures) void this.#decodePictures();
     return true;
   }
 
@@ -1015,6 +1161,12 @@ self.onmessage = (event: MessageEvent<Command>) => {
       break;
     case "audio":
       playback?.selectAudio(command.pid, command.dualMonoSub);
+      break;
+    case "need":
+      playback?.need(command.epoch, command.from, command.until);
+      break;
+    case "recycle":
+      playback?.recycle(command.data);
       break;
   }
 };

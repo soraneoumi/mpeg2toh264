@@ -8,15 +8,21 @@
 import init, {
   firstTimestamp as wasmFirstTimestamp,
   lastTimestamp as wasmLastTimestamp,
+  PictureDecoder,
   Session,
   type AudioStream,
+  type DecodedPictureInfo,
   type Fragment,
   type Progress,
 } from "../wasm/mpeg2toh264_wasm.js";
 import type { PicturePool } from "./pool.js";
-import type { Stats } from "./protocol.js";
+import type { Stats, VideoMode } from "./protocol.js";
 
-export type { AudioStream, Fragment };
+export { PictureDecoder };
+export type { AudioStream, DecodedPictureInfo, Fragment };
+
+/** A unit of MPEG-2 handed out in decode mode. */
+export type VideoFragment = Extract<Fragment, { kind: "video" }>;
 
 /** Where the `.wasm` sits relative to this module, when no caller says. */
 const DEFAULT_WASM_URL = new URL(
@@ -78,6 +84,11 @@ export function firstTimestamp(data: Uint8Array): number | null {
 export class Transcoder {
   #session: Session;
   #pool: PicturePool | null = null;
+  /** Whether the pictures are decoded elsewhere; see `countDecoded`. */
+  readonly #decode: boolean;
+  /** The session's own time in decode mode, which the rates leave out. */
+  #intervalSessionMs = 0;
+  #decodeFailures = 0;
   #totalMs = 0;
   #totalFrames = 0;
   #intervalMs = 0;
@@ -93,8 +104,7 @@ export class Transcoder {
    * `serviceId` takes one named service out of a transport stream carrying
    * several; null takes the first that turns up with a picture in it.
    *
-   * `passthrough` carries the MPEG-2 video into the MP4 as it stands rather
-   * than converting it, for a browser whose decoder takes MPEG-2.
+   * `video` is what becomes of the pictures; see `VideoMode`.
    *
    * `splitGroups` makes a fragment of each anchor picture and the B pictures
    * coded after it, instead of one of each whole group of pictures, so that
@@ -106,18 +116,19 @@ export class Transcoder {
     originTicks: number | null,
     serviceId: number | null,
     splitFieldSamples: boolean | undefined,
-    passthrough = false,
+    video: VideoMode = "transcode",
     openGopRecovery:
       "idr" | "recovery-point" | "discard" | undefined = undefined,
     splitGroups = false,
   ) {
+    this.#decode = video === "decode";
     this.#session = new Session(
       oversample,
       originTicks,
       serviceId,
       recoveryInterval,
       splitFieldSamples,
-      passthrough,
+      video,
       openGopRecovery,
       splitGroups,
     );
@@ -225,6 +236,19 @@ export class Transcoder {
     return fragments;
   }
 
+  /**
+   * Count pictures decoded in decode mode, the time it took and the units
+   * that failed: these are what the rates and the errors describe there.
+   */
+  countDecoded(pictures: number, ms: number, failures: number): void {
+    this.#decodeFailures += failures;
+    this.#totalMs += ms;
+    this.#intervalMs += ms;
+    this.#videoFrames += pictures;
+    this.#totalFrames += pictures;
+    this.#intervalFrames += pictures;
+  }
+
   /** Rust memory, so dropping the reference would not be enough. */
   free(): void {
     this.#session.free();
@@ -245,14 +269,15 @@ export class Transcoder {
       totalFps: (this.#totalFrames * 1000) / this.#totalMs,
       videoFrames: this.#videoFrames,
       audioFrames: this.#audioFrames,
-      convertingMs: this.#intervalMs,
+      convertingMs: this.#intervalMs + this.#intervalSessionMs,
       readingMs: loop.readingMs,
       waitingMs: loop.waitingMs,
       dropped: this.#session.dropped,
       scrambled: this.#session.scrambled,
-      errors: this.#session.errors,
+      errors: this.#session.errors + this.#decodeFailures,
     };
     this.#intervalMs = 0;
+    this.#intervalSessionMs = 0;
     this.#intervalFrames = 0;
     return stats;
   }
@@ -261,8 +286,11 @@ export class Transcoder {
     const started = performance.now();
     const fragments = run();
     const elapsed = performance.now() - started;
-    this.#totalMs += elapsed;
-    this.#intervalMs += elapsed;
+    if (this.#decode) this.#intervalSessionMs += elapsed;
+    else {
+      this.#totalMs += elapsed;
+      this.#intervalMs += elapsed;
+    }
     this.#account(fragments);
     return fragments;
   }

@@ -14,12 +14,13 @@ use crate::container::adts::{
     DualMono, AAC_FRAME_SAMPLES,
 };
 use crate::container::fmp4::{
-    h264_gop_to_fmp4, mpeg2_fragment_duration, mpeg2_gop_to_fmp4, timed_mpeg2_unit,
-    Fmp4AudioSamples, Fmp4Fragment, Mpeg2VideoTimeline, TimedUnit, UnitLeadIn,
+    h264_gop_to_fmp4, mpeg2_decode_unit_to_fmp4, mpeg2_fragment_duration, mpeg2_gop_to_fmp4,
+    timed_mpeg2_unit, Fmp4AudioSamples, Fmp4Fragment, Mpeg2VideoTimeline, PicturePresentation,
+    TimedUnit, UnitLeadIn,
 };
 use crate::container::mpegts::{AudioStream, ElementaryKind, ElementaryPacket, MpegTsAvDemuxer};
 use crate::container::rff::RffState;
-use crate::error::{bail, Result};
+use crate::error::{bail, Error, Result};
 use crate::job::PictureOutput;
 use crate::mpeg2::gop_stream::{Mpeg2Gop, Mpeg2GopStream};
 use crate::mpeg2::headers::{stream_sequence_description, Interlacing, SequenceDescription};
@@ -96,6 +97,24 @@ pub enum Fragment {
         /// Picture-accurate field changes in presentation order.
         scans: Vec<VideoScan>,
     },
+    /// One unit of MPEG-2 for the caller to decode, in decode mode only. It
+    /// follows the `Media` fragment carrying the same unit's sound, where
+    /// the unit has any.
+    Video {
+        /// The unit's elementary stream, which `parse_elementary_stream`
+        /// splits into the pictures named below.
+        data: Vec<u8>,
+        /// Where the unit starts on the presentation timeline, in seconds:
+        /// the `start` of its `Media` fragment.
+        start: f64,
+        /// References decoded before this unit must not be used.
+        restart: bool,
+        /// Whether the unit opens with an intra picture, where decoding can
+        /// begin after a jump.
+        intra: bool,
+        /// The pictures to decode, in decode order.
+        pictures: Vec<VideoPicture>,
+    },
     /// A private PES payload selected from the same service as the media.
     /// It is kept out of fMP4 and exposed to browser consumers as an event.
     PrivateStream {
@@ -108,6 +127,21 @@ pub enum Fragment {
     },
 }
 
+/// One coded frame of a [`Fragment::Video`] unit.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct VideoPicture {
+    /// Index of the frame picture, or of the first field, in the pictures
+    /// `parse_elementary_stream` returns for the unit.
+    pub picture: usize,
+    /// Index of the second field, for a frame coded as two fields.
+    pub second_field: Option<usize>,
+    /// Presentation time in seconds, where the sample would sit in the MP4
+    /// the other modes make.
+    pub time: f64,
+    /// How long it is shown, in seconds.
+    pub duration: f64,
+}
+
 /// What the video of one unit turns into, and what the muxer needs to know
 /// about it.
 ///
@@ -116,17 +150,18 @@ pub enum Fragment {
 /// crate's, and is otherwise the same walk -- so the timeline underneath is the
 /// same. They differ in what covers the display slots of an open GOP's leading
 /// pictures where a fragment opens the presentation: the transcoder puts an
-/// extra copy of its IDR there, and passthrough simply shows its first picture
-/// for longer.
+/// extra copy of its IDR there, and passthrough and decoding simply show the
+/// first picture for longer.
 enum UnitPlan {
     Transcode(TimedUnit),
     Passthrough(TimedUnit),
+    Decode(TimedUnit),
 }
 
 impl UnitPlan {
     fn timed(&self) -> &TimedUnit {
         match self {
-            Self::Transcode(unit) | Self::Passthrough(unit) => unit,
+            Self::Transcode(unit) | Self::Passthrough(unit) | Self::Decode(unit) => unit,
         }
     }
 
@@ -136,7 +171,9 @@ impl UnitPlan {
 
     fn timeline_mut(&mut self) -> &mut Mpeg2VideoTimeline {
         match self {
-            Self::Transcode(unit) | Self::Passthrough(unit) => &mut unit.unit.timeline,
+            Self::Transcode(unit) | Self::Passthrough(unit) | Self::Decode(unit) => {
+                &mut unit.unit.timeline
+            }
         }
     }
 
@@ -144,7 +181,7 @@ impl UnitPlan {
         match (self, starts_at_idr) {
             (_, false) => UnitLeadIn::None,
             (Self::Transcode(_), true) => UnitLeadIn::IdrClone,
-            (Self::Passthrough(_), true) => UnitLeadIn::FirstPicture,
+            (Self::Passthrough(_) | Self::Decode(_), true) => UnitLeadIn::FirstPicture,
         }
     }
 }
@@ -177,6 +214,17 @@ struct Ready {
     /// The display slots of its group that went out before it, which the plan
     /// was drawn knowing and the transcoder has to be told as well.
     consumed: u32,
+}
+
+/// What packaging one unit made.
+struct Packaged {
+    fragment: Fmp4Fragment,
+    /// Whether the fragment carries a recovery point.
+    recovery_point: bool,
+    lag: UnitLag,
+    /// Where the pictures handed out for decoding are presented. Empty on
+    /// the paths that mux the video.
+    pictures: Vec<PicturePresentation>,
 }
 
 /// How a unit sits against the display clock of its group, worked out from the
@@ -233,6 +281,11 @@ enum VideoPipeline {
         recovery_pending: bool,
         split_field_samples: bool,
     },
+    /// Handed out for the caller to decode, with only the sound muxed.
+    Decode {
+        /// As for passthrough: nothing is kept until an intra picture.
+        awaiting_intra: bool,
+    },
 }
 
 impl VideoPipeline {
@@ -241,7 +294,9 @@ impl VideoPipeline {
     fn awaiting_random_access(&self) -> bool {
         match self {
             Self::Transcode(transcoder) => transcoder.awaiting_random_access(),
-            Self::Passthrough { awaiting_intra, .. } => *awaiting_intra,
+            Self::Passthrough { awaiting_intra, .. } | Self::Decode { awaiting_intra } => {
+                *awaiting_intra
+            }
         }
     }
 
@@ -251,6 +306,8 @@ impl VideoPipeline {
             Self::Passthrough {
                 recovery_pending, ..
             } => *recovery_pending = true,
+            // No video track, so no sample to mark.
+            Self::Decode { .. } => {}
         }
     }
 
@@ -269,7 +326,9 @@ impl VideoPipeline {
     fn request_random_access(&mut self) {
         match self {
             Self::Transcode(transcoder) => transcoder.request_random_access_point(),
-            Self::Passthrough { awaiting_intra, .. } => *awaiting_intra = true,
+            Self::Passthrough { awaiting_intra, .. } | Self::Decode { awaiting_intra } => {
+                *awaiting_intra = true
+            }
         }
     }
 
@@ -277,13 +336,13 @@ impl VideoPipeline {
     /// what they say has changed, so the fragment it becomes carries an
     /// initialization segment.
     ///
-    /// Only the transcoding path has to be told. The passthrough one is asked
-    /// for the segment directly, since every unit it carries opens with the
-    /// sequence header the segment would be built from.
+    /// Only the transcoding path has to be told. The other two are asked for
+    /// the segment directly, since every unit they carry opens with the
+    /// sequence header a video description would be built from.
     fn describe_again(&mut self) {
         match self {
             Self::Transcode(transcoder) => transcoder.request_description(),
-            Self::Passthrough { .. } => {}
+            Self::Passthrough { .. } | Self::Decode { .. } => {}
         }
     }
 
@@ -294,6 +353,8 @@ impl VideoPipeline {
                 split_field_samples,
                 ..
             } => *split_field_samples,
+            // A pair is one picture to whoever decodes it.
+            Self::Decode { .. } => false,
         }
     }
 
@@ -301,7 +362,7 @@ impl VideoPipeline {
         match self {
             Self::Transcode(transcoder) => transcoder.errors(),
             // Nothing is decoded here, so nothing malformed is found.
-            Self::Passthrough { .. } => 0,
+            Self::Passthrough { .. } | Self::Decode { .. } => 0,
         }
     }
 }
@@ -497,7 +558,11 @@ impl Session {
     pub fn anchored(options: TranscodeOptions, origin_ticks: Option<u64>) -> Self {
         Self {
             demuxer: MpegTsAvDemuxer::new(),
-            gops: Mpeg2GopStream::with_split_groups(options.split_groups),
+            // A player decoding the pictures itself takes each as soon as it
+            // has arrived.
+            gops: Mpeg2GopStream::with_split_groups(
+                options.split_groups || options.video == VideoMode::Decode,
+            ),
             adts: AdtsStream::new(),
             video: match options.video {
                 VideoMode::Transcode => {
@@ -507,6 +572,9 @@ impl Session {
                     awaiting_intra: true,
                     recovery_pending: false,
                     split_field_samples: options.split_field_samples,
+                },
+                VideoMode::Decode => VideoPipeline::Decode {
+                    awaiting_intra: true,
                 },
             },
             recovery_point_gop_interval: options.recovery_interval,
@@ -609,7 +677,7 @@ impl Session {
             bail!("no pictures were asked for");
         };
         let VideoPipeline::Transcode(transcoder) = &mut self.video else {
-            bail!("the passthrough pipeline converts no pictures");
+            bail!("only the transcoding pipeline converts pictures");
         };
         match transcoder.complete(&converting.gop.data, outputs)? {
             Step::Again(jobs) => {
@@ -674,8 +742,8 @@ impl Session {
     fn advance(&mut self, final_flush: bool, mut out: Vec<Fragment>) -> Result<Progress> {
         while let Some(ready) = self.take_ready(final_flush)? {
             let VideoPipeline::Transcode(transcoder) = &mut self.video else {
-                // Passthrough codes nothing, so there is never anything to wait
-                // for and the unit goes out as it stands.
+                // Nothing else codes pictures, so there is never anything to
+                // wait for and the unit goes out as it stands.
                 self.finish_gop(ready, None, &mut out)?;
                 continue;
             };
@@ -973,6 +1041,7 @@ impl Session {
         match self.video {
             VideoPipeline::Transcode(_) => UnitPlan::Transcode(timed),
             VideoPipeline::Passthrough { .. } => UnitPlan::Passthrough(timed),
+            VideoPipeline::Decode { .. } => UnitPlan::Decode(timed),
         }
     }
 
@@ -1162,6 +1231,10 @@ impl Session {
             if self.pending_gops.is_empty() {
                 return Ok(None);
             }
+            // The sound is the clock decoded pictures are shown by.
+            if matches!(self.video, VideoPipeline::Decode { .. }) {
+                return Err(Error::no_aac_audio());
+            }
             let gop = self.pending_gops.remove(0);
             self.note_description(&gop);
             let mut plan = self.plan_unit(&gop, self.starts_at_idr(&gop))?;
@@ -1323,13 +1396,13 @@ impl Session {
         out: &mut Vec<Fragment>,
     ) -> Result<()> {
         let Ready {
-            gop,
+            gop: unit,
             audio: audio_frames,
             plan,
             starts_at_idr,
             consumed,
         } = ready;
-        let gop = &gop;
+        let gop = &unit;
         self.align_timelines(gop, &plan);
 
         let config = audio_frames
@@ -1344,7 +1417,12 @@ impl Session {
                 .collect(),
             base_decode_time: self.audio_base_decode_time(config.sample_rate),
         });
-        let (fragment, recovery_point, lag) = self.package(
+        let Packaged {
+            fragment,
+            recovery_point,
+            lag,
+            pictures,
+        } = self.package(
             gop,
             &plan,
             starts_at_idr,
@@ -1367,7 +1445,7 @@ impl Session {
         // group ends with one, and there is nothing in it for a SourceBuffer to
         // play. The transcoder has already seen it, which is what the unit was
         // worth.
-        if fragment.sample_count == 0 && audio_frames.is_empty() {
+        if fragment.sample_count == 0 && audio_frames.is_empty() && pictures.is_empty() {
             return Ok(());
         }
         // Aligning can still move the origin, so read the start after it.
@@ -1429,7 +1507,9 @@ impl Session {
                 height: description.map_or(0, |description| description.height),
             });
         }
-        let random_access = starts_at_idr || recovery_point;
+        let decode = matches!(plan, UnitPlan::Decode(_));
+        // Sound alone: every fragment is somewhere a decoder can begin.
+        let random_access = starts_at_idr || recovery_point || decode;
         if random_access {
             self.media_bytes_since_random_access = fragment.media_segment.len();
         } else {
@@ -1437,15 +1517,46 @@ impl Session {
                 .media_bytes_since_random_access
                 .saturating_add(fragment.media_segment.len());
         }
-        out.push(Fragment::Media {
-            data: fragment.media_segment,
-            start,
-            random_access,
-            restart_offset: gop.restart_offset.filter(|_| !gop.continues_group),
-            video_samples: fragment.sample_count,
-            audio_samples: audio_frames.len(),
-            scans,
-        });
+        let restart_offset = gop.restart_offset.filter(|_| !gop.continues_group);
+        // In decode mode the pictures go out on their own, and a unit with no
+        // sound has nothing for the media element.
+        if !decode || !audio_frames.is_empty() {
+            out.push(Fragment::Media {
+                data: fragment.media_segment,
+                start,
+                random_access,
+                restart_offset,
+                video_samples: fragment.sample_count,
+                audio_samples: audio_frames.len(),
+                scans: if decode { Vec::new() } else { scans },
+            });
+        }
+        if !pictures.is_empty() {
+            let intra = plan
+                .timed()
+                .unit
+                .samples
+                .first()
+                .is_some_and(|sample| sample.sync);
+            // A unit with no sound can go out before the initialization
+            // segment does, and its pictures fix the origin all the same.
+            self.initialized = true;
+            out.push(Fragment::Video {
+                data: unit.data,
+                start,
+                restart: starts_at_idr,
+                intra,
+                pictures: pictures
+                    .iter()
+                    .map(|picture| VideoPicture {
+                        picture: picture.picture,
+                        second_field: picture.field_pair.then_some(picture.picture + 1),
+                        time: picture.time as f64 / TIMESCALE as f64,
+                        duration: f64::from(picture.duration) / TIMESCALE as f64,
+                    })
+                    .collect(),
+            });
+        }
         Ok(())
     }
 
@@ -1462,7 +1573,7 @@ impl Session {
         audio: Option<&AacConfig>,
         audio_track: Option<&Fmp4AudioSamples>,
         converted: Option<TranscodeResult>,
-    ) -> Result<(Fmp4Fragment, bool, UnitLag)> {
+    ) -> Result<Packaged> {
         match (&mut self.video, plan) {
             (VideoPipeline::Transcode(transcoder), UnitPlan::Transcode(timed)) => {
                 let timeline = &timed.unit.timeline;
@@ -1503,7 +1614,12 @@ impl Session {
                     audio,
                     audio_track,
                 )?;
-                Ok((fragment, h264.recovery_point, lag))
+                Ok(Packaged {
+                    fragment,
+                    recovery_point: h264.recovery_point,
+                    lag,
+                    pictures: Vec::new(),
+                })
             }
             (
                 VideoPipeline::Passthrough {
@@ -1538,7 +1654,31 @@ impl Session {
                     audio,
                     audio_track,
                 )?;
-                Ok((fragment, recovery_point, lag))
+                Ok(Packaged {
+                    fragment,
+                    recovery_point,
+                    lag,
+                    pictures: Vec::new(),
+                })
+            }
+            (VideoPipeline::Decode { awaiting_intra }, UnitPlan::Decode(timed)) => {
+                let unit = &timed.unit;
+                let lag = Self::unit_lag(self.group_lag, gop, starts_at_idr, timed);
+                *awaiting_intra &= unit.samples.is_empty();
+                let (fragment, pictures) = mpeg2_decode_unit_to_fmp4(
+                    unit,
+                    self.sequence_number,
+                    self.video_presentation_start,
+                    plan.lead_in(starts_at_idr),
+                    self.describe_pending,
+                    audio_track,
+                );
+                Ok(Packaged {
+                    fragment,
+                    recovery_point: false,
+                    lag,
+                    pictures,
+                })
             }
             // The pipeline is chosen once, at construction, and the plan is
             // made by it.

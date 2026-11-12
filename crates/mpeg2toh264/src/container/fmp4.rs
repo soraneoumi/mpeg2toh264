@@ -386,6 +386,9 @@ pub fn complementary_field<'a>(
 /// which is what makes a sample that opens a fragment decodable on its own.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Mpeg2Sample {
+    /// Index of the picture in what `parse_elementary_stream` returns for the
+    /// unit. The second field of a pair is the picture after it.
+    pub picture: usize,
     pub start: usize,
     /// Where the first field of a complementary pair ends, when this picture is
     /// one. A caller splitting field samples cuts here; one that is not ignores
@@ -672,6 +675,7 @@ pub(crate) fn timed_mpeg2_unit(
         sample_scans.push(interlacing);
         field_pairs.push(mate.is_some());
         samples.push(Mpeg2Sample {
+            picture: source_index,
             start,
             field_end,
             end: sample_start,
@@ -1180,15 +1184,8 @@ fn make_init_segment(
         body.ascii("isom").u32(0x200).ascii("isomiso6mp41avc1");
         boxed("ftyp", &body.into_vec())
     };
-    let mvhd = {
-        let mut body = Buf::new();
-        body.u32(0).u32(0).u32(TIMESCALE).u32(0);
-        body.u32(0x0001_0000).u16(0x0100).u16(0).zeros(8);
-        identity_matrix(&mut body);
-        // next_track_ID, past every track this movie declares.
-        body.zeros(24).u32(if audio.is_some() { 3 } else { 2 });
-        full_box("mvhd", 0, 0, &body.into_vec())
-    };
+    // next_track_ID, past every track this movie declares.
+    let mvhd = make_mvhd(if audio.is_some() { 3 } else { 2 });
     let tkhd = {
         let mut body = Buf::new();
         body.u32(0).u32(0).u32(1).u32(0).u32(0).zeros(8);
@@ -1213,13 +1210,7 @@ fn make_init_segment(
         body.u16(0).u16(0).u16(0).u16(0);
         full_box("vmhd", 0, 1, &body.into_vec())
     };
-    let url = full_box("url ", 0, 1, &[]);
-    let dref = {
-        let mut body = Buf::new();
-        body.u32(1).bytes(&url);
-        full_box("dref", 0, 0, &body.into_vec())
-    };
-    let dinf = boxed("dinf", &dref);
+    let dinf = make_dinf();
     let sample_entry = {
         let mut body = Buf::new();
         body.zeros(6).u16(1).zeros(16);
@@ -1267,80 +1258,16 @@ fn make_init_segment(
 
     let (audio_trak, audio_trex) = match audio {
         None => (Vec::new(), Vec::new()),
-        Some(audio) => {
-            let audio_tkhd = {
-                let mut body = Buf::new();
-                body.u32(0).u32(0).u32(2).u32(0).u32(0).zeros(8);
-                // Full volume, and no width or height: this track has no picture.
-                body.u16(0).u16(0).u16(0x0100).u16(0);
-                identity_matrix(&mut body);
-                body.u32(0).u32(0);
-                full_box("tkhd", 0, 7, &body.into_vec())
-            };
-            let audio_mdhd = {
-                let mut body = Buf::new();
-                body.u32(0)
-                    .u32(0)
-                    .u32(audio.sample_rate)
-                    .u32(0)
-                    .u16(0x55c4)
-                    .u16(0);
-                full_box("mdhd", 0, 0, &body.into_vec())
-            };
-            let audio_hdlr = {
-                let mut body = Buf::new();
-                body.u32(0).ascii("soun").zeros(12).ascii("SoundHandler\0");
-                full_box("hdlr", 0, 0, &body.into_vec())
-            };
-            let smhd = {
-                let mut body = Buf::new();
-                body.u16(0).u16(0);
-                full_box("smhd", 0, 0, &body.into_vec())
-            };
-            let mp4a = {
-                let mut body = Buf::new();
-                body.zeros(6).u16(1).zeros(8);
-                body.u16(audio.channel_count as u16).u16(16);
-                body.u16(0)
-                    .u16(0)
-                    .u32(fixed16_16(audio.sample_rate))
-                    .bytes(&make_esds(
-                        2,
-                        OTI_MPEG4_AUDIO,
-                        STREAM_TYPE_AUDIO,
-                        &audio.audio_specific_config,
-                    ));
-                boxed("mp4a", &body.into_vec())
-            };
-            let audio_stsd = {
-                let mut body = Buf::new();
-                body.u32(1).bytes(&mp4a);
-                full_box("stsd", 0, 0, &body.into_vec())
-            };
-            let audio_stbl = boxed(
-                "stbl",
-                &concat(&[
-                    &audio_stsd,
-                    &full_box("stts", 0, 0, &empty_count.0),
-                    &full_box("stsc", 0, 0, &empty_count.0),
-                    &full_box("stsz", 0, 0, &empty_pair.0),
-                    &full_box("stco", 0, 0, &empty_count.0),
-                ]),
-            );
-            let audio_minf = boxed("minf", &concat(&[&smhd, &dinf, &audio_stbl]));
-            let audio_mdia = boxed("mdia", &concat(&[&audio_mdhd, &audio_hdlr, &audio_minf]));
-            let mut trex_body = Buf::new();
-            trex_body.u32(2).u32(1).u32(0).u32(0).u32(0);
-            (
-                boxed("trak", &concat(&[&audio_tkhd, &audio_mdia])),
-                full_box("trex", 0, 0, &trex_body.into_vec()),
-            )
-        }
+        Some(audio) => make_audio_track(audio, &dinf),
     };
 
     let mvex = boxed("mvex", &concat(&[&trex, &audio_trex]));
     let moov = boxed("moov", &concat(&[&mvhd, &trak, &audio_trak, &mvex]));
-    let audio_codec = if audio.is_some() { ",mp4a.40.2" } else { "" };
+    let audio_codec = if audio.is_some() {
+        format!(",{AAC_CODECS_PARAMETER}")
+    } else {
+        String::new()
+    };
     Ok((
         concat(&[&ftyp, &moov]),
         format!(
@@ -1348,6 +1275,119 @@ fn make_init_segment(
             video.codecs_parameter()
         ),
     ))
+}
+
+/// What the codecs parameter of a MIME type calls AAC-LC (RFC 6381).
+const AAC_CODECS_PARAMETER: &str = "mp4a.40.2";
+
+fn make_mvhd(next_track_id: u32) -> Vec<u8> {
+    let mut body = Buf::new();
+    body.u32(0).u32(0).u32(TIMESCALE).u32(0);
+    body.u32(0x0001_0000).u16(0x0100).u16(0).zeros(8);
+    identity_matrix(&mut body);
+    body.zeros(24).u32(next_track_id);
+    full_box("mvhd", 0, 0, &body.into_vec())
+}
+
+fn make_dinf() -> Vec<u8> {
+    let url = full_box("url ", 0, 1, &[]);
+    let mut body = Buf::new();
+    body.u32(1).bytes(&url);
+    boxed("dinf", &full_box("dref", 0, 0, &body.into_vec()))
+}
+
+/// The sound's `trak` and `trex`. It is track 2 whether or not a video track
+/// sits beside it.
+fn make_audio_track(audio: &AacConfig, dinf: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut empty_count = Buf::new();
+    empty_count.u32(0);
+    let mut empty_pair = Buf::new();
+    empty_pair.u32(0).u32(0);
+    let audio_tkhd = {
+        let mut body = Buf::new();
+        body.u32(0).u32(0).u32(2).u32(0).u32(0).zeros(8);
+        // Full volume, and no width or height: this track has no picture.
+        body.u16(0).u16(0).u16(0x0100).u16(0);
+        identity_matrix(&mut body);
+        body.u32(0).u32(0);
+        full_box("tkhd", 0, 7, &body.into_vec())
+    };
+    let audio_mdhd = {
+        let mut body = Buf::new();
+        body.u32(0)
+            .u32(0)
+            .u32(audio.sample_rate)
+            .u32(0)
+            .u16(0x55c4)
+            .u16(0);
+        full_box("mdhd", 0, 0, &body.into_vec())
+    };
+    let audio_hdlr = {
+        let mut body = Buf::new();
+        body.u32(0).ascii("soun").zeros(12).ascii("SoundHandler\0");
+        full_box("hdlr", 0, 0, &body.into_vec())
+    };
+    let smhd = {
+        let mut body = Buf::new();
+        body.u16(0).u16(0);
+        full_box("smhd", 0, 0, &body.into_vec())
+    };
+    let mp4a = {
+        let mut body = Buf::new();
+        body.zeros(6).u16(1).zeros(8);
+        body.u16(audio.channel_count as u16).u16(16);
+        body.u16(0)
+            .u16(0)
+            .u32(fixed16_16(audio.sample_rate))
+            .bytes(&make_esds(
+                2,
+                OTI_MPEG4_AUDIO,
+                STREAM_TYPE_AUDIO,
+                &audio.audio_specific_config,
+            ));
+        boxed("mp4a", &body.into_vec())
+    };
+    let audio_stsd = {
+        let mut body = Buf::new();
+        body.u32(1).bytes(&mp4a);
+        full_box("stsd", 0, 0, &body.into_vec())
+    };
+    let audio_stbl = boxed(
+        "stbl",
+        &concat(&[
+            &audio_stsd,
+            &full_box("stts", 0, 0, &empty_count.0),
+            &full_box("stsc", 0, 0, &empty_count.0),
+            &full_box("stsz", 0, 0, &empty_pair.0),
+            &full_box("stco", 0, 0, &empty_count.0),
+        ]),
+    );
+    let audio_minf = boxed("minf", &concat(&[&smhd, dinf, &audio_stbl]));
+    let audio_mdia = boxed("mdia", &concat(&[&audio_mdhd, &audio_hdlr, &audio_minf]));
+    let mut trex_body = Buf::new();
+    trex_body.u32(2).u32(1).u32(0).u32(0).u32(0);
+    (
+        boxed("trak", &concat(&[&audio_tkhd, &audio_mdia])),
+        full_box("trex", 0, 0, &trex_body.into_vec()),
+    )
+}
+
+/// An initialization segment declaring the sound alone, and its MIME type.
+fn make_audio_init_segment(audio: &AacConfig) -> (Vec<u8>, String) {
+    let ftyp = {
+        let mut body = Buf::new();
+        body.ascii("isom").u32(0x200).ascii("isomiso6mp41");
+        boxed("ftyp", &body.into_vec())
+    };
+    let (trak, trex) = make_audio_track(audio, &make_dinf());
+    let moov = boxed(
+        "moov",
+        &concat(&[&make_mvhd(3), &trak, &boxed("mvex", &trex)]),
+    );
+    (
+        concat(&[&ftyp, &moov]),
+        format!("audio/mp4; codecs=\"{AAC_CODECS_PARAMETER}\""),
+    )
 }
 
 fn make_media_segment(
@@ -1830,6 +1870,90 @@ pub fn mpeg2_gop_to_fmp4(
     )
 }
 
+/// Where one picture a unit keeps is presented, for a player that decodes the
+/// pictures itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PicturePresentation {
+    /// The picture's index in the unit; see [`Mpeg2Sample::picture`].
+    pub picture: usize,
+    /// Whether the picture after it is its second field.
+    pub field_pair: bool,
+    /// Presentation time on the 90 kHz movie timeline.
+    pub time: u64,
+    pub duration: u32,
+}
+
+/// Package one unit for a player that decodes its pictures itself: its sound
+/// as a fragment with no video track, and where each picture it keeps is
+/// presented, which is where [`mpeg2_gop_to_fmp4`] puts that picture's sample.
+///
+/// `describe` asks for an audio-only initialization segment. Neither segment
+/// is made without sound to put in it.
+pub fn mpeg2_decode_unit_to_fmp4(
+    unit: &Mpeg2Unit,
+    sequence_number: u32,
+    presentation_start: u64,
+    lead_in: UnitLeadIn,
+    describe: bool,
+    audio_track: Option<&Fmp4AudioSamples>,
+) -> (Fmp4Fragment, Vec<PicturePresentation>) {
+    let timing = mpeg2_sample_timing(&unit.timeline, lead_in);
+    let mut decode_time = base_decode_time(presentation_start, &timing);
+    let split_fields = unit.timeline.split_field_samples;
+    let mut at = 0;
+    let mut pictures = Vec::with_capacity(unit.samples.len());
+    for sample in &unit.samples {
+        let samples = if split_fields && sample.field_end.is_some() {
+            2
+        } else {
+            1
+        };
+        let duration: u32 = timing.durations[at..at + samples].iter().sum();
+        pictures.push(PicturePresentation {
+            picture: sample.picture,
+            field_pair: sample.field_end.is_some(),
+            time: decode_time + u64::from(timing.compositions[at]),
+            duration,
+        });
+        decode_time += u64::from(duration);
+        at += samples;
+    }
+    let sound = audio_track.filter(|track| !track.samples.is_empty());
+    let media_segment = sound.map_or_else(Vec::new, |track| {
+        make_av_media_segment(
+            &VideoPayload::mpeg2(Vec::new()),
+            &[],
+            &[],
+            &[],
+            &track.samples,
+            sequence_number,
+            0,
+            track.base_decode_time,
+        )
+    });
+    let (init_segment, mime_codec) = match sound.filter(|_| describe) {
+        Some(track) => make_audio_init_segment(&track.config),
+        None => (Vec::new(), String::new()),
+    };
+    (
+        Fmp4Fragment {
+            init_segment,
+            media_segment,
+            mime_codec,
+            sample_count: 0,
+            duration: timing.durations.iter().map(|&d| d as u64).sum(),
+        },
+        pictures,
+    )
+}
+
+/// Decoding runs ahead of display by the reorder delay; a fragment at the
+/// very start of the timeline has nowhere to put it and simply displays that
+/// much later.
+fn base_decode_time(presentation_start: u64, timing: &SampleTiming) -> u64 {
+    presentation_start.saturating_sub(timing.reorder_delay as u64)
+}
+
 /// Put one fragment together, whatever the video in it is coded as.
 #[allow(clippy::too_many_arguments)]
 fn make_fragment(
@@ -1843,10 +1967,7 @@ fn make_fragment(
     audio: Option<&AacConfig>,
     audio_track: Option<&Fmp4AudioSamples>,
 ) -> Result<Fmp4Fragment> {
-    // Decoding runs ahead of display by the reorder delay; a fragment at the
-    // very start of the timeline has nowhere to put it and simply displays that
-    // much later.
-    let base_decode_time = presentation_start.saturating_sub(timing.reorder_delay as u64);
+    let base_decode_time = base_decode_time(presentation_start, timing);
     let media_segment = match audio_track {
         Some(track) => make_av_media_segment(
             &video,
@@ -2366,6 +2487,7 @@ mod tests {
             let field_end = pair.then(|| at + 1);
             let end = at + if pair { 2 } else { 1 };
             samples.push(Mpeg2Sample {
+                picture: index,
                 start: at,
                 field_end,
                 end,

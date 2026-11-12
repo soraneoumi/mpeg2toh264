@@ -6,9 +6,15 @@ mod support;
 use std::collections::HashSet;
 
 use mpeg2toh264::mpeg2::constants::{PictureStructure, PictureType};
-use mpeg2toh264::mpeg2::decode::{DecodedFrame, Decoder, DisplayOrder, StreamDecoder};
+use mpeg2toh264::mpeg2::decode::{
+    packed_planes, DecodedFrame, Decoder, DisplayOrder, StreamDecoder, UnitDecoder,
+};
 use mpeg2toh264::mpeg2::headers::parse_elementary_stream;
-use support::{fnv1a, read_fixture, FIXTURES};
+use mpeg2toh264::{
+    mpeg2_video_timeline, picture_display_size, picture_matrix, Fragment, Session,
+    TranscodeOptions, YcbcrMatrix,
+};
+use support::{decoding, fnv1a, mux_with_sound, read_fixture, FIXTURES};
 
 /// Frames output and FNV-1a of their visible Y, Cb and Cr samples, in
 /// display order. The values were taken from a decode that matched ffmpeg
@@ -214,4 +220,222 @@ fn frames_are_reused_once_released() {
     // Two references, the frame being decoded and the anchor held for
     // display, and nothing more however long the stream runs.
     assert!(buffers.len() <= 4, "{} frame buffers", buffers.len());
+}
+
+/// The `video` fragments a decode-mode session makes of copies of a fixture.
+fn decode_mode_units(name: &str, copies: u64) -> (Vec<u8>, Vec<Fragment>) {
+    let one = read_fixture(name);
+    let timeline = mpeg2_video_timeline(&one, false, &[]).expect("a timeline");
+    let group = parse_elementary_stream(&one).expect("parses").len() as u64
+        * u64::from(timeline.sample_duration);
+    let groups: Vec<(&[u8], u64, u64)> = (0..copies)
+        .map(|copy| (one.as_slice(), 900_000 + copy * group, group))
+        .collect();
+    let stream = mux_with_sound(&groups);
+    let mut session = Session::new(decoding(TranscodeOptions::default()));
+    let mut fragments = session.push(&stream).expect("push");
+    fragments.extend(session.finish().expect("finish"));
+    let units = fragments
+        .into_iter()
+        .filter(|fragment| matches!(fragment, Fragment::Video { .. }))
+        .collect();
+    (one.repeat(copies as usize), units)
+}
+
+/// Decode units from `first` on, after a reset, keeping what is shown at or
+/// after `from`, as `(time, samples)`.
+fn decode_units(decoder: &mut UnitDecoder, units: &[Fragment], from: f64) -> Vec<(f64, Vec<u8>)> {
+    let mut shown = Vec::new();
+    for unit in units {
+        let Fragment::Video {
+            data,
+            restart,
+            pictures,
+            ..
+        } = unit
+        else {
+            unreachable!()
+        };
+        let count = decoder
+            .begin(
+                data,
+                *restart,
+                pictures
+                    .iter()
+                    .map(|picture| (picture.picture, picture.second_field)),
+            )
+            .expect("the unit parses");
+        assert_eq!(count, pictures.len());
+        for picture in pictures {
+            let show = picture.time + picture.duration > from;
+            if let Some(frame) = decoder.next(show).expect("decodes") {
+                assert!(show);
+                assert_eq!(frame.matrix, YcbcrMatrix::Bt709);
+                let (width, height) = frame.frame.size();
+                assert_eq!(frame.display_height as usize, height);
+                assert!(frame.display_width as usize >= width);
+                let planes = packed_planes(&frame.frame);
+                let mut packed = vec![0; planes[2].offset + planes[2].len];
+                for (component, plane) in planes.iter().enumerate() {
+                    packed[plane.offset..plane.offset + plane.len]
+                        .copy_from_slice(&frame.frame.plane(component).data[..plane.len]);
+                }
+                // The packed planes hold every visible row at its stride.
+                let mut visible = Vec::new();
+                for (component, plane) in planes.iter().enumerate() {
+                    let rows = frame.frame.plane(component);
+                    for y in 0..rows.height {
+                        let at = plane.offset + y * plane.stride;
+                        visible.extend_from_slice(&packed[at..at + rows.width]);
+                    }
+                }
+                assert_eq!(visible, samples(&frame.frame));
+                shown.push((picture.time, visible));
+            }
+        }
+    }
+    shown.sort_by(|a, b| a.0.total_cmp(&b.0));
+    shown
+}
+
+#[test]
+fn units_decode_to_the_frames_the_stream_decoder_shows() {
+    for name in [
+        "ibbp.m2v",
+        "open_gop_leading_bb.m2v",
+        "hd1080i.m2v",
+        "ip.m2v",
+    ] {
+        let (es, units) = decode_mode_units(name, 3);
+        let mut expected = Vec::new();
+        let mut decoder = StreamDecoder::new();
+        let mut take = |frame: &DecodedFrame| expected.push(samples(frame));
+        decoder.push(&es, &mut take);
+        decoder.finish(&mut take);
+
+        let shown = decode_units(&mut UnitDecoder::new(), &units, f64::NEG_INFINITY);
+        let shown: Vec<Vec<u8>> = shown.into_iter().map(|(_, samples)| samples).collect();
+        assert_eq!(shown.len(), expected.len(), "{name}: pictures");
+        assert!(shown == expected, "{name}: samples");
+    }
+}
+
+#[test]
+fn decoding_from_an_intra_unit_after_a_reset_shows_what_continuous_decoding_does() {
+    let (_, units) = decode_mode_units("open_gop_leading_bb.m2v", 2);
+    let continuous = decode_units(&mut UnitDecoder::new(), &units, f64::NEG_INFINITY);
+    let mut decoder = UnitDecoder::new();
+    // Decode a little, then jump to each later intra unit.
+    decode_units(&mut decoder, &units[..3], f64::NEG_INFINITY);
+    let mut jumps = 0;
+    for (at, unit) in units.iter().enumerate().skip(1) {
+        let Fragment::Video {
+            intra: true,
+            pictures,
+            ..
+        } = unit
+        else {
+            continue;
+        };
+        let from = pictures[0].time;
+        decoder.reset();
+        let shown = decode_units(&mut decoder, &units[at..], from);
+        let wanted: Vec<_> = continuous
+            .iter()
+            .filter(|(time, _)| *time >= from)
+            .cloned()
+            .collect();
+        assert!(shown == wanted, "jump to unit {at}");
+        jumps += 1;
+    }
+    assert!(jumps >= 2);
+}
+
+#[test]
+fn a_unit_that_fails_leaves_the_decoder_waiting_for_an_intra_unit() {
+    let (_, units) = decode_mode_units("ibbp.m2v", 3);
+    let mut decoder = UnitDecoder::new();
+    decode_units(&mut decoder, &units[..2], f64::NEG_INFINITY);
+    let Fragment::Video { data, .. } = &units[2] else {
+        unreachable!()
+    };
+    // A frame the unit does not have, then a second field that is not one.
+    assert!(decoder.begin(data, false, [(999, None)]).is_err());
+    assert!(decoder.begin(data, false, [(0, Some(2))]).is_err());
+    // What follows the failure, up to the next intra unit, shows nothing.
+    let next_intra = units
+        .iter()
+        .skip(3)
+        .position(|unit| matches!(unit, Fragment::Video { intra: true, .. }))
+        .expect("another intra unit")
+        + 3;
+    assert!(decode_units(&mut decoder, &units[3..next_intra], f64::NEG_INFINITY).is_empty());
+    assert!(!decode_units(&mut decoder, &units[next_intra..], f64::NEG_INFINITY).is_empty());
+}
+
+/// `data` with a sequence display extension carrying `matrix` after each
+/// sequence extension.
+fn with_display_extension(data: &[u8], matrix: u8) -> Vec<u8> {
+    // video_format 5, colour_description 1, primaries and transfer 1, the
+    // matrix, then a 1920x1080 display size around its marker bit.
+    let extension = [
+        0x00, 0x00, 0x01, 0xb5, 0x2b, 0x01, 0x01, matrix, 0x1e, 0x02, 0x21, 0xc0,
+    ];
+    let mut out = Vec::with_capacity(data.len() + 64);
+    let mut at = 0;
+    while at < data.len() {
+        out.push(data[at]);
+        if data[at..].starts_with(&[0, 0, 1, 0xb5]) && data.get(at + 4).is_some_and(|b| b >> 4 == 1)
+        {
+            out.extend_from_slice(&data[at + 1..at + 10]);
+            at += 10;
+            out.extend_from_slice(&extension);
+            continue;
+        }
+        at += 1;
+    }
+    out
+}
+
+#[test]
+fn the_colour_description_names_the_matrix() {
+    let data = read_fixture("ibbp.m2v");
+    let picture = |data: &[u8]| parse_elementary_stream(data).expect("parses")[0].clone();
+    assert_eq!(picture_matrix(&picture(&data)), YcbcrMatrix::Bt709);
+    for (code, matrix) in [
+        (1, YcbcrMatrix::Bt709),
+        (4, YcbcrMatrix::Bt709),
+        (5, YcbcrMatrix::Bt601),
+        (6, YcbcrMatrix::Bt601),
+        (7, YcbcrMatrix::Bt709),
+    ] {
+        let described = with_display_extension(&data, code);
+        assert_ne!(described, data);
+        let first = picture(&described);
+        assert_eq!(first.matrix_coefficients, Some(code));
+        assert_eq!(picture_matrix(&first), matrix, "matrix_coefficients {code}");
+        // The samples are the same whatever it names.
+        let (count, all) = decode_stream(&described, 1 << 20);
+        assert_eq!((count, all), decode_stream(&data, 1 << 20));
+    }
+}
+
+#[test]
+fn display_size_applies_the_sample_aspect_ratio() {
+    let picture = parse_elementary_stream(&read_fixture("hd1080i.m2v")).expect("parses")[0].clone();
+    let (width, height) = (
+        picture.sequence.horizontal_size,
+        picture.sequence.vertical_size,
+    );
+    let mut anamorphic = picture.clone();
+    anamorphic.sequence.horizontal_size = 1440;
+    anamorphic.sequence.vertical_size = 1080;
+    anamorphic.sequence.aspect_ratio_information = 3;
+    assert_eq!(picture_display_size(&anamorphic), (1920, 1080));
+    let mut square = picture.clone();
+    square.sequence.aspect_ratio_information = 1;
+    assert_eq!(picture_display_size(&square), (width, height));
+    let mut unknown = picture;
+    unknown.sequence.aspect_ratio_information = 0;
+    assert_eq!(picture_display_size(&unknown), (width, height));
 }

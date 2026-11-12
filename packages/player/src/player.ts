@@ -17,9 +17,12 @@ import {
   DEFAULT_KEEP_BEHIND_SECONDS,
   DEFAULT_MAX_AHEAD_SECONDS,
   DEFAULT_QUEUE_HIGH_WATER_MARK,
+  PICTURE_NEED_AHEAD_SECONDS,
+  PICTURE_NEED_INTERVAL_MS,
   PLAYHEAD_REPORT_INTERVAL_MS,
   type AudioTracks,
   type Command,
+  type DecodedPicture,
   type Notification,
   type PlayerState,
   type PrivateStream,
@@ -63,6 +66,24 @@ const TIMED_EVENTS: TimingMark[] = [
   "waiting",
 ];
 
+/**
+ * Where a deinterlacer takes decoded pictures, which it then shows by the
+ * media element's clock. Every pushed buffer comes back through `onrelease`
+ * once, possibly as another ArrayBuffer object or detached.
+ */
+export interface PlayerDecodedVideo {
+  push(picture: DecodedPicture): void;
+  reset(): void;
+  finish(): void;
+  onrelease: ((data: ArrayBuffer) => void) | null;
+}
+
+/**
+ * The element events after which decoded pictures are asked for at once,
+ * rather than at the next interval. `seeking` starts a new run of them.
+ */
+const NEED_EVENTS = ["seeked", "play", "ratechange"];
+
 /** A replaceable deinterlacer controlled by the source picture timeline. */
 export interface PlayerDeinterlacer {
   /** Optional compressed video input for filtering before browser presentation can drop frames. */
@@ -71,6 +92,12 @@ export interface PlayerDeinterlacer {
     reset(): void;
     finish(): void;
   } | null;
+  /**
+   * Decoded pictures in. Where there is one the player decodes the video
+   * itself and the element plays the sound alone; see
+   * `Mpeg2TsPlayerOptions.softwareDecode`.
+   */
+  readonly decodedVideo?: PlayerDecodedVideo | null;
   readonly running: boolean;
   /** Field information selected for the picture most recently presented. */
   readonly scan: Scan | null;
@@ -192,6 +219,14 @@ export interface Mpeg2TsPlayerOptions {
   deinterlace?: boolean;
   /** Construct the deinterlacer attached to this player's video element. */
   deinterlacer?: PlayerDeinterlacerFactory;
+  /**
+   * Decode the MPEG-2 in the worker and hand the pictures to the
+   * deinterlacer, where it takes decoded pictures: the element then plays
+   * only the sound, and its `videoWidth` is 0 (see `videoSize`). On by
+   * default; false converts the video for the element as without such a
+   * deinterlacer. A stream without AAC sound is converted whatever this says.
+   */
+  softwareDecode?: boolean;
 }
 
 export interface Mpeg2TsPlayerEventMap {
@@ -345,6 +380,24 @@ export class Mpeg2TsPlayer extends EventTarget {
   /** Whether deinterlacing was asked for. */
   #wanted = false;
   #destroyed = false;
+  /** What the current load was asked for, so it can be loaded again. */
+  #url = "";
+  /** Whether the current load decodes the pictures here. */
+  #decoding = false;
+  /**
+   * Whether the deinterlacer has been handed a picture. From then on it
+   * shows only the pictures handed to it, so a load that converts the video
+   * needs another one.
+   */
+  #fedPictures = false;
+  /**
+   * Which run of pictures is wanted: a seek, or the worker throwing away
+   * what it holds, starts another, and pictures of an older one are not
+   * shown.
+   */
+  #epoch = 0;
+  #needs: ReturnType<typeof setInterval> | null = null;
+  #videoSize: { width: number; height: number } | null = null;
 
   constructor(video: HTMLVideoElement, options: Mpeg2TsPlayerOptions = {}) {
     super();
@@ -358,6 +411,8 @@ export class Mpeg2TsPlayer extends EventTarget {
           : "main"
         : preference;
     this.video.addEventListener("seeking", this.#onSeeking);
+    for (const name of NEED_EVENTS)
+      this.video.addEventListener(name, this.#postNeed);
     for (const name of TIMED_EVENTS)
       this.video.addEventListener(name, this.#onTimedEvent);
     if (options.deinterlace) this.deinterlace = true;
@@ -426,6 +481,26 @@ export class Mpeg2TsPlayer extends EventTarget {
   /** Which side of the wire ended up owning the MediaSource. */
   get mediaSourceOwner(): SinkKind {
     return this.#sinkKind;
+  }
+
+  /**
+   * Whether the current load decodes the pictures in the worker and hands
+   * them to the deinterlacer. The element then has no video track.
+   */
+  get softwareDecoding(): boolean {
+    return this.#decoding;
+  }
+
+  /**
+   * The size the picture is shown at, after its sample aspect ratio, or
+   * null before the first one. Where the pictures are decoded here this is
+   * what `video.videoWidth` and `videoHeight` would say; otherwise it is
+   * them.
+   */
+  get videoSize(): { width: number; height: number } | null {
+    if (this.#decoding) return this.#videoSize;
+    const { videoWidth: width, videoHeight: height } = this.video;
+    return width > 0 && height > 0 ? { width, height } : null;
   }
 
   /**
@@ -547,13 +622,35 @@ export class Mpeg2TsPlayer extends EventTarget {
       );
     }
     this.stop();
+    return this.#start(String(url), true);
+  }
+
+  /**
+   * Start a load. `decodable` is false to convert the video whatever the
+   * deinterlacer takes, which is how a stream decode mode cannot play is
+   * loaded again.
+   */
+  #start(url: string, decodable: boolean): Promise<void> {
     const id = this.#generation;
+    this.#url = url;
     this.#duration = null;
     this.#startHold = 0;
     // Nothing is known about this source yet, so it gets whatever was asked
     // for until its first fragment says what it is.
     this.#clearVideoTimeline();
     this.#applyDeinterlace();
+    const decodedVideo = this.#deinterlacer?.decodedVideo ?? null;
+    this.#decoding =
+      decodable &&
+      this.#options.softwareDecode !== false &&
+      decodedVideo !== null;
+    if (!this.#decoding && this.#fedPictures) {
+      this.#deinterlacer?.destroy();
+      this.#deinterlacer = null;
+      this.#fedPictures = false;
+      this.#applyDeinterlace();
+    }
+    this.#videoSize = null;
     this.#loadedAt = now();
     this.#markedAt = this.#loadedAt;
     const worker = this.#ensureWorker();
@@ -564,7 +661,7 @@ export class Mpeg2TsPlayer extends EventTarget {
     worker.postMessage({
       type: "load",
       id,
-      url: String(url),
+      url,
       wasmUrl:
         this.#options.wasmUrl === undefined
           ? null
@@ -578,11 +675,15 @@ export class Mpeg2TsPlayer extends EventTarget {
         this.#options.surroundAudioGainSteps ??
         this.#options.audioGainSteps ??
         0,
-      passthrough: this.#options.passthrough ?? false,
+      video: this.#decoding
+        ? "decode"
+        : this.#options.passthrough
+          ? "passthrough"
+          : "transcode",
       pictureWorkers: this.#options.pictureWorkers,
       serviceId: this.#options.serviceId ?? null,
       sink: this.#sinkKind,
-      encodedVideo: this.#deinterlacer?.encodedVideo != null,
+      encodedVideo: !this.#decoding && this.#deinterlacer?.encodedVideo != null,
       preferManagedMediaSource: this.#options.preferManagedMediaSource ?? false,
       queueHighWaterMark:
         this.#options.queueHighWaterMark ?? DEFAULT_QUEUE_HIGH_WATER_MARK,
@@ -592,7 +693,69 @@ export class Mpeg2TsPlayer extends EventTarget {
         this.#options.keepBehindSeconds ?? DEFAULT_KEEP_BEHIND_SECONDS,
     } satisfies Command);
     this.#startPlayhead();
+    if (this.#decoding && decodedVideo) {
+      decodedVideo.onrelease = this.#recycle;
+      this.#newEpoch();
+      this.#needs = setInterval(this.#postNeed, PICTURE_NEED_INTERVAL_MS);
+    }
     return promise;
+  }
+
+  /** Give a picture's buffer back to the worker that made it. */
+  #recycle = (data: ArrayBuffer): void => {
+    // A detached buffer has nothing left to transfer.
+    if (!this.#decoding || data.byteLength === 0) return;
+    this.#worker?.postMessage(
+      { type: "recycle", id: this.#generation, data } satisfies Command,
+      [data],
+    );
+  };
+
+  /** Forget the pictures held and ask for the ones at the playhead. */
+  #newEpoch(): void {
+    this.#epoch++;
+    this.#deinterlacer?.decodedVideo?.reset();
+    this.#postNeed();
+  }
+
+  /** Ask for the pictures from the playhead to a little past it. */
+  #postNeed = (): void => {
+    if (!this.#decoding) return;
+    const from = this.video.currentTime;
+    const until =
+      from + PICTURE_NEED_AHEAD_SECONDS * Math.max(1, this.video.playbackRate);
+    this.#worker?.postMessage({
+      type: "need",
+      id: this.#generation,
+      epoch: this.#epoch,
+      from,
+      until,
+    } satisfies Command);
+  };
+
+  /** Show a picture of the current run, and hand back one of an older run. */
+  #takePicture(epoch: number, picture: DecodedPicture): void {
+    const decodedVideo = this.#deinterlacer?.decodedVideo;
+    if (epoch !== this.#epoch || !decodedVideo) {
+      this.#recycle(picture.data);
+      return;
+    }
+    const size = this.#videoSize;
+    if (
+      size?.width !== picture.displayWidth ||
+      size?.height !== picture.displayHeight
+    )
+      this.#videoSize = {
+        width: picture.displayWidth,
+        height: picture.displayHeight,
+      };
+    this.#fedPictures = true;
+    try {
+      decodedVideo.push(picture);
+    } catch (error) {
+      // The deinterlacer released the buffer; the pictures after it go on.
+      this.#emit("error", { error: toError(error) });
+    }
   }
 
   /** Abandon the current load. The player stays usable. */
@@ -611,6 +774,8 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.stop();
     this.#destroyed = true;
     this.video.removeEventListener("seeking", this.#onSeeking);
+    for (const name of NEED_EVENTS)
+      this.video.removeEventListener(name, this.#postNeed);
     for (const name of TIMED_EVENTS)
       this.video.removeEventListener(name, this.#onTimedEvent);
     this.#deinterlacer?.destroy();
@@ -687,18 +852,22 @@ export class Mpeg2TsPlayer extends EventTarget {
         this.#mark("attached", now());
         break;
       case "open":
-        this.#deinterlacer?.encodedVideo?.append(notification.data);
+        if (!this.#decoding)
+          this.#deinterlacer?.encodedVideo?.append(notification.data);
         this.#openSink(notification.mimeCodec, notification.data);
         break;
       case "video-config":
-        this.#setCodedSize(
-          notification.width,
-          notification.height,
-          notification.start,
-        );
+        // Decoded pictures carry their own size.
+        if (!this.#decoding)
+          this.#setCodedSize(
+            notification.width,
+            notification.height,
+            notification.start,
+          );
         break;
       case "fragment":
-        this.#deinterlacer?.encodedVideo?.append(notification.data);
+        if (!this.#decoding)
+          this.#deinterlacer?.encodedVideo?.append(notification.data);
         this.#sink?.push(
           notification.data,
           notification.start,
@@ -718,6 +887,17 @@ export class Mpeg2TsPlayer extends EventTarget {
         this.#deinterlacer?.encodedVideo?.reset();
         this.#clearVideoTimeline();
         this.#sink?.reset();
+        if (this.#decoding) this.#newEpoch();
+        break;
+      case "picture":
+        this.#takePicture(notification.epoch, notification.picture);
+        break;
+      case "pictures-end":
+        if (this.#decoding && notification.epoch === this.#epoch)
+          this.#deinterlacer?.decodedVideo?.finish();
+        break;
+      case "no-aac-audio":
+        this.#transcodeInstead();
         break;
       case "scans":
         this.#addScans(notification.scans);
@@ -765,7 +945,7 @@ export class Mpeg2TsPlayer extends EventTarget {
         this.#drainSink();
         break;
       case "completed":
-        this.#deinterlacer?.encodedVideo?.finish();
+        if (!this.#decoding) this.#deinterlacer?.encodedVideo?.finish();
         this.#setState("completed");
         // Nothing more will be appended, so the buffer cannot fill again and
         // the worker has no further use for the playhead. The page path waits
@@ -901,8 +1081,11 @@ export class Mpeg2TsPlayer extends EventTarget {
    * the input again from where the viewer asked to be.
    */
   #onSeeking = (): void => {
-    if (this.#duration === null) return;
     if (this.#state === "idle" || this.#state === "error") return;
+    // Before the seek below goes out, so that the worker reads the request
+    // before it is told to throw the old pictures away.
+    if (this.#decoding) this.#newEpoch();
+    if (this.#duration === null) return;
     const time = this.video.currentTime;
     if (this.#isBuffered(time)) return;
     this.#setState("seeking");
@@ -1022,8 +1205,31 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.#playhead = null;
   }
 
+  /**
+   * Load the same input again converting the video, for a stream that decode
+   * mode cannot play. The load's promise settles as the new one does.
+   */
+  #transcodeInstead(): void {
+    if (!this.#decoding) {
+      this.#fail(new Error("the worker refused to decode a load it converts"));
+      return;
+    }
+    const pending = this.#pending;
+    this.#pending = null;
+    this.stop();
+    const restarted = this.#start(this.#url, false);
+    // A failure raises `error` as well, which is all an unawaited load has.
+    restarted.then(pending?.resolve, (error: Error) => pending?.reject(error));
+  }
+
   #teardown(): void {
     this.#stopPlayhead();
+    if (this.#needs !== null) clearInterval(this.#needs);
+    this.#needs = null;
+    const decoded = this.#decoding;
+    // Released buffers go nowhere now.
+    this.#decoding = false;
+    if (decoded) this.#deinterlacer?.decodedVideo?.reset();
     this.#deinterlacer?.encodedVideo?.reset();
     this.#clearVideoTimeline();
     this.#sink?.close();

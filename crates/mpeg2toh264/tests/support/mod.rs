@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use mpeg2toh264::Fragment;
+use mpeg2toh264::mpeg2::constants::{PictureStructure, PictureType};
+use mpeg2toh264::mpeg2::headers::parse_elementary_stream;
+use mpeg2toh264::{Fragment, TranscodeOptions, VideoMode};
 
 const PACKET_SIZE: usize = 188;
 
@@ -587,4 +589,313 @@ pub fn with_extension_in_pictures(source: &[u8], pictures: &[usize], extension: 
         at += 1;
     }
     out
+}
+
+/// Video PES, one per `(payload, pts, duration)`, each followed by the 48 kHz
+/// AAC access units covering its span: the form with sound of a video-only
+/// scenario, with its holes and joins in both tracks.
+pub fn mux_with_sound(groups: &[(&[u8], u64, u64)]) -> Vec<u8> {
+    const AAC_TICKS: u64 = 1024 * 90_000 / 48_000;
+    let frame = adts_stream(1, 3, 2);
+    let blocks: Vec<Vec<u8>> = groups
+        .iter()
+        .map(|&(_, _, duration)| frame.repeat(duration.div_ceil(AAC_TICKS) as usize))
+        .collect();
+    let mut units = Vec::new();
+    for (&(payload, pts, _), block) in groups.iter().zip(&blocks) {
+        units.push(PesUnit {
+            pid: VIDEO_PID,
+            stream_id: 0xe0,
+            payload,
+            pts: Some(pts),
+        });
+        units.push(PesUnit {
+            pid: AUDIO_PID,
+            stream_id: 0xc0,
+            payload: block,
+            pts: Some(pts),
+        });
+    }
+    mux_transport_stream(
+        &[
+            (VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO),
+            (AUDIO_PID, STREAM_TYPE_AAC_ADTS),
+        ],
+        &units,
+        &mut HashMap::new(),
+    )
+}
+
+/// The passthrough options whose MP4 decode mode has to agree with: groups
+/// cut into anchor units, and a field pair in one sample, as it is one
+/// picture to decode.
+pub fn passthrough_like_decode(options: TranscodeOptions) -> TranscodeOptions {
+    TranscodeOptions {
+        video: VideoMode::Passthrough,
+        split_groups: true,
+        split_field_samples: false,
+        ..options
+    }
+}
+
+pub fn decoding(options: TranscodeOptions) -> TranscodeOptions {
+    TranscodeOptions {
+        video: VideoMode::Decode,
+        ..options
+    }
+}
+
+/// The handler type of a `trak`.
+fn track_handler(trak: &[u8]) -> [u8; 4] {
+    let mdia = child_boxes(trak)
+        .into_iter()
+        .find(|(kind, _)| kind == b"mdia")
+        .expect("a trak has an mdia")
+        .1;
+    let hdlr = child_boxes(mdia)
+        .into_iter()
+        .find(|(kind, _)| kind == b"hdlr")
+        .expect("an mdia has an hdlr")
+        .1;
+    hdlr[8..12].try_into().unwrap()
+}
+
+/// The `trak` boxes of an initialization segment.
+fn init_tracks(init: &[u8]) -> Vec<&[u8]> {
+    let top = child_boxes(init);
+    assert_eq!(
+        top[0].0, *b"ftyp",
+        "an initialization segment opens with ftyp"
+    );
+    let moov = top
+        .iter()
+        .find(|(kind, _)| kind == b"moov")
+        .expect("an initialization segment has a moov")
+        .1;
+    child_boxes(moov)
+        .into_iter()
+        .filter(|(kind, _)| kind == b"trak")
+        .map(|(_, body)| body)
+        .collect()
+}
+
+/// Decode mode is the passthrough timeline without the video muxed: the same
+/// sound sample for sample, a picture for every video sample at its time and
+/// for its duration, and units that name pictures their bytes hold.
+pub fn assert_decode_matches_passthrough(label: &str, decoded: &[Fragment], muxed: &[Fragment]) {
+    let sound_tracks = |fragments: &[Fragment]| -> Vec<Vec<u8>> {
+        init_segments(fragments)
+            .into_iter()
+            .map(|init| {
+                init_tracks(init)
+                    .into_iter()
+                    .find(|trak| &track_handler(trak) == b"soun")
+                    .expect("the segment describes the sound")
+                    .to_vec()
+            })
+            .collect()
+    };
+    for fragment in decoded {
+        if let Fragment::Init {
+            data, mime_codec, ..
+        } = fragment
+        {
+            assert_eq!(mime_codec, "audio/mp4; codecs=\"mp4a.40.2\"", "{label}");
+            let tracks = init_tracks(data);
+            assert_eq!(tracks.len(), 1, "{label}: one track");
+            assert_eq!(&track_handler(tracks[0]), b"soun", "{label}: sound only");
+        }
+    }
+    assert_eq!(
+        sound_tracks(decoded),
+        sound_tracks(muxed),
+        "{label}: the sound is described as the passthrough MP4 describes it"
+    );
+    let sizes = |fragments: &[Fragment]| -> Vec<(u32, u32)> {
+        fragments
+            .iter()
+            .filter_map(|fragment| match fragment {
+                Fragment::Init { width, height, .. } => Some((*width, *height)),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(sizes(decoded), sizes(muxed), "{label}: coded sizes");
+
+    let mut media = Vec::new();
+    let mut units = Vec::new();
+    for fragment in decoded {
+        match fragment {
+            Fragment::Media {
+                data,
+                start,
+                random_access,
+                restart_offset,
+                video_samples,
+                audio_samples,
+                scans,
+            } => {
+                assert_eq!(*video_samples, 0, "{label}: no video in the MP4");
+                assert!(*random_access, "{label}: every sound fragment is a start");
+                assert!(scans.is_empty(), "{label}: no scans without video");
+                let tracks = fragment_samples(data);
+                assert_eq!(tracks.len(), 1, "{label}: one traf");
+                assert_eq!(tracks[0].0, 2, "{label}: the sound's track");
+                assert_eq!(tracks[0].1.len(), *audio_samples, "{label}: sample count");
+                assert!(*audio_samples > 0, "{label}: no fragment without sound");
+                media.push((*start, *restart_offset));
+            }
+            Fragment::Video {
+                data,
+                start,
+                restart,
+                intra,
+                pictures,
+            } => {
+                let parsed = parse_elementary_stream(data).expect("a unit parses");
+                assert!(!pictures.is_empty(), "{label}: a unit has pictures");
+                assert_eq!(
+                    *intra,
+                    parsed[pictures[0].picture].header.picture_coding_type == PictureType::I,
+                    "{label}: intra"
+                );
+                if *restart {
+                    assert!(*intra, "{label}: a restart opens with an intra picture");
+                }
+                for picture in pictures {
+                    let first = &parsed[picture.picture];
+                    match picture.second_field {
+                        Some(second) => {
+                            assert_eq!(second, picture.picture + 1, "{label}");
+                            assert_ne!(
+                                first.coding.picture_structure,
+                                PictureStructure::Frame,
+                                "{label}: a pair is two fields"
+                            );
+                            assert_ne!(
+                                parsed[second].coding.picture_structure,
+                                first.coding.picture_structure,
+                                "{label}: of opposite parity"
+                            );
+                        }
+                        None => assert_eq!(
+                            first.coding.picture_structure,
+                            PictureStructure::Frame,
+                            "{label}: a lone picture is a frame"
+                        ),
+                    }
+                }
+                units.push((*start, *restart, pictures.clone()));
+            }
+            _ => {}
+        }
+    }
+    let muxed_media: Vec<(f64, Option<u64>)> = muxed
+        .iter()
+        .filter_map(|fragment| match fragment {
+            Fragment::Media {
+                start,
+                restart_offset,
+                audio_samples,
+                ..
+            } if *audio_samples > 0 => Some((*start, *restart_offset)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(media, muxed_media, "{label}: sound fragment starts");
+    let muxed_units: Vec<f64> = muxed
+        .iter()
+        .filter_map(|fragment| match fragment {
+            Fragment::Media {
+                start,
+                video_samples,
+                ..
+            } if *video_samples > 0 => Some(*start),
+            _ => None,
+        })
+        .collect();
+    let unit_starts: Vec<f64> = units.iter().map(|unit| unit.0).collect();
+    assert_eq!(unit_starts, muxed_units, "{label}: unit starts");
+    assert!(
+        units.first().is_some_and(|unit| unit.1),
+        "{label}: the first unit restarts"
+    );
+
+    let (decoded_samples, muxed_samples) = (track_samples(decoded), track_samples(muxed));
+    assert!(
+        decoded_samples.video.is_empty(),
+        "{label}: no video samples"
+    );
+    assert!(
+        !muxed_samples.audio.is_empty(),
+        "{label}: the stream has sound"
+    );
+    assert!(
+        decoded_samples.audio == muxed_samples.audio,
+        "{label}: the sound samples differ"
+    );
+    let pictures: Vec<(f64, f64)> = units
+        .iter()
+        .flat_map(|unit| {
+            unit.2
+                .iter()
+                .map(|picture| (picture.time, picture.duration))
+        })
+        .collect();
+    let samples: Vec<(f64, f64)> = muxed_samples
+        .video
+        .iter()
+        .map(|sample| {
+            (
+                sample.composition_time as f64 / 90_000.0,
+                f64::from(sample.duration) / 90_000.0,
+            )
+        })
+        .collect();
+    assert!(!pictures.is_empty(), "{label}: the stream made pictures");
+    assert_eq!(pictures, samples, "{label}: picture times and durations");
+}
+
+/// Everything a session handed out, flattened so two runs can be compared.
+pub fn fragments_digest(fragments: &[Fragment]) -> Vec<String> {
+    fragments
+        .iter()
+        .map(|fragment| match fragment {
+            Fragment::Init {
+                data,
+                mime_codec,
+                width,
+                height,
+            } => format!("init {mime_codec} {width}x{height} {:x}", fnv1a(data)),
+            Fragment::Media {
+                data,
+                start,
+                random_access,
+                restart_offset,
+                video_samples,
+                audio_samples,
+                scans,
+            } => format!(
+                "media {start} {random_access} {restart_offset:?} {video_samples} \
+                 {audio_samples} {scans:?} {:x}",
+                fnv1a(data)
+            ),
+            Fragment::Video {
+                data,
+                start,
+                restart,
+                intra,
+                pictures,
+            } => format!(
+                "video {start} {restart} {intra} {pictures:?} {:x}",
+                fnv1a(data)
+            ),
+            Fragment::PrivateStream {
+                stream_id,
+                pid,
+                data,
+                pts,
+            } => format!("private {stream_id} {pid} {pts:?} {:x}", fnv1a(data)),
+        })
+        .collect()
 }

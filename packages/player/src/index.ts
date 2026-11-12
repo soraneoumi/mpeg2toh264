@@ -27,6 +27,7 @@ export {
 export type {
   Mpeg2TsPlayerEventMap,
   Mpeg2TsPlayerOptions,
+  PlayerDecodedVideo,
   PlayerDeinterlacer,
   PlayerDeinterlacerFactory,
 } from "./player.js";
@@ -36,6 +37,7 @@ export {
   DEFAULT_QUEUE_HIGH_WATER_MARK,
   type AudioStream,
   type AudioTracks,
+  type DecodedPicture,
   type PlayerState,
   type PrivateStream,
   type Progress,

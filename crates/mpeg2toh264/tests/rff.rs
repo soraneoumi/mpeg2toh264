@@ -8,7 +8,10 @@ use mpeg2toh264::mpeg2::{gop_stream::Mpeg2GopStream, headers::parse_elementary_s
 use mpeg2toh264::{
     mpeg2_video_timeline, Fragment, PictureEncoder, Progress, Session, TranscodeOptions, VideoMode,
 };
-use support::{init_segments, read_fixture, track_samples, wrap_mpeg2_es_in_ts};
+use support::{
+    assert_decode_matches_passthrough, decoding, init_segments, mux_with_sound,
+    passthrough_like_decode, read_fixture, track_samples, wrap_mpeg2_es_in_ts,
+};
 
 const ORIGIN: u64 = 891_000;
 const START: u64 = 900_000;
@@ -551,5 +554,61 @@ fn cutting_groups_leaves_the_field_clock_and_the_samples_where_they_were() {
             );
             assert!(split.len() > whole.len(), "{label}: the groups were cut");
         }
+    }
+}
+
+/// `stream`, with sound alongside every group.
+fn stream_with_sound(groups: &[Option<usize>], gap_before: Option<usize>) -> Vec<u8> {
+    let payloads: Vec<Vec<u8>> = groups.iter().map(|&film| gop(film)).collect();
+    let mut fields = 0;
+    let mut timed = Vec::new();
+    for (index, (&film_start, payload)) in groups.iter().zip(&payloads).enumerate() {
+        let gap = if gap_before.is_some_and(|at| index >= at) {
+            90_000
+        } else {
+            0
+        };
+        let duration = ticks(fields + field_count(film_start)) - ticks(fields);
+        timed.push((payload.as_slice(), START + ticks(fields) + gap, duration));
+        fields += field_count(film_start);
+    }
+    mux_with_sound(&timed)
+}
+
+#[test]
+fn decode_mode_times_repeated_fields_as_the_passthrough_samples() {
+    let groups = [None, Some(0), Some(1), Some(1), None, Some(0)];
+    for gap_before in [None, Some(3)] {
+        let stream = stream_with_sound(&groups, gap_before);
+        let run_with = |options: TranscodeOptions| {
+            let mut session = Session::anchored(options, Some(ORIGIN));
+            let mut fragments = Vec::new();
+            for bytes in stream.chunks(64 * 1024) {
+                fragments.extend(session.push(bytes).unwrap());
+            }
+            fragments.extend(session.finish().unwrap());
+            fragments
+        };
+        let options = TranscodeOptions {
+            recovery_interval: 2,
+            ..TranscodeOptions::default()
+        };
+        let decoded = run_with(decoding(options));
+        let muxed = run_with(passthrough_like_decode(options));
+        assert_decode_matches_passthrough(&format!("gap {gap_before:?}"), &decoded, &muxed);
+        // Three-field pictures keep their own durations.
+        let durations: Vec<f64> = decoded
+            .iter()
+            .filter_map(|fragment| match fragment {
+                Fragment::Video { pictures, .. } => {
+                    Some(pictures.iter().map(|picture| picture.duration))
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(durations
+            .iter()
+            .any(|&duration| (duration * 90_000.0 - 3753.0).abs() < 1.5));
     }
 }
