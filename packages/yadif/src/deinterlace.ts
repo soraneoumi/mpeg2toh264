@@ -808,6 +808,8 @@ export class Deinterlacer extends EventTarget {
   /** The size the decoded pictures are shown at. */
   #displayWidth = 0;
   #displayHeight = 0;
+  /** The element's own inline aspect ratio, from before decoded pictures gave it theirs. */
+  #elementAspectRatio: string | null = null;
   /**
    * Buffers transferred to the Worker and not yet back, by the id they went
    * with. A Worker that goes away takes them with it, and what is handed
@@ -1575,6 +1577,8 @@ export class Deinterlacer extends EventTarget {
     this.#video.removeEventListener("seeked", this.#onFlush);
     this.#video.removeEventListener("ratechange", this.#onFlush);
     this.#video.removeEventListener("waiting", this.#onWaiting);
+    if (this.#elementAspectRatio !== null)
+      this.#video.style.aspectRatio = this.#elementAspectRatio;
     this.#unmount();
     for (const texture of this.#textures) this.#gl.deleteTexture(texture);
     this.#textures = [];
@@ -2069,6 +2073,7 @@ export class Deinterlacer extends EventTarget {
       this.#release(picture.data);
       throw error;
     }
+    this.#setDisplaySize(picture.displayWidth, picture.displayHeight);
     // Stopped, destroyed or without a context: nothing will show it.
     if (!this.#running) {
       this.#release(picture.data);
@@ -2105,6 +2110,23 @@ export class Deinterlacer extends EventTarget {
       this.#reportMaxQueuedFields,
       pending.length,
     );
+  }
+
+  /**
+   * Note the size decoded pictures are shown at. An element playing only
+   * sound has no proportions of its own, and a page that sizes its player
+   * from the element's would lay it out as 2:1, so the element is given the
+   * picture's.
+   */
+  #setDisplaySize(width: number, height: number): void {
+    if (width === this.#displayWidth && height === this.#displayHeight) return;
+    this.#displayWidth = width;
+    this.#displayHeight = height;
+    if (!this.#externalHost) {
+      this.#elementAspectRatio ??= this.#video.style.aspectRatio;
+      this.#video.style.aspectRatio = `${width} / ${height}`;
+    }
+    this.#layout();
   }
 
   /** Transfer a picture to the Worker, which sends its buffer back when done. */
@@ -2360,14 +2382,6 @@ export class Deinterlacer extends EventTarget {
     // against itself. A new size throws its outputs away anyway.
     if (awaiting && !flushed && (stale || woven) && !resized)
       this.#emit(true, time, rate);
-    if (
-      picture.displayWidth !== this.#displayWidth ||
-      picture.displayHeight !== this.#displayHeight
-    ) {
-      this.#displayWidth = picture.displayWidth;
-      this.#displayHeight = picture.displayHeight;
-      this.#layout();
-    }
     if (stale) {
       if (newest !== null) this.#stats.discontinuities++;
       this.#frames = 0;

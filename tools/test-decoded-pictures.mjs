@@ -1222,6 +1222,7 @@ for (const rate of [1.5, 2])
           canvas.style.width,
           canvas.style.height,
         ];
+        marks.aspect = control.video.style.aspectRatio;
         const images = [];
         control.pageContext.createImageBitmap = (...args) => {
           images.push(args);
@@ -1236,6 +1237,8 @@ for (const rate of [1.5, 2])
   // The element's box is 1920x1080 and the picture is shown at 34x9.
   assert.equal(marks.size[2], "1920px");
   assert.equal(marks.size[3], `${(9 * 1920) / 34}px`);
+  // The element has no picture of its own to take its proportions from.
+  assert.equal(marks.aspect, "34 / 9");
   assert.equal(marks.images.length, 1);
   assert.equal(marks.images[0][1].resizeWidth, 34);
   assert.equal(marks.images[0][1].resizeHeight, 9);
