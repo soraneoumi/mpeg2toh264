@@ -361,7 +361,7 @@ class S {
     );
   }
 }
-const v = "" + new URL("assets/worker-Bi5J1m1z.js", import.meta.url).href, E = v, d = 0.1, c = [
+const v = "" + new URL("assets/worker-B6T7kFmx.js", import.meta.url).href, E = v, d = 0.1, c = [
   "loadedmetadata",
   "loadeddata",
   "canplay",
