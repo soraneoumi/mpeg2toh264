@@ -341,6 +341,9 @@ pub struct Picture {
     pub starts_gop: bool,
     pub header: PictureHeader,
     pub coding: PictureCodingExtension,
+    /// Whether a picture coding extension followed the header. Without one
+    /// the picture is MPEG-1 syntax and `coding` holds defaults.
+    pub has_coding_extension: bool,
     /// Sequence state in effect for this picture.
     pub sequence: SequenceHeader,
     pub sequence_ext: SequenceExtension,
@@ -611,6 +614,7 @@ pub fn parse_elementary_stream(data: &[u8]) -> Result<Vec<Picture>> {
             } else if id == extension::PICTURE_CODING {
                 if let Some(index) = current {
                     pictures[index].coding = read_picture_coding_extension(&mut r);
+                    pictures[index].has_coding_extension = true;
                 }
             }
         } else if sc.code == start_code::PICTURE {
@@ -626,6 +630,7 @@ pub fn parse_elementary_stream(data: &[u8]) -> Result<Vec<Picture>> {
             pictures.push(Picture {
                 starts_gop: saw_gop_header,
                 coding: PictureCodingExtension::mpeg1_default(&header),
+                has_coding_extension: false,
                 header,
                 sequence,
                 sequence_ext: seq_ext.unwrap_or_else(SequenceExtension::mpeg1_default),

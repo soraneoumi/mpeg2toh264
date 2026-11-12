@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use mpeg2toh264::job::PictureOutput;
+use mpeg2toh264::mpeg2::decode::{DecodedFrame, StreamDecoder};
 use mpeg2toh264::{
     extract_mpeg2_video_es, h264_to_fmp4, is_mpeg_transport_stream, mpeg2_passthrough_unit,
     mpeg2_to_fmp4, mpeg2_video_timeline, transcode, AudioGain, Fragment, OpenGopRecovery,
@@ -58,7 +59,168 @@ Options:
                             MP4 output from a transport stream only
   -q, --quiet               Do not print conversion progress or summary
   -h, --help                Show this help
+
+Use 'mpeg2toh264 decode --help' to decode MPEG-2 video to raw frames.
 ";
+
+const DECODE_USAGE: &str = "\
+Usage: mpeg2toh264 decode [options] <input.ts|input.m2v> <output.yuv>
+       mpeg2toh264 decode --bench <input.ts|input.m2v>
+
+Decode the MPEG-2 video of an MPEG transport stream (its first MPEG-2 video
+program) or of an elementary stream to planar 4:2:0 frames at the visible
+size, in display order (yuv420p rawvideo). Leading B pictures that lack a
+reference are not output.
+
+Options:
+      --bench               Decode without writing output
+  -q, --quiet               Do not print the summary
+  -h, --help                Show this help
+
+The summary gives the pictures output, the macroblocks concealed, the decoding
+time and rate, and a checksum of the visible luma of every output picture.
+";
+
+struct DecodeOptions {
+    input: PathBuf,
+    output: Option<PathBuf>,
+    quiet: bool,
+}
+
+fn parse_decode_args(args: &[String]) -> Option<DecodeOptions> {
+    let mut positional: Vec<&str> = Vec::new();
+    let mut bench = false;
+    let mut quiet = false;
+    for arg in args {
+        match arg.as_str() {
+            "-h" | "--help" => return None,
+            "--bench" => bench = true,
+            "-q" | "--quiet" => quiet = true,
+            other if other.starts_with('-') => fail(&format!("unknown option '{other}'")),
+            other => positional.push(other),
+        }
+    }
+    let wanted = if bench { 1 } else { 2 };
+    if positional.len() != wanted {
+        fail(&format!(
+            "decode expects {wanted} path(s), got {} positional argument(s)",
+            positional.len()
+        ));
+    }
+    let input = absolute(Path::new(positional[0]));
+    let output = positional.get(1).map(|path| absolute(Path::new(path)));
+    if output.as_ref() == Some(&input) {
+        fail("input and output must be different files");
+    }
+    Some(DecodeOptions {
+        input,
+        output,
+        quiet,
+    })
+}
+
+/// The checksum the decoder benchmarks compare: per luma row, the sum of
+/// its bytes read as little-endian 32-bit words (a short tail added byte by
+/// byte), folded into an FNV-1a style hash together with the row index.
+fn checksum_luma(hash: &mut u32, frame: &DecodedFrame) {
+    let luma = frame.plane(0);
+    for y in 0..luma.height {
+        let row = luma.row(y);
+        let mut words = row.chunks_exact(4);
+        let mut sum = 0u32;
+        for word in &mut words {
+            sum = sum.wrapping_add(u32::from_le_bytes([word[0], word[1], word[2], word[3]]));
+        }
+        for &byte in words.remainder() {
+            sum = sum.wrapping_add(byte as u32);
+        }
+        *hash = (*hash ^ sum ^ y as u32).wrapping_mul(0x0100_0193);
+    }
+}
+
+fn write_frame(output: &mut impl Write, frame: &DecodedFrame) -> std::io::Result<()> {
+    for component in 0..3 {
+        let plane = frame.plane(component);
+        for y in 0..plane.height {
+            output.write_all(plane.row(y))?;
+        }
+    }
+    Ok(())
+}
+
+fn run_decode(options: &DecodeOptions) -> Result<(), Box<dyn std::error::Error>> {
+    let mut input = BufReader::new(File::open(&options.input)?);
+    let transport_stream = is_mpeg_transport_stream(input.fill_buf()?);
+    let mut container = Vec::new();
+    input.read_to_end(&mut container)?;
+    let source = if transport_stream {
+        extract_mpeg2_video_es(&container)?
+    } else {
+        container
+    };
+    let mut output = match &options.output {
+        Some(path) => Some(BufWriter::new(File::create(path)?)),
+        None => None,
+    };
+
+    let started = Instant::now();
+    let mut decoder = StreamDecoder::new();
+    let mut hash = 0x811c_9dc5u32;
+    let mut failure: Option<std::io::Error> = None;
+    let mut deliver = |frame: &DecodedFrame| {
+        checksum_luma(&mut hash, frame);
+        if let (Some(output), None) = (output.as_mut(), failure.as_ref()) {
+            if let Err(error) = write_frame(output, frame) {
+                failure = Some(error);
+            }
+        }
+    };
+    for chunk in source.chunks(1 << 20) {
+        decoder.push(chunk, &mut deliver);
+    }
+    decoder.finish(&mut deliver);
+    if let Some(error) = failure {
+        return Err(error.into());
+    }
+    if let Some(output) = output.as_mut() {
+        output.flush()?;
+    }
+    let seconds = started.elapsed().as_secs_f64();
+    if decoder.stats().output == 0 {
+        return Err(match decoder.first_error() {
+            Some(error) => error.clone().into(),
+            None => "no decodable MPEG-2 pictures in the input".into(),
+        });
+    }
+
+    if !options.quiet {
+        let stats = decoder.stats();
+        let rate = if seconds > 0.0 {
+            stats.output as f64 / seconds
+        } else {
+            f64::INFINITY
+        };
+        println!(
+            "{} ({}) -> {}",
+            options.input.display(),
+            if transport_stream {
+                "MPEG-TS"
+            } else {
+                "MPEG-2 ES"
+            },
+            options
+                .output
+                .as_ref()
+                .map_or("(no output)".to_string(), |path| path.display().to_string()),
+        );
+        println!(
+            "{} pictures, {} concealed macroblocks, {} skipped, {} groups failed, \
+             {seconds:.3} s, {rate:.1} pictures/s, checksum {hash:08x}",
+            stats.output, stats.concealed_macroblocks, stats.skipped, stats.failed_groups,
+        );
+    }
+    Ok(())
+}
 
 struct CliOptions {
     input: PathBuf,
@@ -574,6 +736,19 @@ fn write_fragment(
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "decode") {
+        let Some(options) = parse_decode_args(&args[1..]) else {
+            print!("{DECODE_USAGE}");
+            return ExitCode::SUCCESS;
+        };
+        return match run_decode(&options) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("mpeg2toh264: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let options = match parse_args(&args) {
         Invocation::Help => {
             print!("{USAGE}");
