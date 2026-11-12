@@ -327,6 +327,11 @@ export class Mpeg2TsPlayer extends EventTarget {
     null;
   /** How long the input is, when it turned out to be one that can be seeked. */
   #duration: number | null = null;
+  /**
+   * A start hold the worker asked for. It arrives before the first
+   * initialization segment, which is what creates the sink.
+   */
+  #startHold = 0;
   /** Source video properties indexed by presentation time. */
   #videoTimeline: VideoState[] = [];
   /** What sound the programme last said it was carrying. See `AudioTracks`. */
@@ -544,6 +549,7 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.stop();
     const id = this.#generation;
     this.#duration = null;
+    this.#startHold = 0;
     // Nothing is known about this source yet, so it gets whatever was asked
     // for until its first fragment says what it is.
     this.#clearVideoTimeline();
@@ -740,6 +746,7 @@ export class Mpeg2TsPlayer extends EventTarget {
           this.video.currentTime = notification.time;
         break;
       case "hold":
+        this.#startHold = notification.seconds;
         this.#sink?.holdStart(notification.seconds);
         break;
       case "progress":
@@ -787,6 +794,7 @@ export class Mpeg2TsPlayer extends EventTarget {
       // Making one is where a browser with no Media Source Extensions at all
       // says so, and the load is what has to hear it.
       sink = this.#sink ?? this.#createSink(id);
+      sink.holdStart(this.#startHold);
     } catch (error) {
       this.#fail(toError(error));
       return;
