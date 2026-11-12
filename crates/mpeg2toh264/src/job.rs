@@ -269,6 +269,8 @@ impl PictureContext {
             (VideoMode::Passthrough, false) => 1,
             (VideoMode::Transcode, true) => 2,
             (VideoMode::Passthrough, true) => 3,
+            (VideoMode::Decode, false) => 4,
+            (VideoMode::Decode, true) => 5,
         };
         out[PICTURE_COUNT_AT] = self.picture_count;
         put_u32(out, 4, self.frame_num);
@@ -339,7 +341,7 @@ impl PictureContext {
             options: TranscodeOptions {
                 oversample: f64::from_bits(get_u64(data, 52)),
                 recovery_interval: get_u32(data, 60) as usize,
-                open_gop_recovery: if matches!(data[3], 2 | 3) {
+                open_gop_recovery: if matches!(data[3], 2 | 3 | 5) {
                     OpenGopRecovery::Discard
                 } else if flags & FLAG_NON_IDR_OPEN_GOP_RECOVERY != 0 {
                     OpenGopRecovery::RecoveryPoint
@@ -350,6 +352,7 @@ impl PictureContext {
                 video: match data[3] {
                     0 | 2 => VideoMode::Transcode,
                     1 | 3 => VideoMode::Passthrough,
+                    4 | 5 => VideoMode::Decode,
                     other => bail!("picture job names video mode {other}"),
                 },
                 // Where a unit is cut has no bearing on how a picture is coded.

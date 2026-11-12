@@ -11,13 +11,14 @@ use mpeg2toh264::mpeg2::gop_stream::Mpeg2Gop;
 use mpeg2toh264::mpeg2::gop_stream::Mpeg2GopStream;
 use mpeg2toh264::mpeg2::headers::parse_elementary_stream;
 use mpeg2toh264::{
-    AudioGain, DualMono, Fragment, OpenGopRecovery, Session, TranscodeOptions, VideoMode,
+    AudioGain, DualMono, Fragment, OpenGopRecovery, Progress, Session, TranscodeOptions, VideoMode,
 };
 use support::{
-    adts_frame, adts_frame_with_payload, adts_stream, init_segments, mux_programs,
-    mux_transport_stream, non_intra_matrix_extension, picture_starts, read_fixture, track_samples,
-    with_extension_in_pictures, wrap_mpeg2_es_in_ts, PesUnit, TrackSample, AUDIO_PID, FIXTURES,
-    STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID,
+    adts_frame, adts_frame_with_payload, adts_stream, assert_decode_matches_passthrough, decoding,
+    fragments_digest, init_segments, mux_programs, mux_transport_stream, mux_with_sound,
+    non_intra_matrix_extension, passthrough_like_decode, picture_starts, read_fixture,
+    track_samples, with_extension_in_pictures, wrap_mpeg2_es_in_ts, PesUnit, TrackSample,
+    AUDIO_PID, FIXTURES, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID,
 };
 
 /// Offset of the first `00 00 01 B8` group header.
@@ -3217,4 +3218,185 @@ fn does_not_cut_in_the_rest_of_a_group_after_a_gap() {
         ]
     );
     assert!(!units[2].continues_group);
+}
+
+// ---------------------------------------------------------------- decode mode
+
+/// Run a stream in decode mode and on the passthrough path it has to agree
+/// with, and check that it does.
+fn assert_decode_mode_agrees(label: &str, stream: &[u8], options: TranscodeOptions) {
+    let decoded = run_session_with_options(stream, 64 * 1024, decoding(options));
+    let muxed = run_session_with_options(stream, 64 * 1024, passthrough_like_decode(options));
+    assert_decode_matches_passthrough(label, &decoded, &muxed);
+}
+
+/// Copies of a fixture, one PES each stamped where it plays, with sound.
+fn fixture_with_sound(name: &str, copies: u64, base: u64) -> Vec<u8> {
+    let one = read_fixture(name);
+    let timeline = mpeg2toh264::mpeg2_video_timeline(&one, false, &[]).expect("a timeline");
+    let frames = parse_elementary_stream(&one).expect("parses").len() as u64;
+    let group = frames * u64::from(timeline.sample_duration);
+    let groups: Vec<(&[u8], u64, u64)> = (0..copies)
+        .map(|copy| (one.as_slice(), base + copy * group, group))
+        .collect();
+    mux_with_sound(&groups)
+}
+
+#[test]
+fn decode_mode_is_the_passthrough_timeline_without_the_video() {
+    let mut streams: Vec<(String, Vec<u8>)> = vec![
+        ("interleaved".into(), av_stream(6, 400)),
+        ("timed".into(), timed_av_stream(10)),
+        (
+            "open gop".into(),
+            fixture_with_sound("open_gop_leading_bb.m2v", 3, 900_000),
+        ),
+    ];
+    for name in FIXTURES {
+        streams.push((name.into(), fixture_with_sound(name, 4, 900_000)));
+    }
+    for (name, stream) in &streams {
+        for open_gop_recovery in [OpenGopRecovery::RecoveryPoint, OpenGopRecovery::Discard] {
+            let options = TranscodeOptions {
+                open_gop_recovery,
+                recovery_interval: 2,
+                ..TranscodeOptions::default()
+            };
+            assert_decode_mode_agrees(&format!("{name}, {open_gop_recovery:?}"), stream, options);
+        }
+    }
+}
+
+#[test]
+fn decode_mode_holds_over_holes_and_keeps_a_group_in_place_after_one() {
+    let stream = timed_av_stream(10);
+    let packets = stream.len() / 188;
+    let lossy = with_packets_dropped(&stream, packets / 2, packets / 20);
+    assert_decode_mode_agrees("a hole", &lossy, TranscodeOptions::default());
+    // Single packets inside groups, which leave later units of the group
+    // lagging behind its display clock.
+    let mut cases = 0;
+    for at in (packets / 3..packets * 2 / 3).step_by(41) {
+        let lossy = with_packets_dropped(&stream, at, 1);
+        assert_decode_mode_agrees(
+            &format!("packet {at} lost"),
+            &lossy,
+            TranscodeOptions::default(),
+        );
+        cases += 1;
+    }
+    assert!(cases > 4);
+}
+
+#[test]
+fn decode_mode_leaves_a_join_and_a_wrap_where_the_source_has_them() {
+    const JUMP: u64 = 120 * 90_000;
+    let one = read_fixture("ibbp.m2v");
+    let group = parse_elementary_stream(&one).expect("parses").len() as u64 * (90_000 / 25);
+    let groups: Vec<(&[u8], u64, u64)> = (0..6u64)
+        .map(|copy| {
+            let jump = if copy >= 3 { JUMP } else { 0 };
+            (one.as_slice(), 900_000 + copy * group + jump, group)
+        })
+        .collect();
+    let joined = mux_with_sound(&groups);
+    assert_decode_mode_agrees("a join", &joined, TranscodeOptions::default());
+    let decoded =
+        run_session_with_options(&joined, 64 * 1024, decoding(TranscodeOptions::default()));
+    let times: Vec<f64> = decoded
+        .iter()
+        .filter_map(|fragment| match fragment {
+            Fragment::Video { pictures, .. } => Some(pictures.iter().map(|picture| picture.time)),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let mut sorted = times.clone();
+    sorted.sort_by(f64::total_cmp);
+    let widest = sorted
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .fold(0.0, f64::max);
+    assert!(
+        (widest - JUMP as f64 / 90_000.0).abs() < 0.1,
+        "the widest step between pictures is {widest}s"
+    );
+
+    let wrapped = timed_av_stream_from(6, (1u64 << 33) - group * 2);
+    assert_decode_mode_agrees("a wrap", &wrapped, TranscodeOptions::default());
+}
+
+#[test]
+fn decode_mode_describes_new_sound_again() {
+    let stream = audio_change_stream(8, 90, 90);
+    assert_decode_mode_agrees("a new configuration", &stream, TranscodeOptions::default());
+    let decoded =
+        run_session_with_options(&stream, 64 * 1024, decoding(TranscodeOptions::default()));
+    assert_eq!(
+        init_segments(&decoded).len(),
+        2,
+        "one description per configuration"
+    );
+}
+
+#[test]
+fn decode_mode_refuses_a_stream_without_aac_sound() {
+    let mut session = Session::new(decoding(TranscodeOptions::default()));
+    let stream = video_only_stream(3);
+    let mut result = Ok(Vec::new());
+    for chunk in stream.chunks(64 * 1024) {
+        result = session.push(chunk);
+        if result.is_err() {
+            break;
+        }
+    }
+    if result.is_ok() {
+        result = session.finish();
+    }
+    let error = result.expect_err("decode mode needs sound");
+    assert!(error.is_no_aac_audio(), "{error}");
+
+    // Nothing came out before the refusal.
+    let mut session = Session::new(decoding(TranscodeOptions::default()));
+    let first = stream
+        .chunks(188 * 4)
+        .find_map(|chunk| match session.push(chunk) {
+            Ok(fragments) => {
+                assert!(fragments.is_empty(), "nothing goes out before the refusal");
+                None
+            }
+            Err(error) => Some(error),
+        });
+    assert!(first.is_some_and(|error| error.is_no_aac_audio()));
+}
+
+#[test]
+fn decode_mode_does_not_depend_on_chunking_or_on_the_deferred_calls() {
+    let stream = timed_av_stream(8);
+    let options = decoding(TranscodeOptions::default());
+    let whole = fragments_digest(&run_session_with_options(&stream, stream.len(), options));
+    for chunk in [188, 1000, 64 * 1024] {
+        assert_eq!(
+            fragments_digest(&run_session_with_options(&stream, chunk, options)),
+            whole,
+            "chunks of {chunk}"
+        );
+    }
+    let mut session = Session::new(options);
+    let mut deferred = Vec::new();
+    for chunk in stream.chunks(7 * 188) {
+        let mut progress = session.push_deferred(chunk).expect("push");
+        assert!(matches!(progress, Progress::Idle(_)), "nothing to convert");
+        deferred.extend(progress.fragments());
+    }
+    loop {
+        let mut progress = session.finish_deferred().expect("finish");
+        assert!(matches!(progress, Progress::Idle(_)), "nothing to convert");
+        let fragments = progress.fragments();
+        if fragments.is_empty() {
+            break;
+        }
+        deferred.extend(fragments);
+    }
+    assert_eq!(fragments_digest(&deferred), whole, "the deferred calls");
 }

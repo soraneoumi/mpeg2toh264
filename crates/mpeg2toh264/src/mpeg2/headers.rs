@@ -154,6 +154,41 @@ pub fn sequence_sample_aspect_ratio(sequence: &SequenceHeader) -> Option<SampleA
     Some(SampleAspectRatio { width, height })
 }
 
+/// The YCbCr matrix decoded samples are in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum YcbcrMatrix {
+    Bt709,
+    Bt601,
+}
+
+/// The matrix of a picture's samples (H.262 6.3.6, Table 6-9). Without a
+/// colour description H.262 specifies BT.709.
+pub fn picture_matrix(picture: &Picture) -> YcbcrMatrix {
+    match picture.matrix_coefficients {
+        Some(5 | 6) => YcbcrMatrix::Bt601,
+        // 1 is BT.709. FCC (4), SMPTE 240M (7) and reserved values are not
+        // rendered; BT.709 is used for them.
+        _ => YcbcrMatrix::Bt709,
+    }
+}
+
+/// The size a picture is shown at: its visible size with the sample aspect
+/// ratio applied to the width. An unknown ratio leaves the coded size.
+pub fn picture_display_size(picture: &Picture) -> (u32, u32) {
+    let (width, height) = (
+        picture.sequence.horizontal_size,
+        picture.sequence.vertical_size,
+    );
+    match sequence_sample_aspect_ratio(&picture.sequence) {
+        Some(sar) if sar.width > 0 && sar.height > 0 => {
+            let scaled = u64::from(width) * u64::from(sar.width);
+            let denominator = u64::from(sar.height);
+            (((scaled + denominator / 2) / denominator) as u32, height)
+        }
+        _ => (width, height),
+    }
+}
+
 /// What the H.264 parameter sets and the MP4 initialization segment are built
 /// out of, as the sequence header states it.
 ///
@@ -348,11 +383,15 @@ pub struct Picture {
     pub sequence: SequenceHeader,
     pub sequence_ext: SequenceExtension,
     pub quant: QuantMatrices,
+    /// `matrix_coefficients` of the sequence display extension in effect, or
+    /// `None` when the sequence carries no colour description.
+    pub matrix_coefficients: Option<u8>,
     pub slices: Vec<Slice>,
     /// Byte range of the sequence-level headers standing in front of this
     /// picture: from its sequence header to one past the last thing that
-    /// changed the description, which is the sequence extension and any
-    /// quantiser matrix extension that arrived before it.
+    /// changed the description, which is the sequence extension, the sequence
+    /// display extension and any quantiser matrix extension that arrived
+    /// before it.
     ///
     /// This is what a converter has to put in front of the picture's own bytes
     /// for a fresh parse to describe it the way this walk did. Normally it is
@@ -497,6 +536,17 @@ fn read_quant_matrix_extension(r: &mut BitReader<'_>, quant: &mut QuantMatrices)
     }
 }
 
+/// `matrix_coefficients` of a sequence display extension (6.2.2.4), if it
+/// has a colour description.
+fn read_sequence_display_matrix(r: &mut BitReader<'_>) -> Option<u8> {
+    r.skip(3); // video_format
+    if !r.flag() {
+        return None;
+    }
+    r.skip(16); // colour_primaries, transfer_characteristics
+    Some(r.u(8) as u8)
+}
+
 fn read_picture_header(r: &mut BitReader<'_>) -> PictureHeader {
     let temporal_reference = r.u(10);
     let picture_coding_type = PictureType::from_code(r.u(3));
@@ -564,6 +614,7 @@ pub fn parse_elementary_stream(data: &[u8]) -> Result<Vec<Picture>> {
     let mut seq: Option<SequenceHeader> = None;
     let mut seq_ext: Option<SequenceExtension> = None;
     let mut quant = QuantMatrices::default();
+    let mut matrix_coefficients: Option<u8> = None;
     let mut current: Option<usize> = None;
     let mut saw_gop_header = false;
     // The sequence description in hand: where its header starts, and one past
@@ -593,6 +644,7 @@ pub fn parse_elementary_stream(data: &[u8]) -> Result<Vec<Picture>> {
             seq = Some(header);
             quant = matrices;
             seq_ext = None;
+            matrix_coefficients = None;
             context_start = sc.offset;
             context_end = ends_at;
         } else if sc.code == start_code::EXTENSION {
@@ -600,6 +652,11 @@ pub fn parse_elementary_stream(data: &[u8]) -> Result<Vec<Picture>> {
             if id == extension::SEQUENCE {
                 if let Some(header) = seq.as_mut() {
                     seq_ext = Some(read_sequence_extension(&mut r, header)?);
+                    context_end = ends_at;
+                }
+            } else if id == extension::SEQUENCE_DISPLAY {
+                if seq.is_some() {
+                    matrix_coefficients = read_sequence_display_matrix(&mut r);
                     context_end = ends_at;
                 }
             } else if id == extension::QUANT_MATRIX {
@@ -635,6 +692,7 @@ pub fn parse_elementary_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 sequence,
                 sequence_ext: seq_ext.unwrap_or_else(SequenceExtension::mpeg1_default),
                 quant: quant.clone(),
+                matrix_coefficients,
                 slices: Vec::new(),
                 context_start,
                 context_end,

@@ -2,23 +2,38 @@ use std::fmt;
 
 /// Anything that stops a transcode, carrying the message the caller sees.
 ///
-/// The failures here are all "this stream is not something we can handle", and
-/// nothing recovers from them programmatically, so one message-carrying type
-/// serves the whole crate rather than an enum nobody matches on.
+/// The failures here are all "this stream is not something we can handle".
+/// One of them a caller acts on: a stream without AAC sound cannot be played
+/// in decode mode but can be transcoded, so that one can be told apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
     message: String,
+    no_aac_audio: bool,
 }
 
 impl Error {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            no_aac_audio: false,
+        }
+    }
+
+    /// The stream carries no AAC sound for decode mode to play the pictures
+    /// against.
+    pub fn no_aac_audio() -> Self {
+        Self {
+            message: "the stream has no AAC audio, which decode mode needs as its clock".into(),
+            no_aac_audio: true,
         }
     }
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    pub fn is_no_aac_audio(&self) -> bool {
+        self.no_aac_audio
     }
 }
 

@@ -227,6 +227,12 @@ fn digest(fragments: &[Fragment]) -> Vec<(String, u64, usize, usize)> {
                 *video_samples,
                 *audio_samples,
             ),
+            Fragment::Video {
+                data,
+                start,
+                pictures,
+                ..
+            } => (format!("video {start}"), fnv1a(data), pictures.len(), 0),
             Fragment::PrivateStream { pid, data, pts, .. } => {
                 (format!("private {pid} {pts:?}"), fnv1a(data), 0, 0)
             }

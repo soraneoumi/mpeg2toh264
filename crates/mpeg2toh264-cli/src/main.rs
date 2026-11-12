@@ -74,6 +74,9 @@ reference are not output.
 
 Options:
       --bench               Decode without writing output
+      --checksums           Print the luma checksum and type of each output
+                            picture, one per line, marking a field decoded
+                            without its second field
   -q, --quiet               Do not print the summary
   -h, --help                Show this help
 
@@ -85,16 +88,19 @@ struct DecodeOptions {
     input: PathBuf,
     output: Option<PathBuf>,
     quiet: bool,
+    checksums: bool,
 }
 
 fn parse_decode_args(args: &[String]) -> Option<DecodeOptions> {
     let mut positional: Vec<&str> = Vec::new();
     let mut bench = false;
     let mut quiet = false;
+    let mut checksums = false;
     for arg in args {
         match arg.as_str() {
             "-h" | "--help" => return None,
             "--bench" => bench = true,
+            "--checksums" => checksums = true,
             "-q" | "--quiet" => quiet = true,
             other if other.starts_with('-') => fail(&format!("unknown option '{other}'")),
             other => positional.push(other),
@@ -116,12 +122,17 @@ fn parse_decode_args(args: &[String]) -> Option<DecodeOptions> {
         input,
         output,
         quiet,
+        checksums,
     })
 }
+
+/// FNV-1a offset basis, where every checksum starts.
+const CHECKSUM_BASIS: u32 = 0x811c_9dc5;
 
 /// The checksum the decoder benchmarks compare: per luma row, the sum of
 /// its bytes read as little-endian 32-bit words (a short tail added byte by
 /// byte), folded into an FNV-1a style hash together with the row index.
+/// `--checksums` prints it per picture, starting from the basis each time.
 fn checksum_luma(hash: &mut u32, frame: &DecodedFrame) {
     let luma = frame.plane(0);
     for y in 0..luma.height {
@@ -165,10 +176,24 @@ fn run_decode(options: &DecodeOptions) -> Result<(), Box<dyn std::error::Error>>
 
     let started = Instant::now();
     let mut decoder = StreamDecoder::new();
-    let mut hash = 0x811c_9dc5u32;
+    let mut hash = CHECKSUM_BASIS;
     let mut failure: Option<std::io::Error> = None;
     let mut deliver = |frame: &DecodedFrame| {
         checksum_luma(&mut hash, frame);
+        if options.checksums {
+            let mut own = CHECKSUM_BASIS;
+            checksum_luma(&mut own, frame);
+            let info = frame.info();
+            println!(
+                "{own:08x} {:?}{}",
+                info.picture_type,
+                if info.missing_field {
+                    " lone-field"
+                } else {
+                    ""
+                }
+            );
+        }
         if let (Some(output), None) = (output.as_mut(), failure.as_ref()) {
             if let Err(error) = write_frame(output, frame) {
                 failure = Some(error);
@@ -727,7 +752,8 @@ fn write_fragment(
             }
             data
         }
-        Fragment::PrivateStream { .. } => return Ok(()),
+        // Only decode mode hands pictures out, and this writes MP4.
+        Fragment::PrivateStream { .. } | Fragment::Video { .. } => return Ok(()),
     };
     output.write_all(&data)?;
     totals.bytes += data.len();

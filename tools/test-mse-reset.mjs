@@ -144,6 +144,27 @@ try {
   assert.equal(shortBuffer.appended.length, 1);
   void short.finish();
   assert.equal(shortBuffer.appended[1], only);
+
+  // The playhead goes where the media begins: the later of where the buffer
+  // and the first fragment do. Sound alone, for pictures decoded beside it,
+  // can buffer from before the first picture.
+  for (const [buffered, first, expected] of [
+    [0.5, 0.87, 0.87],
+    [1.2, 0.87, 1.2],
+  ]) {
+    const seeks = [];
+    const placed = new MseSink({
+      ...options,
+      seek: (time) => seeks.push(time),
+    });
+    await placed.open("audio/mp4; codecs=mp4a.40.2", fragment(0));
+    const placedBuffer = placed.mediaSource.sourceBuffer;
+    placedBuffer.complete();
+    placed.push(fragment(50), first, true);
+    placedBuffer.buffered = { length: 1, start: () => buffered, end: () => 2 };
+    placedBuffer.complete();
+    assert.deepEqual(seeks, [expected], `buffered from ${buffered} s`);
+  }
 } finally {
   delete globalThis.MediaSource;
   await unlink(output).catch(() => {});

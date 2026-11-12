@@ -536,6 +536,8 @@ function createPlayer(): Mpeg2TsPlayer {
     counts = `${videoFrames} video frames`;
     if (audioFrames > 0) counts += ` ${audioFrames} AAC frames`;
     setDetails();
+    // No element event says when decoded pictures change size.
+    if (created.softwareDecoding) syncPictureAspect();
   });
   created.addEventListener("error", (event) =>
     setStatus(event.detail.error.message, true),
@@ -852,8 +854,11 @@ function setPlayhead() {
 }
 
 function syncPictureAspect(): void {
-  if (video.videoWidth > 0 && video.videoHeight > 0) {
-    const aspect = video.videoWidth / video.videoHeight;
+  // Decoded pictures leave the element without a video track, and the
+  // player says their size instead.
+  const size = player?.videoSize;
+  if (size) {
+    const aspect = size.width / size.height;
     picture.style.setProperty("--picture-aspect", String(aspect));
     picture.style.setProperty("--picture-width", `${aspect * 100}vh`);
   }

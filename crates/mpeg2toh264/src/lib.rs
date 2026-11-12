@@ -28,19 +28,20 @@ pub use job::{PictureJob, PictureOutput, TranscoderState};
 
 pub use container::adts::{AudioGain, DualMono};
 pub use container::fmp4::{
-    h264_gop_to_fmp4, h264_to_fmp4, mpeg2_gop_to_fmp4, mpeg2_passthrough_unit, mpeg2_to_fmp4,
-    mpeg2_video_timeline, Fmp4Fragment, Fmp4Output, Mpeg2Sample, Mpeg2Unit, Mpeg2VideoTimeline,
-    UnitLeadIn,
+    h264_gop_to_fmp4, h264_to_fmp4, mpeg2_decode_unit_to_fmp4, mpeg2_gop_to_fmp4,
+    mpeg2_passthrough_unit, mpeg2_to_fmp4, mpeg2_video_timeline, Fmp4Fragment, Fmp4Output,
+    Mpeg2Sample, Mpeg2Unit, Mpeg2VideoTimeline, PicturePresentation, UnitLeadIn,
 };
 pub use container::mpegts::{
     extract_mpeg2_video_es, first_pts, is_mpeg_transport_stream, last_pts, AudioStream,
     ElementaryKind, MpegTsAvDemuxer,
 };
 pub use mpeg2::headers::{
-    pictures_interlacing, stream_sequence_description, Interlacing, SequenceDescription,
+    picture_display_size, picture_matrix, pictures_interlacing, stream_sequence_description,
+    Interlacing, SequenceDescription, YcbcrMatrix,
 };
 pub use session::VideoScan;
-pub use session::{Fragment, Progress, Session};
+pub use session::{Fragment, Progress, Session, VideoPicture};
 pub use transcode::{
     plan_unit, transcode, IncrementalTranscoder, OpenGopRecovery, PictureEncoder, TranscodeOptions,
     TranscodeResult, UnitPlan, UnitRequest, VideoMode,

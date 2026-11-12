@@ -515,7 +515,7 @@ export class MseSink implements FragmentSink {
       ) {
         const appended = this.#queue.shift()!;
         this.#queuedBytes -= appended.data.byteLength;
-        if (!appended.init) this.#startAtMedia();
+        if (!appended.init) this.#startAtMedia(appended.start!);
       }
     } else if (operation?.type === "remove") {
       this.#quotaBlocked = false;
@@ -569,13 +569,18 @@ export class MseSink implements FragmentSink {
    * begins after that, and nothing is ever appended at zero. Chrome moves the
    * playhead into the first buffered range by itself; Firefox waits at zero for
    * data that is not coming.
+   *
+   * An element given the sound alone, for pictures decoded beside it, buffers
+   * from where the sound begins. The pictures begin where the first fragment
+   * does, and the playhead goes to the later of the two, where the tracks of
+   * muxed media would have both begun.
    */
-  #startAtMedia(): void {
+  #startAtMedia(start: number): void {
     const buffered = this.#sourceBuffer?.buffered;
     if (this.#playheadPlaced || !buffered || buffered.length === 0) return;
     this.#playheadPlaced = true;
     this.#options.onMark?.("appended");
-    this.#options.seek(buffered.start(0));
+    this.#options.seek(Math.max(buffered.start(0), start));
   }
 
   /**

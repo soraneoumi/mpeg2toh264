@@ -99,6 +99,11 @@ pub enum VideoMode {
     /// broadcast's own and the conversion costs almost nothing -- but a decoder
     /// that does not take MPEG-2 plays none of it.
     Passthrough,
+    /// Hand the MPEG-2 out for the caller to decode, and put only the sound
+    /// into the MP4: the media element plays the sound and keeps the clock
+    /// the pictures are shown by. Groups are always cut into anchor units.
+    /// Needs AAC sound.
+    Decode,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -144,7 +149,8 @@ pub struct TranscodeOptions {
     /// pictures coded after it, each of which becomes a fragment of its own.
     /// The pictures and their timing are the same either way; only the
     /// fragment boundaries move, so that media can be handed on as soon as it
-    /// has arrived rather than once its group has.
+    /// has arrived rather than once its group has. [`VideoMode::Decode`]
+    /// always cuts them.
     pub split_groups: bool,
 }
 
