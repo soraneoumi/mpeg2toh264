@@ -27,6 +27,7 @@ interface WorkerElementStyle {
   top: string;
   width: string;
   height: string;
+  aspectRatio: string;
 }
 
 /**
