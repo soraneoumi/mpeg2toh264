@@ -81,6 +81,7 @@ class WorkerVideo extends EventTarget {
 let video: WorkerVideo | null = null;
 let deinterlacer: Deinterlacer | null = null;
 let destroying = false;
+const pictureIDs = new Map<ArrayBuffer, number>();
 
 /** Run the shared engine's presentation loop on the Worker's animation frames. */
 function requestWorkerAnimationFrame(callback: FrameRequestCallback): number {
@@ -133,6 +134,14 @@ workerScope.onmessage = (event: MessageEvent<WorkerCommand>) => {
         requestWorkerAnimationFrame,
         cancelWorkerAnimationFrame,
       );
+      // Buffers of decoded pictures go back with the id they came with.
+      const engine = deinterlacer;
+      engine.decodedVideo.onrelease = (data) => {
+        const id = pictureIDs.get(data);
+        pictureIDs.delete(data);
+        if (id !== undefined && !destroying)
+          post({ type: "release", id, data }, [data]);
+      };
       let filmFailure = 0;
       deinterlacer.addEventListener("failure", () => filmFailure++);
       deinterlacer.addEventListener("stats", (statsEvent) => {
@@ -175,6 +184,22 @@ workerScope.onmessage = (event: MessageEvent<WorkerCommand>) => {
         break;
       case "enabled":
         deinterlacer.enabled = command.enabled;
+        break;
+      case "running":
+        if (command.running) deinterlacer.start();
+        else deinterlacer.stop();
+        break;
+      case "picture":
+        pictureIDs.set(command.picture.data, command.id);
+        deinterlacer.decodedVideo.push(command.picture);
+        break;
+      case "pictures":
+        if (command.action === "reset") deinterlacer.decodedVideo.reset();
+        else deinterlacer.decodedVideo.finish();
+        break;
+      case "clock":
+        video.update(command.video);
+        deinterlacer.observeMediaClock(command.at, command.timeOrigin);
         break;
       case "event":
         video.update(command.video);

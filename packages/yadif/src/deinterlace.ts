@@ -24,6 +24,11 @@
  * each frame is put back together into the film frame it came from, the
  * repeated one in every five is dropped, and the rest are shown at 24 a
  * second, evenly spaced.
+ *
+ * Pictures can instead be pushed already decoded, with their presentation
+ * times, through `decodedVideo`. The element then only plays the sound and
+ * keeps the time: each picture is filtered as soon as its successor is in
+ * hand, and each field is shown at the refresh its own time falls in.
  */
 import {
   destroyDebugRenderState,
@@ -34,6 +39,13 @@ import {
 import { YADIF_FRAGMENT_SHADER, YADIF_UNIFORMS } from "./shader.js";
 import { FilmDetector, NO_PHASE, type Phase } from "./film-detect.js";
 import { EncodedVideoFrames } from "./encoded-video.js";
+import {
+  checkPicture,
+  PictureConverter,
+  type DecodedPicture,
+  type DecodedVideoInput,
+} from "./decoded-video.js";
+import { MediaClock } from "./media-clock.js";
 import { PictureWatch } from "./picture-watch.js";
 import {
   FIELD_METRICS,
@@ -142,6 +154,24 @@ const DISPLAY_TIME_REACH = 4;
  */
 const FILM_HOLD_FRAMES = 90;
 
+/**
+ * How far ahead of the refresh being filled a decoded picture is filtered, in
+ * refreshes of wall time. More than one, so that a late animation frame still
+ * finds its field filtered. Less than a picture at normal speed, so that a B
+ * picture pushed before its own time is in hand before the anchor shown after
+ * it is taken in.
+ */
+const LOOKAHEAD_REFRESHES = 1.5;
+
+/**
+ * Decoded pictures held before being taken in, per unit of playback rate.
+ * About 0.8 s of 29.97 pictures: well above what the producer sends ahead.
+ */
+const PICTURE_QUEUE = 24;
+
+/** How far two decoded timestamps may disagree and still be the same moment, in seconds. */
+const TIMESTAMP_TOLERANCE = 0.001;
+
 /** Broadcast frames in a pulldown cycle, and the film frames they hold. */
 const PULLDOWN_FRAMES = 5;
 const FILM_FRAMES = 4;
@@ -159,6 +189,13 @@ const FILM_LEAD: Record<number, number> = {
   4: 0.5,
   5: 0.75,
 };
+
+/** The shared scan of a decoded picture. */
+function decodedScan(picture: HeldPicture): Scan {
+  return DECODED_SCANS[
+    (picture.interlaced ? 2 : 0) + (picture.topFieldFirst ? 1 : 0)
+  ]!;
+}
 
 /**
  * Putting a picture that has already been filtered onto the canvas.
@@ -194,6 +231,35 @@ interface Ready {
 }
 
 type Cadence = "frame" | "field" | "film";
+
+/** What the renderer keeps of a decoded picture once its samples are in a texture. */
+interface HeldPicture {
+  timestamp: number;
+  duration: number;
+  interlaced: boolean;
+  topFieldFirst: boolean;
+  repeatFirstField: boolean;
+}
+
+/** A decoded picture's filtered field or frame waiting for its media time. */
+interface DecodedOutput {
+  slot: number;
+  /** When it belongs on the screen, in media seconds. */
+  time: number;
+  /** The timestamp of the picture it is made from. */
+  picture: number;
+  /** Whether it is the first output of that picture, which is what a paused element shows. */
+  start: boolean;
+  scan: Scan;
+}
+
+/** The scan of each kind of decoded picture, shared so that outputs allocate none. */
+const DECODED_SCANS: readonly Scan[] = [
+  { interlaced: false, topFieldFirst: false },
+  { interlaced: false, topFieldFirst: true },
+  { interlaced: true, topFieldFirst: false },
+  { interlaced: true, topFieldFirst: true },
+];
 
 /** Callback metadata describing one presented frame to take in. */
 interface FrameObservation {
@@ -249,6 +315,9 @@ export interface DeinterlaceStats {
    * the previous frame's cannot be told apart from a missed one, so a still
    * scene raises this count although nothing is wrong. With Worker rendering
    * the gaps are those in `mozPaintedFrames`.
+   *
+   * With decoded pictures, the pictures dropped because their time had
+   * passed before they could be taken in, none of them shown.
    */
   missed: number;
   /**
@@ -270,17 +339,27 @@ export interface DeinterlaceStats {
    * Times the schedule was restarted from the clock instead of following on
    * from the last picture: a seek, a stall, a cadence change, or a missed
    * frame. Climbing during steady playback means the cadence is not holding.
-   * (otya)
+   * (otya) With decoded pictures, times the media clock started again from
+   * `currentTime`: after a seek, a pause, a rate change or a stall, or on a
+   * reading too far from it.
    */
   resynced: number;
-  /** Fields skipped because their display time passed or disagreed with the presentation clock. */
+  /**
+   * Fields skipped because their display time passed or disagreed with the
+   * presentation clock. With decoded pictures, every field or frame filtered
+   * or due and never shown, including those a rate above the refresh skips.
+   */
   late: number;
   /**
    * Times the presentation queue was reset because its scheduled lead exceeded
-   * the useful display window.
+   * the useful display window. With decoded pictures, pictures dropped
+   * because more were pushed than are held.
    */
   queueResetted: number;
-  /** Frames presented per second over the last report. */
+  /**
+   * Frames presented per second over the last report. With decoded pictures,
+   * pictures taken in per second.
+   */
   fps: number;
   /**
    * Average rendering-thread time per input frame spent uploading, filtering
@@ -292,10 +371,14 @@ export interface DeinterlaceStats {
   frameMs: number;
   /**
    * The largest number of pictures queued during the last reporting interval,
-   * across both the field-rate and film scheduling paths.
+   * across both the field-rate and film scheduling paths. With decoded
+   * pictures, the largest number pushed and not yet taken in.
    */
   maxQueuedFields: number;
-  /** Pictures actually copied to the canvas per second. */
+  /**
+   * Pictures actually copied to the canvas per second: with decoded pictures,
+   * fields, film frames or frames, as the mode shows them.
+   */
   outputFps: number;
   /**
    * GPU processing time, supported only in Chrome. On ANGLE's Metal backend
@@ -494,6 +577,12 @@ interface PendingWorkerFrame {
 export class Deinterlacer extends EventTarget {
   /** Receive fMP4 from the player and decode supplemental input only above 1.25x playback speed. */
   readonly encodedVideo: EncodedVideoFrames | null;
+  /**
+   * Receive decoded pictures with their presentation times. From the first
+   * push on they are the only pictures shown, and the element is only the
+   * clock they are shown by.
+   */
+  readonly decodedVideo: DecodedVideoInput;
   readonly #renderCanvas: HTMLCanvasElement | OffscreenCanvas;
   #displayCanvas: HTMLCanvasElement;
 
@@ -558,6 +647,7 @@ export class Deinterlacer extends EventTarget {
    */
   #dropQueue(): void {
     this.#queue.length = 0;
+    this.#decodedQueue.length = 0;
     this.#lastScheduled = null;
     this.#scheduleLag = 0;
     this.#offPhase = 0;
@@ -676,6 +766,55 @@ export class Deinterlacer extends EventTarget {
   /** Last worker-reported filmError, to derive the page-side failure event. */
   #workerFilmError: string | null = null;
   #workerFilmFailure = 0;
+  /** Whether pictures come from `decodedVideo`. Set by the first push and kept. */
+  #decoded = false;
+  /** Pushed pictures not yet taken in, in timestamp order. */
+  #pending: DecodedPicture[] = [];
+  /** Whether finish() was called since the last reset. */
+  #finished = false;
+  readonly #clock = new MediaClock();
+  /** Built when the first decoded picture arrives. */
+  #converter: PictureConverter | null = null;
+  /** The decoded picture in each history slot; the newest is at #head. */
+  readonly #held: HeldPicture[] = Array.from({ length: HISTORY }, () => ({
+    timestamp: 0,
+    duration: 0,
+    interlaced: true,
+    topFieldFirst: true,
+    repeatFirstField: false,
+  }));
+  /** Whether a decoded picture has been taken in since the last reset. */
+  #taken = false;
+  /** Whether the newest picture is still to be filtered against its successor. */
+  #awaiting = false;
+  /** Whether it has been filtered against itself meanwhile, its successor being late. */
+  #awaitingFlushed = false;
+  /** Filtered decoded outputs waiting for their media time, in time order. */
+  readonly #decodedQueue: DecodedOutput[] = [];
+  /** The decoded output on the canvas. */
+  #shownOutput: DecodedOutput | null = null;
+  /**
+   * The first outputs of the last two pictures shown, whose slots are kept:
+   * a pause can land in the picture before the one the canvas has gone on to.
+   */
+  #shownStart: DecodedOutput | null = null;
+  #previousStart: DecodedOutput | null = null;
+  /** The media time of the output on the canvas; nothing older goes up after it. */
+  #shownTime = Number.NEGATIVE_INFINITY;
+  /** Outputs the last refresh advanced by. Near a refresh boundary the next refresh does the same. */
+  #advanced = 1;
+  /** Field order of the decoded picture being filtered. */
+  #fieldOrder = true;
+  /** The size the decoded pictures are shown at. */
+  #displayWidth = 0;
+  #displayHeight = 0;
+  /**
+   * Buffers transferred to the Worker and not yet back, by the id they went
+   * with. A Worker that goes away takes them with it, and what is handed
+   * back for them then is the detached original.
+   */
+  readonly #sentPictures = new Map<number, ArrayBuffer>();
+  #pictureID = 0;
   constructor(video: HTMLVideoElement, options?: DeinterlacerOptions);
   /** @internal Used only to construct the rendering engine inside a Worker. */
   constructor(
@@ -767,6 +906,18 @@ export class Deinterlacer extends EventTarget {
       !externalHost && typeof VideoDecoder !== "undefined"
         ? new EncodedVideoFrames(video)
         : null;
+    this.decodedVideo = {
+      push: (picture) => this.#pushPicture(picture),
+      reset: () => this.#resetPictures(),
+      finish: () => {
+        this.#finished = true;
+        this.#worker?.postMessage({
+          type: "pictures",
+          action: "finish",
+        } satisfies WorkerCommand);
+      },
+      onrelease: null,
+    };
     // The watch shares this GL context, so it works only while pictures are
     // drawn here. A Worker renderer is sent frames, not textures.
     this.#pictures = externalHost ? null : new PictureWatch(gl, video);
@@ -788,9 +939,16 @@ export class Deinterlacer extends EventTarget {
     video.addEventListener("seeking", this.#onSeeking);
     video.addEventListener("seeked", this.#onFlush);
     video.addEventListener("ratechange", this.#onFlush);
+    video.addEventListener("waiting", this.#onWaiting);
   }
 
   get running(): boolean {
+    if (this.#decoded)
+      return (
+        this.#running &&
+        this.#enabled &&
+        (this.#shownOutput?.scan.interlaced ?? true)
+      );
     return this.#running && (this.#scan?.interlaced ?? true);
   }
 
@@ -801,6 +959,7 @@ export class Deinterlacer extends EventTarget {
 
   /** Field order for the current scan state, defaulting to top-field-first. */
   get #topFieldFirst(): boolean {
+    if (this.#decoded) return this.#fieldOrder;
     return this.#scan?.topFieldFirst !== false;
   }
 
@@ -830,6 +989,8 @@ export class Deinterlacer extends EventTarget {
 
   /** Update whether the source needs filtering and which field comes first. */
   set scan(scan: Scan | null) {
+    // Decoded pictures carry their own field order.
+    if (this.#decoded) return;
     const interlacingChanged = this.#scan?.interlaced !== scan?.interlaced;
     const changed =
       interlacingChanged || this.#scan?.topFieldFirst !== scan?.topFieldFirst;
@@ -861,6 +1022,7 @@ export class Deinterlacer extends EventTarget {
   }
 
   get scan(): Scan | null {
+    if (this.#decoded) return this.#shownOutput?.scan ?? null;
     return this.#scan;
   }
 
@@ -897,6 +1059,8 @@ export class Deinterlacer extends EventTarget {
     if (doubleRate === this.#doubleRate) return;
     this.#doubleRate = doubleRate;
     this.#postWorkerSettings();
+    // Decoded outputs carry their own times, so those queued still stand.
+    if (this.#decoded) return;
     // A rate change gives every queued field a different presentation cadence,
     // so the next decoded frame starts a new schedule on the current timeline.
     this.#dropQueue();
@@ -979,7 +1143,7 @@ export class Deinterlacer extends EventTarget {
   }
 
   #applyScheduling(): void {
-    if (this.#destroyed) return;
+    if (this.#destroyed || this.#decoded) return;
     if (this.#scheduled) {
       if (this.#width > 0) this.#allocateOutputs();
       if (
@@ -1020,9 +1184,12 @@ export class Deinterlacer extends EventTarget {
   }
 
   #apply(): void {
+    // Decoded pictures have nowhere else to go, so they are shown, filtered
+    // or not, whatever `enabled` and the timeline say.
     if (
-      this.#enabled &&
-      (this.#videoTimeline.length > 0 || (this.#scan?.interlaced ?? true))
+      this.#decoded ||
+      (this.#enabled &&
+        (this.#videoTimeline.length > 0 || (this.#scan?.interlaced ?? true)))
     )
       this.start();
     else this.stop();
@@ -1057,6 +1224,7 @@ export class Deinterlacer extends EventTarget {
     this.#closePendingWorkerFrame();
     this.#worker?.terminate();
     this.#worker = null;
+    this.#releaseSentPictures();
     this.#workerFrameInFlight = false;
     this.#workerAcceptedFrame = false;
     this.#workerFilmError = null;
@@ -1180,6 +1348,8 @@ export class Deinterlacer extends EventTarget {
           break;
         }
         if (notification.image) request.resolve(notification.image);
+        else if (this.#decoded)
+          request.reject(new Error("no rendered picture is available"));
         else
           void createImageBitmap(this.#video).then(
             request.resolve,
@@ -1187,6 +1357,10 @@ export class Deinterlacer extends EventTarget {
           );
         break;
       }
+      case "release":
+        if (this.#sentPictures.delete(notification.id))
+          this.#release(notification.data);
+        break;
     }
   }
 
@@ -1264,6 +1438,7 @@ export class Deinterlacer extends EventTarget {
     this.#worker?.terminate();
     this.#worker = null;
     this.#closePendingWorkerFrame();
+    this.#releaseSentPictures();
     this.#notifyFailure(`deinterlacer worker stopped: ${message}`);
     this.stop();
   }
@@ -1284,6 +1459,7 @@ export class Deinterlacer extends EventTarget {
     this.#worker = null;
     this.#workerState = "main";
     this.#closePendingWorkerFrame();
+    this.#releaseSentPictures();
     if (this.#running) {
       this.#request();
       this.#startCaptureLoop();
@@ -1314,6 +1490,15 @@ export class Deinterlacer extends EventTarget {
     this.#mount();
     this.#startCaptureLoop();
     if (this.#ensureWorker()) {
+      if (this.#decoded) {
+        // The page reads the clock for the Worker on its own refreshes.
+        this.#worker?.postMessage({
+          type: "running",
+          running: true,
+        } satisfies WorkerCommand);
+        this.#startLoop();
+        return;
+      }
       // `start()` can be called without going through the `enabled` setter,
       // so an existing Worker needs the enabled state explicitly.
       this.#worker?.postMessage({
@@ -1326,14 +1511,19 @@ export class Deinterlacer extends EventTarget {
       return;
     }
     this.#request();
-    if (this.#scan?.interlaced ?? true) this.#startLoop();
+    if (this.#decoded || (this.#scan?.interlaced ?? true)) this.#startLoop();
   }
 
-  /** Take the deinterlaced picture away, leaving the element's own showing. */
+  /**
+   * Take the deinterlaced picture away, leaving the element's own showing.
+   * Decoded pictures held are released, and those pushed until the next
+   * start() are released at once.
+   */
   stop(): void {
     this.#playbackRevision++;
     if (!this.#running) return;
     this.#running = false;
+    if (this.#decoded) this.#resetPictures();
     this.#videoFrames.cancel();
     this.encodedVideo?.suspend();
     this.#stopCaptureLoop();
@@ -1342,10 +1532,13 @@ export class Deinterlacer extends EventTarget {
     this.#presentedPicture = null;
     this.#setVisible(false);
     this.#closePendingWorkerFrame();
-    this.#worker?.postMessage({
-      type: "enabled",
-      enabled: false,
-    } satisfies WorkerCommand);
+    // A Worker showing decoded pictures keeps showing them whatever
+    // `enabled` says, so it is stopped as such.
+    this.#worker?.postMessage(
+      this.#decoded
+        ? ({ type: "running", running: false } satisfies WorkerCommand)
+        : ({ type: "enabled", enabled: false } satisfies WorkerCommand),
+    );
   }
 
   destroy(): void {
@@ -1357,6 +1550,7 @@ export class Deinterlacer extends EventTarget {
     this.#worker?.terminate();
     this.#worker = null;
     this.#closePendingWorkerFrame();
+    this.#releaseSentPictures();
     this.#rejectCaptureRequests("the deinterlacer was destroyed");
     // `stop()` cancelled both requests on whichever window held them; the
     // listener that would have re-armed them goes with the same move.
@@ -1380,6 +1574,7 @@ export class Deinterlacer extends EventTarget {
     this.#video.removeEventListener("seeking", this.#onSeeking);
     this.#video.removeEventListener("seeked", this.#onFlush);
     this.#video.removeEventListener("ratechange", this.#onFlush);
+    this.#video.removeEventListener("waiting", this.#onWaiting);
     this.#unmount();
     for (const texture of this.#textures) this.#gl.deleteTexture(texture);
     this.#textures = [];
@@ -1394,6 +1589,8 @@ export class Deinterlacer extends EventTarget {
     this.#timerUsingQueries.length = 0;
     this.#detector?.destroy();
     this.#detector = null;
+    this.#converter?.destroy();
+    this.#converter = null;
     if (this.#debugRenderState !== null) {
       destroyDebugRenderState(this.#debugRenderState);
       this.#debugRenderState = null;
@@ -1429,18 +1626,27 @@ export class Deinterlacer extends EventTarget {
       } satisfies WorkerCommand);
       return image;
     }
-    if (this.#workerState === "starting" || this.#workerState === "failed")
+    if (
+      !this.#decoded &&
+      (this.#workerState === "starting" || this.#workerState === "failed")
+    )
       return createImageBitmap(this.#video);
     const picture = this.#presentedPicture;
-    if (this.#externalHost && (!this.#running || this.#lost || !picture))
+    // Without a video track the element has no picture to fall back on.
+    if (
+      (this.#externalHost || this.#decoded) &&
+      (!this.#running || this.#lost || !picture)
+    )
       return Promise.reject(new Error("no rendered picture is available"));
     if (!this.#running || this.#lost || !picture)
       return createImageBitmap(this.#video);
     if (picture.kind === "texture")
       this.#showTexture(picture.texture, picture.flip, false);
     else this.#render(picture.flush, picture.second, null, false);
-    const width = this.#video.videoWidth;
-    const height = this.#video.videoHeight;
+    const width = this.#decoded ? this.#displayWidth : this.#video.videoWidth;
+    const height = this.#decoded
+      ? this.#displayHeight
+      : this.#video.videoHeight;
     if (
       width > 0 &&
       height > 0 &&
@@ -1492,7 +1698,7 @@ export class Deinterlacer extends EventTarget {
   }
 
   #request(): void {
-    if (this.#externalHost || !this.#running) return;
+    if (this.#externalHost || !this.#running || this.#decoded) return;
     this.#videoFrames.request(this.#onFrame);
   }
 
@@ -1667,7 +1873,7 @@ export class Deinterlacer extends EventTarget {
     const curTexture = this.#textures[cur];
     const nextTexture = this.#textures[next];
     if (!prevTexture || !curTexture || !nextTexture) return;
-    const first = this.#scan?.topFieldFirst !== false ? 0 : 1;
+    const first = this.#topFieldFirst ? 0 : 1;
     // The same two frames the film branch of the filter weaves from. Count
     // first, because detect() scores the frame from these counts.
     this.#detector?.measureComb(prevTexture, curTexture, first);
@@ -1685,7 +1891,7 @@ export class Deinterlacer extends EventTarget {
     const nextTexture = this.#textures[next];
     const detector = this.#detector;
     if (!curTexture || !nextTexture || !detector) return false;
-    const first = this.#scan?.topFieldFirst !== false ? 0 : 1;
+    const first = this.#topFieldFirst ? 0 : 1;
     try {
       detector.measureComb(curTexture, nextTexture, first, true);
     } catch (error) {
@@ -1854,6 +2060,651 @@ export class Deinterlacer extends EventTarget {
     }
   }
 
+  /** Queue a pushed picture in timestamp order. */
+  #pushPicture(picture: DecodedPicture): void {
+    try {
+      checkPicture(picture);
+      if (!this.#decoded) this.#useDecoded();
+    } catch (error) {
+      this.#release(picture.data);
+      throw error;
+    }
+    // Stopped, destroyed or without a context: nothing will show it.
+    if (!this.#running) {
+      this.#release(picture.data);
+      return;
+    }
+    if (this.#workerState === "starting" || this.#workerState === "active") {
+      this.#sendPicture(picture);
+      return;
+    }
+    if (
+      this.#taken &&
+      picture.timestamp <
+        this.#held[this.#head]!.timestamp + TIMESTAMP_TOLERANCE
+    ) {
+      // Older than a picture already taken in, so it cannot join the history.
+      this.#stats.missed++;
+      this.#release(picture.data);
+      return;
+    }
+    const pending = this.#pending;
+    let index = pending.length;
+    while (index > 0 && pending[index - 1]!.timestamp > picture.timestamp)
+      index--;
+    pending.splice(index, 0, picture);
+    this.#dropPassed(this.#clock.at(performance.now()));
+    const limit = Math.ceil(
+      PICTURE_QUEUE * Math.max(1, this.#video.playbackRate),
+    );
+    while (pending.length > limit) {
+      this.#stats.queueResetted++;
+      this.#release(pending.pop()!.data);
+    }
+    this.#reportMaxQueuedFields = Math.max(
+      this.#reportMaxQueuedFields,
+      pending.length,
+    );
+  }
+
+  /** Transfer a picture to the Worker, which sends its buffer back when done. */
+  #sendPicture(picture: DecodedPicture): void {
+    const id = ++this.#pictureID;
+    try {
+      this.#worker!.postMessage(
+        { type: "picture", id, picture } satisfies WorkerCommand,
+        [picture.data],
+      );
+    } catch (error) {
+      // Not transferred, so still the producer's to have back.
+      this.#release(picture.data);
+      throw error;
+    }
+    this.#sentPictures.set(id, picture.data);
+  }
+
+  /** Hand back the buffers a Worker that is going away still holds. */
+  #releaseSentPictures(): void {
+    const sent = [...this.#sentPictures.values()];
+    this.#sentPictures.clear();
+    for (const data of sent) this.#release(data);
+  }
+
+  /** Make pushed pictures the only pictures shown, from now on. */
+  #useDecoded(): void {
+    this.#converter = new PictureConverter(this.#gl);
+    this.#decoded = true;
+    this.#closePendingWorkerFrame();
+    this.#videoFrames.cancel();
+    this.encodedVideo?.suspend();
+    this.#stopCaptureLoop();
+    this.#frames = 0;
+    this.#dropQueue();
+    this.#resetFieldMetrics();
+    this.#presentedPicture = null;
+    // The first picture sizes everything.
+    this.#width = 0;
+    this.#height = 0;
+    this.#clock.hold();
+    this.#apply();
+    this.#startLoop();
+  }
+
+  /** Hand a picture's buffer back to the producer. */
+  #release(data: ArrayBuffer): void {
+    const release = this.decodedVideo.onrelease;
+    if (release === null) return;
+    try {
+      release(data);
+    } catch (error) {
+      // The producer's failure is its own and must not stop the pictures.
+      queueMicrotask(() => {
+        throw error;
+      });
+    }
+  }
+
+  /** Release everything pushed and forget the history, keeping the canvas as it is. */
+  #resetPictures(): void {
+    if (!this.#decoded) return;
+    this.#worker?.postMessage({
+      type: "pictures",
+      action: "reset",
+    } satisfies WorkerCommand);
+    const pending = this.#pending;
+    this.#pending = [];
+    this.#finished = false;
+    this.#taken = false;
+    this.#awaiting = false;
+    this.#awaitingFlushed = false;
+    this.#frames = 0;
+    this.#dropQueue();
+    this.#shownStart = null;
+    this.#previousStart = null;
+    this.#shownTime = Number.NEGATIVE_INFINITY;
+    this.#advanced = 1;
+    this.#resetFieldMetrics();
+    this.#filmHold = 0;
+    this.#clock.hold();
+    for (const picture of pending) this.#release(picture.data);
+  }
+
+  /** Release pictures that will neither be shown nor be the neighbour of one that is. */
+  #dropPassed(time: number): void {
+    const pending = this.#pending;
+    while (pending.length > 2 && pending[2]!.timestamp <= time) {
+      this.#stats.missed++;
+      this.#release(pending.shift()!.data);
+    }
+  }
+
+  /** Read the element's clock, as it was at `wall` on this realm's clock. */
+  #observeClock(wall: number): void {
+    const video = this.#video;
+    if (
+      this.#clock.observe(
+        wall,
+        video.currentTime,
+        video.playbackRate,
+        !video.paused && !video.seeking && !video.ended,
+      )
+    ) {
+      this.#stats.resynced++;
+      this.#advanced = 1;
+    }
+  }
+
+  /**
+   * @internal Give a Worker renderer a reading of the element's clock, taken
+   * at `at` on the clock whose origin is `timeOrigin`. The element state it
+   * belongs to has been applied to the Worker's video.
+   */
+  observeMediaClock(at: number, timeOrigin: number): void {
+    this.#observeClock(this.#localTime(at, timeOrigin));
+  }
+
+  /** Send the page's reading of the element's clock to the Worker renderer. */
+  #postClock(): void {
+    this.#worker?.postMessage({
+      type: "clock",
+      video: this.#workerVideoState(),
+      at: performance.now(),
+      timeOrigin: performance.timeOrigin,
+    } satisfies WorkerCommand);
+  }
+
+  /** Take in what the coming refresh needs and put up what belongs on it. */
+  #presentPictures(): void {
+    const video = this.#video;
+    // A Worker renderer is sent its readings, with the time they were made.
+    if (!this.#externalHost) this.#observeClock(performance.now());
+    const rate = this.#clock.rate;
+    // What is drawn now reaches the screen at the next refresh.
+    const time = this.#clock.at(this.#gridAt + this.#refreshMs);
+    // Held for an event, and not read since.
+    if (Number.isNaN(time)) return;
+    const revision = this.#playbackRevision;
+    this.#feed(time, rate);
+    if (this.#frameIsCurrent(revision))
+      this.#showDecoded(time, rate, video.paused);
+  }
+
+  /**
+   * Take in pictures until the history holds the successor of every picture
+   * whose outputs are due within the lookahead of `time`, the media time of
+   * the refresh being filled.
+   */
+  #feed(time: number, rate: number): void {
+    const revision = this.#playbackRevision;
+    const lookahead =
+      (LOOKAHEAD_REFRESHES * this.#refreshMs * Math.max(1, rate)) / 1000;
+    this.#dropPassed(time);
+    for (;;) {
+      const next = this.#pending[0];
+      if (next === undefined) break;
+      // A picture is filtered when its successor is taken in, which is one
+      // picture ahead of its own time.
+      if (next.timestamp > time + lookahead + next.duration) break;
+      // A picture of a new size starts with a new set of outputs.
+      if (
+        (next.width === this.#width && next.height === this.#height
+          ? this.#spareOutputs()
+          : OUTPUT_POOL_LENGTH) < this.#outputsFor(next)
+      )
+        break;
+      this.#pending.shift();
+      this.#take(next, time, rate);
+      if (!this.#frameIsCurrent(revision)) return;
+      this.#dropPassed(time);
+    }
+    // Its successor is late, or there is none: filter it against itself when
+    // it is due. It is filtered again if the successor comes after all.
+    if (
+      !this.#awaiting ||
+      this.#awaitingFlushed ||
+      this.#pending.length > 0 ||
+      this.#spareOutputs() < this.#outputsPerPicture()
+    )
+      return;
+    const newest = this.#held[this.#head]!;
+    const hysteresis = (PRESENT_HYSTERESIS_MS * rate) / 1000;
+    if (this.#finished || newest.timestamp <= time + hysteresis) {
+      this.#emit(true, time, rate);
+      this.#awaitingFlushed = true;
+    }
+  }
+
+  /** Output slots a filtered picture takes. A repeated first field shares the first one's. */
+  #outputsPerPicture(): number {
+    return this.#doubleRate && !this.#filmLocked ? 2 : 1;
+  }
+
+  /** Output slots taking `picture` in can fill. */
+  #outputsFor(picture: DecodedPicture): number {
+    const woven = !picture.interlaced || !this.#enabled;
+    return (this.#awaiting ? this.#outputsPerPicture() : 0) + (woven ? 1 : 0);
+  }
+
+  /** Whether an output slot holds nothing still wanted. */
+  #slotFree(slot: number): boolean {
+    const output = this.#outputs[slot];
+    if (output === undefined) return false;
+    const presented = this.#presentedPicture;
+    if (presented?.kind === "texture" && presented.texture === output.texture)
+      return false;
+    if (this.#shownStart?.slot === slot || this.#previousStart?.slot === slot)
+      return false;
+    for (const entry of this.#decodedQueue)
+      if (entry.slot === slot) return false;
+    return true;
+  }
+
+  #spareOutputs(): number {
+    let spare = 0;
+    for (let slot = 0; slot < this.#outputs.length; slot++)
+      if (this.#slotFree(slot)) spare++;
+    return spare;
+  }
+
+  /** The next free output slot round the ring, or null. */
+  #spareSlot(): number | null {
+    for (let offset = 1; offset <= OUTPUT_POOL_LENGTH; offset++) {
+      const slot = (this.#outputHead + offset) % OUTPUT_POOL_LENGTH;
+      if (this.#slotFree(slot)) return slot;
+    }
+    return null;
+  }
+
+  /**
+   * Take a decoded picture into the history and filter the picture before it,
+   * which has its successor now.
+   */
+  #take(picture: DecodedPicture, time: number, rate: number): void {
+    const newest = this.#taken ? this.#held[this.#head]! : null;
+    const end = newest === null ? 0 : newest.timestamp + newest.duration;
+    const resized =
+      picture.width !== this.#width || picture.height !== this.#height;
+    const stale =
+      newest === null ||
+      resized ||
+      picture.timestamp < end - TIMESTAMP_TOLERANCE ||
+      picture.timestamp - end > CONTINUOUS_SECONDS;
+    const gap = !stale && picture.timestamp - end > TIMESTAMP_TOLERANCE;
+    // Shown as it is: one instant, or filtering is off.
+    const woven = !picture.interlaced || !this.#enabled;
+    const awaiting = this.#awaiting;
+    const flushed = this.#awaitingFlushed;
+    this.#awaiting = false;
+    this.#awaitingFlushed = false;
+    // The waiting picture's successor is not its neighbour, so it is filtered
+    // against itself. A new size throws its outputs away anyway.
+    if (awaiting && !flushed && (stale || woven) && !resized)
+      this.#emit(true, time, rate);
+    if (
+      picture.displayWidth !== this.#displayWidth ||
+      picture.displayHeight !== this.#displayHeight
+    ) {
+      this.#displayWidth = picture.displayWidth;
+      this.#displayHeight = picture.displayHeight;
+      this.#layout();
+    }
+    if (stale) {
+      if (newest !== null) this.#stats.discontinuities++;
+      this.#frames = 0;
+      this.#resetFieldMetrics();
+      this.#filmHold = 0;
+    } else if (
+      newest !== null &&
+      !woven &&
+      newest.interlaced &&
+      newest.topFieldFirst !== picture.topFieldFirst
+    ) {
+      // Detection measured under the other field order does not carry over.
+      this.#resetFieldMetrics(true);
+    }
+    const at = performance.now();
+    this.#restartReportAfterIdle(at);
+    this.#lastFrameAt = at;
+    const revision = this.#playbackRevision;
+    const q = this.#beginGpuTimer(false);
+    try {
+      if (resized) {
+        this.#resize(picture.width, picture.height);
+        if (this.#outputs.length !== OUTPUT_POOL_LENGTH)
+          throw new Error("decoded pictures have no output textures");
+      }
+      this.#upload(picture);
+    } catch (error) {
+      this.#endGpuTimer(q);
+      this.#notifyFailure(
+        error instanceof Error ? error.message : String(error),
+      );
+      this.stop();
+      return;
+    } finally {
+      this.#release(picture.data);
+    }
+    if (woven) {
+      if (!picture.interlaced) {
+        // As for a progressive stretch of the element's pictures.
+        if (this.#filmHold > 0) this.#filmHold--;
+        this.#afterProgressive = true;
+      }
+      this.#emitWoven();
+      // Not a neighbour for the filter.
+      this.#frames = 0;
+    } else {
+      if (awaiting && !stale) {
+        const current = this.#held[(this.#head + HISTORY - 1) % HISTORY]!;
+        this.#fieldOrder = current.topFieldFirst;
+        this.#ensureFilm();
+        if (this.#frameIsCurrent(revision))
+          this.#measurePhase(
+            gap ? 1 : 0,
+            Math.round(current.timestamp * 1000),
+            this.#doubleRate,
+          );
+        if (this.#frameIsCurrent(revision)) this.#emit(false, time, rate);
+      } else {
+        this.#gapBehind = gap;
+      }
+      this.#afterProgressive = false;
+      this.#awaiting = true;
+    }
+    if (!this.#frameIsCurrent(revision)) {
+      if (!this.#destroyed) this.#endGpuTimer(q);
+      return;
+    }
+    this.#endGpuTimer(q);
+    this.#renderMsSinceReport += performance.now() - at;
+    this.#renderFramesSinceReport++;
+    this.#report(at);
+  }
+
+  /** Convert a decoded picture into the next history slot. */
+  #upload(picture: DecodedPicture): void {
+    this.#head = (this.#head + 1) % HISTORY;
+    this.#converter!.convert(picture, this.#textures[this.#head]!);
+    const held = this.#held[this.#head]!;
+    held.timestamp = picture.timestamp;
+    held.duration = picture.duration;
+    held.interlaced = picture.interlaced;
+    held.topFieldFirst = picture.topFieldFirst;
+    held.repeatFirstField = picture.repeatFirstField;
+    this.#frames = Math.min(this.#frames + 1, HISTORY);
+    this.#taken = true;
+  }
+
+  /** Queue the newest picture as it is, both fields woven. */
+  #emitWoven(): void {
+    const picture = this.#held[this.#head]!;
+    const slot = this.#spareSlot();
+    if (slot === null) {
+      this.#stats.late++;
+      return;
+    }
+    this.#outputHead = slot;
+    // History textures hold rows from the top and outputs from the bottom.
+    this.#blitTexture(
+      this.#textures[this.#head]!,
+      true,
+      this.#outputs[slot]!.framebuffer,
+    );
+    this.#decodedQueue.push({
+      slot,
+      time: picture.timestamp,
+      picture: picture.timestamp,
+      start: true,
+      scan: decodedScan(picture),
+    });
+  }
+
+  /**
+   * Filter the waiting picture into its outputs: against its successor, or
+   * against itself with `flush`. Each output is queued at its own media time:
+   * a field at its field's time, a film frame at its place in the film
+   * cadence, one picture a frame at the first field's time.
+   */
+  #emit(flush: boolean, time: number, rate: number): void {
+    const picture =
+      this.#held[flush ? this.#head : (this.#head + HISTORY - 1) % HISTORY]!;
+    // Outputs it was given while its successor was late are replaced.
+    const queue = this.#decodedQueue;
+    while (queue.length > 0 && queue.at(-1)!.picture === picture.timestamp)
+      queue.pop();
+    this.#fieldOrder = picture.topFieldFirst;
+    // When the next output is due: the successor's first, or never, as far
+    // as is known, for a picture filtered against itself.
+    const next = flush
+      ? Number.POSITIVE_INFINITY
+      : this.#held[this.#head]!.timestamp;
+    const scan = decodedScan(picture);
+    let queued = false;
+    if (this.#filmLocked && !flush) {
+      const phase = this.#phase.phase;
+      if (phase === FILM_DUPLICATE_PHASE) {
+        this.#filmDropped++;
+        return;
+      }
+      const at = picture.timestamp + (FILM_LEAD[phase] ?? 0) * picture.duration;
+      queued =
+        this.#output(
+          at,
+          at + (picture.duration * PULLDOWN_FRAMES) / FILM_FRAMES,
+          next,
+          picture.timestamp,
+          true,
+          false,
+          null,
+          flush,
+          scan,
+          time,
+          rate,
+        ) !== null;
+    } else if (!this.#doubleRate) {
+      queued =
+        this.#output(
+          picture.timestamp,
+          next,
+          next,
+          picture.timestamp,
+          true,
+          false,
+          null,
+          flush,
+          scan,
+          time,
+          rate,
+        ) !== null;
+    } else {
+      // A repeated first field is the first field again, a third of the
+      // picture's time after the second.
+      const fields = picture.repeatFirstField ? 3 : 2;
+      const step = picture.duration / fields;
+      let first: number | null = null;
+      for (let field = 0; field < fields; field++) {
+        const at = picture.timestamp + field * step;
+        const slot = this.#output(
+          at,
+          field + 1 < fields ? at + step : next,
+          next,
+          picture.timestamp,
+          field === 0,
+          field === 1,
+          field === 2 ? first : null,
+          flush,
+          scan,
+          time,
+          rate,
+        );
+        if (field === 0) first = slot;
+        if (slot !== null) queued = true;
+      }
+    }
+    if (!queued && next <= time) this.#stats.missed++;
+  }
+
+  /**
+   * Filter one output into a slot and queue it for `at`, unless it can never
+   * be shown. `until` is when the output after it is due and `pictureUntil`
+   * when the next picture is. `slot` is a slot already holding the same
+   * field. Returns the slot, or null.
+   */
+  #output(
+    at: number,
+    until: number,
+    pictureUntil: number,
+    picture: number,
+    start: boolean,
+    second: boolean,
+    slot: number | null,
+    flush: boolean,
+    scan: Scan,
+    time: number,
+    rate: number,
+  ): number | null {
+    if (!this.#useful(at, until, pictureUntil, time, rate)) {
+      this.#stats.late++;
+      return null;
+    }
+    if (slot === null) {
+      slot = this.#spareSlot();
+      if (slot === null) {
+        this.#stats.late++;
+        return null;
+      }
+      this.#outputHead = slot;
+      this.#render(flush, second, this.#outputs[slot]!.framebuffer);
+    }
+    this.#decodedQueue.push({ slot, time: at, picture, start, scan });
+    return slot;
+  }
+
+  /**
+   * Whether an output due from `at` until `until` can be shown. A refresh
+   * shows the newest output due by then, so one whose successor is due before
+   * the next refresh after `at` is never seen: at rates the display cannot
+   * keep up with, or after it was due. Refreshes are predicted from `time`,
+   * the media time of the coming one, with a margin for the hysteresis.
+   * While the clock stands still every output of a current picture is kept,
+   * since a paused element shows its picture's first field.
+   */
+  #useful(
+    at: number,
+    until: number,
+    pictureUntil: number,
+    time: number,
+    rate: number,
+  ): boolean {
+    if (rate === 0) return pictureUntil > time;
+    const margin = (2 * PRESENT_HYSTERESIS_MS * rate) / 1000;
+    if (until <= time - margin) return false;
+    const refresh = (this.#refreshMs * rate) / 1000;
+    if (until - at + 2 * margin >= refresh) return true;
+    const refreshes = Math.max(0, Math.ceil((at - margin - time) / refresh));
+    return time + refreshes * refresh < until + margin;
+  }
+
+  /**
+   * Put up the output the coming refresh should show.
+   *
+   * Playing, that is the newest output due by `time`. Where an output's time
+   * is within the hysteresis of `time`, the refresh advances by as many
+   * outputs as the last one did if it can, so that the one slip a field rate
+   * the refresh does not divide into must make happens once rather than
+   * flapping. Paused, it is the first output of the picture `time` falls in.
+   */
+  #showDecoded(time: number, rate: number, paused: boolean): void {
+    const queue = this.#decodedQueue;
+    let index = -1;
+    if (paused) {
+      for (let i = 0; i < queue.length && queue[i]!.picture <= time; i++)
+        if (queue[i]!.start) index = i;
+      if (index < 0) {
+        // The picture is one already shown.
+        const current = this.#shownStart;
+        const previous = this.#previousStart;
+        let start =
+          current !== null && current.picture <= time ? current : null;
+        if (
+          previous !== null &&
+          previous.picture <= time &&
+          (start === null || previous.picture > start.picture)
+        )
+          start = previous;
+        if (start !== null && start !== this.#shownOutput)
+          this.#showOutput(start);
+        return;
+      }
+      this.#advanced = 1;
+    } else {
+      // Outputs already shown in an earlier version, filtered against
+      // themselves while their successor was late.
+      let replaced = 0;
+      while (
+        replaced < queue.length &&
+        queue[replaced]!.time <= this.#shownTime
+      )
+        replaced++;
+      const hysteresis = (PRESENT_HYSTERESIS_MS * rate) / 1000;
+      let due = 0;
+      let near = 0;
+      for (let i = replaced; i < queue.length; i++) {
+        const slack = time - queue[i]!.time;
+        if (slack >= hysteresis) due++;
+        else if (slack >= -hysteresis) near++;
+        else break;
+      }
+      const count = Math.min(Math.max(this.#advanced, due), due + near);
+      this.#advanced = count;
+      if (count === 0) {
+        queue.splice(0, replaced);
+        return;
+      }
+      this.#stats.late += count - 1;
+      index = replaced + count - 1;
+    }
+    const entry = queue[index]!;
+    queue.splice(0, index + 1);
+    this.#showOutput(entry);
+  }
+
+  #showOutput(entry: DecodedOutput): void {
+    const begin = performance.now();
+    const q = this.#beginGpuTimer(true);
+    this.#show(entry.slot);
+    this.#endGpuTimer(q);
+    this.#showMsSinceReport += performance.now() - begin;
+    this.#showFramesSinceReport++;
+    this.#shownOutput = entry;
+    this.#shownTime = entry.time;
+    if (entry === this.#shownStart || entry === this.#previousStart) return;
+    if (entry.start || this.#shownStart?.picture !== entry.picture) {
+      this.#previousStart = this.#shownStart;
+      this.#shownStart = entry.start ? entry : null;
+    }
+  }
+
   /** Take one input into the shared history and decide its YADIF or IVTC presentation. */
   #processFrame(now: DOMHighResTimeStamp, metadata: FrameObservation): void {
     const revision = this.#playbackRevision;
@@ -1983,76 +2834,16 @@ export class Deinterlacer extends EventTarget {
       const begin = performance.now();
       const q = this.#beginGpuTimer(false);
       this.#push();
-      if (this.#film && !this.#filmDegraded && !this.#detector) {
-        // A retry point stood the engine back up; rebuild the detector the
-        // setter would have built. A repeated failure degrades as a new
-        // episode rather than silently idling without pulldown detection.
-        try {
-          this.#ensureDetector();
-        } catch (error) {
-          this.#degradeFilm(
-            `film detector unavailable: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
-      }
+      this.#ensureFilm();
       if (!this.#frameIsCurrent(revision)) {
         if (!this.#destroyed) this.#endGpuTimer(q);
         return;
       }
-      this.#measured = false;
-      this.#matching = false;
-      this.#aheadMeasured = false;
-      if (this.#film && !this.#filmDegraded) {
-        // GPU pulldown detection (otya): a missed frame leaves a gap in the
-        // held frames, so the comparisons carried over would be between
-        // frames that were never neighbours.
-        let measured = false;
-        if (this.#frames === HISTORY && missed === 0) {
-          try {
-            this.#collectPhase();
-            this.#detect();
-            measured = true;
-          } catch (error) {
-            // A GPU failure must not stop the frame loop (e.g. an
-            // incomplete RGBA32F framebuffer despite the extension being
-            // present). The engine stands down with notification -- the
-            // `film` option stays on, so this is not a silent fallback --
-            // and a retry point attempts the GPU path again.
-            this.#degradeFilm(
-              `film detection failed: ${error instanceof Error ? error.message : String(error)}`,
-            );
-          }
-        } else {
-          this.#resetFieldMetrics(true);
-        }
-        this.#phaseCounts[this.#phase.phase] =
-          (this.#phaseCounts[this.#phase.phase] ?? 0) + 1;
-        this.#filmLocked =
-          this.#phase.phase !== 0 && this.#phase.run >= FILM_LOCK_FRAMES;
-        if (this.#filmLocked) this.#filmHold = FILM_HOLD_FRAMES;
-        else if (this.#filmHold > 0) this.#filmHold--;
-        // While the cadence is held, the filter weaves by its phase. Matching
-        // then only covers frames for which the loss of the cadence is read
-        // back late. The counts are for this frame and the frames on either
-        // side of it. They do not apply to a frame that was not measured, or
-        // to one whose previous frame is not its neighbour. The frame after a
-        // gap is measured against the frame from before the gap.
-        this.#measured = measured && !this.#gapBehind;
-        this.#matching = this.#measured && this.#filmHold > 0;
-        // Counts for the next frame are needed only when a second field is
-        // drawn (field path only) and matching runs without a lock, because
-        // only that case looks beyond the frame's own fields.
-        this.#aheadMeasured =
-          this.#matching &&
-          !this.#filmLocked &&
-          this.#doubleRate &&
-          this.#scheduling() &&
-          this.#measureAhead();
-        if (this.#matching && !this.#filmLocked) this.#stats.matched++;
-        if (this.#debug)
-          this.#debugText = this.#describePhase(metadata.presentedFrames);
-      }
-      this.#gapBehind = missed > 0;
+      this.#measurePhase(
+        missed,
+        metadata.presentedFrames,
+        this.#doubleRate && this.#scheduling(),
+      );
       if (!this.#frameIsCurrent(revision)) {
         if (!this.#destroyed) this.#endGpuTimer(q);
         return;
@@ -2149,6 +2940,83 @@ export class Deinterlacer extends EventTarget {
       this.#renderFramesSinceReport++;
       this.#report(at);
     }
+  }
+
+  /** Rebuild the detector a retry point stood the engine back up for. */
+  #ensureFilm(): void {
+    if (this.#film && !this.#filmDegraded && !this.#detector) {
+      // A retry point stood the engine back up; rebuild the detector the
+      // setter would have built. A repeated failure degrades as a new
+      // episode rather than silently idling without pulldown detection.
+      try {
+        this.#ensureDetector();
+      } catch (error) {
+        this.#degradeFilm(
+          `film detector unavailable: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Run the pulldown detection for the frame behind the newest, which is the
+   * one about to be filtered. `missed` is how many frames went unseen before
+   * the newest, `frame` labels the debug overlay, and `secondFields` is
+   * whether the frame's second field is drawn too.
+   */
+  #measurePhase(missed: number, frame: number, secondFields: boolean): void {
+    this.#measured = false;
+    this.#matching = false;
+    this.#aheadMeasured = false;
+    if (this.#film && !this.#filmDegraded) {
+      // GPU pulldown detection (otya): a missed frame leaves a gap in the
+      // held frames, so the comparisons carried over would be between
+      // frames that were never neighbours.
+      let measured = false;
+      if (this.#frames === HISTORY && missed === 0) {
+        try {
+          this.#collectPhase();
+          this.#detect();
+          measured = true;
+        } catch (error) {
+          // A GPU failure must not stop the frame loop (e.g. an
+          // incomplete RGBA32F framebuffer despite the extension being
+          // present). The engine stands down with notification -- the
+          // `film` option stays on, so this is not a silent fallback --
+          // and a retry point attempts the GPU path again.
+          this.#degradeFilm(
+            `film detection failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      } else {
+        this.#resetFieldMetrics(true);
+      }
+      this.#phaseCounts[this.#phase.phase] =
+        (this.#phaseCounts[this.#phase.phase] ?? 0) + 1;
+      this.#filmLocked =
+        this.#phase.phase !== 0 && this.#phase.run >= FILM_LOCK_FRAMES;
+      if (this.#filmLocked) this.#filmHold = FILM_HOLD_FRAMES;
+      else if (this.#filmHold > 0) this.#filmHold--;
+      // While the cadence is held, the filter weaves by its phase. Matching
+      // then only covers frames for which the loss of the cadence is read
+      // back late. The counts are for this frame and the frames on either
+      // side of it. They do not apply to a frame that was not measured, or
+      // to one whose previous frame is not its neighbour. The frame after a
+      // gap is measured against the frame from before the gap.
+      this.#measured = measured && !this.#gapBehind;
+      this.#matching = this.#measured && this.#filmHold > 0;
+      // Counts for the next frame are needed only when a second field is
+      // drawn (field path only) and matching runs without a lock, because
+      // only that case looks beyond the frame's own fields.
+      this.#aheadMeasured =
+        this.#matching &&
+        !this.#filmLocked &&
+        secondFields &&
+        this.#measureAhead();
+      if (this.#matching && !this.#filmLocked) this.#stats.matched++;
+      if (this.#debug) this.#debugText = this.#describePhase(frame);
+    }
+    this.#gapBehind = missed > 0;
   }
 
   #frameIsCurrent(revision: number): boolean {
@@ -2474,9 +3342,16 @@ export class Deinterlacer extends EventTarget {
     if (!this.#running || this.#lost) return;
     this.#measureRefresh(now);
     const revision = this.#playbackRevision;
-    this.#videoFrames.flush(now);
+    if (this.#decoded) {
+      if (this.#externalHost || this.#workerState === "main")
+        this.#presentPictures();
+      else this.#postClock();
+    } else {
+      this.#videoFrames.flush(now);
+      if (!this.#frameIsCurrent(revision)) return;
+      if (this.#workerState === "main") this.#present(this.#gridAt, now);
+    }
     if (!this.#frameIsCurrent(revision)) return;
-    if (this.#workerState === "main") this.#present(this.#gridAt, now);
     this.#loopRequest = this.#armAnimationFrame(this.#onLoop);
   };
 
@@ -2613,6 +3488,7 @@ export class Deinterlacer extends EventTarget {
   #startCaptureLoop(): void {
     if (
       this.#externalHost ||
+      this.#decoded ||
       this.#captureRequest !== null ||
       !this.#videoFrames.captureDriven ||
       !this.#running ||
@@ -2737,8 +3613,20 @@ export class Deinterlacer extends EventTarget {
   }
 
   #showTexture(texture: WebGLTexture, flip = false, countOutput = true): void {
+    this.#blitTexture(texture, flip, null);
+    this.#presentedPicture = { kind: "texture", texture, flip };
+    this.#setVisible(true);
+    if (countOutput) this.#outputSinceReport++;
+  }
+
+  /** Copy a texture onto the canvas or into an output. */
+  #blitTexture(
+    texture: WebGLTexture,
+    flip: boolean,
+    target: WebGLFramebuffer | null,
+  ): void {
     const gl = this.#gl;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target);
     gl.useProgram(this.#blit);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, texture);
@@ -2746,9 +3634,6 @@ export class Deinterlacer extends EventTarget {
     gl.uniform1i(this.#blitFlip, flip ? 1 : 0);
     gl.viewport(0, 0, this.#width, this.#height);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
-    this.#presentedPicture = { kind: "texture", texture, flip };
-    this.#setVisible(true);
-    if (countOutput) this.#outputSinceReport++;
   }
 
   /**
@@ -2797,7 +3682,9 @@ export class Deinterlacer extends EventTarget {
     const elapsed = at - this.#reportedAt;
     if (elapsed < STATS_INTERVAL_MS) return;
     const frames =
-      this.#scheduling() && (this.#doubleRate || this.#filmLocked)
+      !this.#decoded &&
+      this.#scheduling() &&
+      (this.#doubleRate || this.#filmLocked)
         ? this.#showFramesSinceReport
         : this.#renderFramesSinceReport;
     // Keep the published per-input-picture CPU cost: both fields' filtering
@@ -3012,8 +3899,10 @@ export class Deinterlacer extends EventTarget {
     if (!this.#wrapper) return;
     const video = this.#video;
     // The size the picture is to be seen at, sample aspect ratio and all.
-    const displayWidth = video.videoWidth;
-    const displayHeight = video.videoHeight;
+    const displayWidth = this.#decoded ? this.#displayWidth : video.videoWidth;
+    const displayHeight = this.#decoded
+      ? this.#displayHeight
+      : video.videoHeight;
     if (displayWidth === 0 || displayHeight === 0) return;
     const scale = Math.min(
       video.offsetWidth / displayWidth,
@@ -3066,7 +3955,9 @@ export class Deinterlacer extends EventTarget {
       this.#textures.push(texture);
     }
     this.#freeOutputs();
-    if (this.#doubleRate || this.#film) this.#allocateOutputs();
+    if (this.#doubleRate || this.#film || this.#decoded)
+      this.#allocateOutputs();
+    this.#converter?.resize(width, height);
     this.#detector?.resize(width, height);
     // Fresh resources mean fresh attempts: a degraded engine retries on the
     // next frame instead of staying stood down for the stream's lifetime.
@@ -3138,6 +4029,9 @@ export class Deinterlacer extends EventTarget {
     // released. Do not leave a snapshot pointing at a deleted output texture.
     if (this.#outputs.some((output) => output.texture === shownTexture))
       this.#presentedPicture = null;
+    this.#shownOutput = null;
+    this.#shownStart = null;
+    this.#previousStart = null;
     for (const { texture, framebuffer } of this.#outputs) {
       gl.deleteFramebuffer(framebuffer);
       gl.deleteTexture(texture);
@@ -3182,7 +4076,14 @@ export class Deinterlacer extends EventTarget {
 
   /** Forward a media event with the page's playback state that gives it meaning. */
   #postWorkerEvent(
-    name: "emptied" | "pause" | "ended" | "seeking" | "seeked" | "ratechange",
+    name:
+      | "emptied"
+      | "pause"
+      | "ended"
+      | "seeking"
+      | "seeked"
+      | "ratechange"
+      | "waiting",
   ): boolean {
     if (!this.#worker || this.#workerState === "main") return false;
     this.#worker.postMessage({
@@ -3194,6 +4095,11 @@ export class Deinterlacer extends EventTarget {
   }
 
   #onEmptied = (): void => {
+    if (this.#decoded) {
+      this.#clock.hold();
+      this.#postWorkerEvent("emptied");
+      return;
+    }
     if (this.#postWorkerEvent("emptied")) {
       this.#closePendingWorkerFrame();
       this.#setVisible(false);
@@ -3246,6 +4152,11 @@ export class Deinterlacer extends EventTarget {
    * A new seek invalidates any destination frame remembered for the last one.
    */
   #onSeeking = (): void => {
+    if (this.#decoded) {
+      this.#clock.hold();
+      this.#postWorkerEvent("seeking");
+      return;
+    }
     if (this.#postWorkerEvent("seeking")) {
       this.#closePendingWorkerFrame();
       return;
@@ -3259,6 +4170,14 @@ export class Deinterlacer extends EventTarget {
    * the one the first field was taken at.
    */
   #onFlush = (event: Event): void => {
+    // Decoded pictures are shown by the clock, which only has to start again.
+    if (this.#decoded) {
+      this.#clock.hold();
+      this.#postWorkerEvent(
+        event.type as "pause" | "ended" | "seeked" | "ratechange",
+      );
+      return;
+    }
     if (event.type === "ratechange") {
       if (this.#videoFrames.captureDriven) this.#startCaptureLoop();
       else this.#stopCaptureLoop();
@@ -3321,6 +4240,13 @@ export class Deinterlacer extends EventTarget {
       this.#lastPresented = 0;
       this.#resetFieldMetrics();
     }
+  };
+
+  /** The element ran out of data. Its readings stop moving until it has more. */
+  #onWaiting = (): void => {
+    if (!this.#decoded) return;
+    this.#clock.hold();
+    this.#postWorkerEvent("waiting");
   };
 
   /**

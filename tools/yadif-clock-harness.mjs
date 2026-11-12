@@ -66,16 +66,22 @@ export class Clock {
 /**
  * Structured-clone semantics for the mock transport: plain data is copied so
  * the realms cannot alias it, while the transferables the protocol carries
- * (`VideoFrame`, `OffscreenCanvas`, `ImageBitmap`) cross by reference.
+ * (`VideoFrame`, `OffscreenCanvas`, `ImageBitmap`) cross by reference. An
+ * ArrayBuffer in the transfer list is moved, which detaches the sender's.
  */
-function cloneMessage(value) {
+function cloneMessage(value, transfer = []) {
   if (value === null || typeof value !== "object") return value;
   if (value.__transferable) return value;
+  if (Object.prototype.toString.call(value) === "[object ArrayBuffer]")
+    return transfer.includes(value)
+      ? structuredClone(value, { transfer: [value] })
+      : value.slice(0);
   if (ArrayBuffer.isView(value)) return value.slice();
-  if (Array.isArray(value)) return value.map(cloneMessage);
+  if (Array.isArray(value))
+    return value.map((entry) => cloneMessage(entry, transfer));
   const copy = {};
   for (const [key, entry] of Object.entries(value))
-    copy[key] = cloneMessage(entry);
+    copy[key] = cloneMessage(entry, transfer);
   return copy;
 }
 
@@ -91,6 +97,10 @@ class WebGL2RenderingContext {
   RGBA = 0x1908;
   UNSIGNED_BYTE = 0x1401;
   RGBA32F = 0x8814;
+  R8 = 0x8229;
+  RED = 0x1903;
+  UNPACK_ALIGNMENT = 0x0cf5;
+  UNPACK_ROW_LENGTH = 0x0cf2;
   FLOAT = 0x1406;
   ALREADY_SIGNALED = 0x911a;
   TRIANGLES = 0x0004;
@@ -115,6 +125,7 @@ class WebGL2RenderingContext {
   #textures = new Map();
   #uniforms = new Map();
   #nextId = 1;
+  #unpack = new Map([[0x0cf5, 4], [0x0cf2, 0]]);
 
   getExtension(name) { return name === "EXT_color_buffer_float" ? {} : null; }
   createShader(kind) { return { kind, source: "" }; }
@@ -143,7 +154,23 @@ class WebGL2RenderingContext {
     if (source && this.#texture)
       this.#texture.mediaTime = source.pictureTime ?? source.currentTime ?? source.timestamp / 1e6;
   }
-  texSubImage2D() {}
+  texStorage2D(target, levels, format, width, height) {
+    if (this.#texture) Object.assign(this.#texture, { format, width, height });
+  }
+  pixelStorei(name, value) { this.#unpack.set(name, value); }
+  // Decoded planes: the test says which picture a buffer holds.
+  texSubImage2D(target, level, x, y, width, height, format, type, data, offset) {
+    if (!ArrayBuffer.isView(data) || !this.#texture) return;
+    this.#texture.mediaTime = __host.pictureTime(data.buffer);
+    __host.upload(__realm, {
+      buffer: data.buffer,
+      width,
+      height,
+      offset,
+      alignment: this.#unpack.get(this.UNPACK_ALIGNMENT),
+      rowLength: this.#unpack.get(this.UNPACK_ROW_LENGTH),
+    });
+  }
   deleteTexture() {}
   createFramebuffer() { return { id: this.#nextId++ }; }
   bindFramebuffer(target, framebuffer) { this.#framebuffer = framebuffer; }
@@ -161,6 +188,7 @@ class WebGL2RenderingContext {
     this.#uniforms.set(location.program + ":" + location.name, value);
   }
   uniform2i() {}
+  uniform4fv() {}
   viewport() {}
   readPixels() { __host.readback(__realm, this.#framebuffer.texture); }
   drawBuffers() {}
@@ -182,14 +210,19 @@ class WebGL2RenderingContext {
     const blit = (this.#program && this.#program.fragment || "").includes(__blitMark);
     const uniform = name => this.#uniforms.get(this.#program.id + ":" + name);
     const current = this.#textures.get(uniform("uCur"));
-    const picture = blit ? this.#texture?.picture : {
+    const fragment = (this.#program && this.#program.fragment) || "";
+    // The conversion of a decoded picture into a history texture.
+    const luma = fragment.includes("uLuma") ? this.#textures.get(uniform("uLuma")) : null;
+    const picture = luma ? { mediaTime: luma.mediaTime, converted: true }
+      : blit ? this.#texture?.picture : {
       mediaTime: current?.mediaTime,
       second: uniform("uSecond"),
+      parity: uniform("uParity"),
       match: uniform("uMatch"),
       instant: uniform("uInstant"),
     };
     if (this.#framebuffer) this.#framebuffer.texture.picture = picture;
-    const fragment = (this.#program && this.#program.fragment) || "";
+    if (luma && this.#framebuffer) this.#framebuffer.texture.mediaTime = luma.mediaTime;
     __host.draw(__realm, {
       t: __host.now(),
       blit,
@@ -544,6 +577,10 @@ export async function run(bundles, options = {}) {
     programAvailable = () => true,
     filmMetrics = null,
     arrival = null,
+    refreshMs = REFRESH_MS,
+    serveDelay = null,
+    pictureTime = () => undefined,
+    upload = null,
     deinterlacerOptions = {},
     consoleOutput = console,
   } = options;
@@ -607,6 +644,10 @@ export async function run(bundles, options = {}) {
     metrics(realm, into) {
       filmMetrics?.({ realm, t: clock.now, into });
     },
+    pictureTime: (buffer) => pictureTime(buffer),
+    upload(realm, record) {
+      upload?.({ realm, t: clock.now, ...record });
+    },
     draw(realm, record) {
       draws[realm].push(record);
     },
@@ -656,8 +697,8 @@ export async function run(bundles, options = {}) {
     closeWorker() {
       workerAlive = false;
     },
-    pageToWorker(id, data) {
-      const payload = cloneMessage(data);
+    pageToWorker(id, data, transfer) {
+      const payload = cloneMessage(data, transfer);
       if (data.type !== "frame") commands.push({ t: clock.now, ...payload });
       // A transferred OffscreenCanvas belongs to the receiving realm, and the
       // Worker checks `gl instanceof WebGL2RenderingContext` against its own
@@ -676,8 +717,8 @@ export async function run(bundles, options = {}) {
         workerContext.self.onmessage?.({ data: payload });
       });
     },
-    workerToPage(data) {
-      const payload = cloneMessage(data);
+    workerToPage(data, transfer) {
+      const payload = cloneMessage(data, transfer);
       if (data.type === "consumed") acked.push({ id: data.id, at: clock.now });
       clock.at(clock.now + CONTROL_TRANSIT_MS, () => {
         pageWorker?.onmessage?.({ data: payload });
@@ -746,13 +787,16 @@ export async function run(bundles, options = {}) {
   );
 
   const video = pageContext.__video;
-  /** Serve one animation frame from a window, unless it is suspended. */
-  const serve = (name, timeOrigin) => {
+  /**
+   * Serve one animation frame from a window, unless it is suspended. The
+   * callbacks may run after the refresh they are stamped with.
+   */
+  const serve = (name, timeOrigin, at) => {
     const queue = queueFor(name);
     if (queue.suspended) return;
     const pending = [...queue.pending.values()];
     queue.pending.clear();
-    for (const callback of pending) callback(clock.now - timeOrigin);
+    for (const callback of pending) callback(at - timeOrigin);
   };
 
   /** Where each window's outstanding requests are, by window name. */
@@ -767,6 +811,7 @@ export async function run(bundles, options = {}) {
     video,
     pageContext,
     views,
+    now: () => clock.now,
     outstanding,
     requests,
     cancels,
@@ -822,12 +867,12 @@ export async function run(bundles, options = {}) {
   };
 
   for (let vsync = 0; vsync < vsyncs; vsync++) {
-    const at = BASE_MS + vsync * REFRESH_MS;
-    clock.at(at, () => {
+    const at = BASE_MS + vsync * refreshMs;
+    clock.at(at + (serveDelay?.(vsync) ?? 0), () => {
       beforeVsync?.(vsync, control);
-      serve("worker", workerTimeOrigin);
+      serve("worker", workerTimeOrigin, at);
       for (const [name, window] of views)
-        serve(name, window.performance.timeOrigin);
+        serve(name, window.performance.timeOrigin, at);
       // By default a frame arrives every other refresh. `arrival` overrides
       // this per refresh.
       const arrives = arrival ? arrival(vsync) : vsync % 2 === 0;
@@ -853,7 +898,7 @@ export async function run(bundles, options = {}) {
           : expected,
       });
     });
-    await clock.runUntil(at + REFRESH_MS - 1e-6);
+    await clock.runUntil(at + refreshMs - 1e-6);
   }
 
   const realm = rendering === "main" ? "page" : "worker";
