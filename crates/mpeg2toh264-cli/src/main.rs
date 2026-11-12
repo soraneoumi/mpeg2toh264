@@ -48,6 +48,11 @@ Options:
       --surround-audio-gain <n>
                             The same for audio of more than two channels
                             (default: the --audio-gain value)
+      --split-groups        Cut each group of pictures into units of one anchor
+                            picture and the B pictures coded after it, each its
+                            own fragment, so that the media can be played as
+                            soon as it has arrived. The samples are the same as
+                            without it. MP4 output from a transport stream only
   -j, --threads <n>         Convert this many pictures at once (default: 1).
                             The output is the same whatever this is set to.
                             MP4 output from a transport stream only
@@ -83,6 +88,7 @@ fn parse_args(args: &[String]) -> Invocation {
     let mut recovery_interval: usize = 24;
     let mut open_gop_recovery = OpenGopRecovery::Idr;
     let mut split_field_samples = true;
+    let mut split_groups = false;
     let mut quiet = false;
     let mut passthrough = false;
     let mut threads: usize = 1;
@@ -98,6 +104,7 @@ fn parse_args(args: &[String]) -> Invocation {
             "-s" | "--split-field-samples" => split_field_samples = true,
             "--no-split-field-samples" => split_field_samples = false,
             "-p" | "--passthrough" => passthrough = true,
+            "--split-groups" => split_groups = true,
             "-o" | "--oversample" => {
                 i += 1;
                 let Some(value) = args.get(i) else {
@@ -207,6 +214,7 @@ fn parse_args(args: &[String]) -> Invocation {
             } else {
                 VideoMode::Transcode
             },
+            split_groups,
         },
         audio_gain: AudioGain { stereo, surround },
     }))

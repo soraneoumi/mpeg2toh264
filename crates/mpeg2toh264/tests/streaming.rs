@@ -6,13 +6,18 @@ mod support;
 use std::collections::HashMap;
 
 use mpeg2toh264::container::adts::AdtsStream;
+use mpeg2toh264::mpeg2::constants::PictureType;
+use mpeg2toh264::mpeg2::gop_stream::Mpeg2Gop;
 use mpeg2toh264::mpeg2::gop_stream::Mpeg2GopStream;
 use mpeg2toh264::mpeg2::headers::parse_elementary_stream;
-use mpeg2toh264::{AudioGain, DualMono, Fragment, OpenGopRecovery, Session, TranscodeOptions};
+use mpeg2toh264::{
+    AudioGain, DualMono, Fragment, OpenGopRecovery, Session, TranscodeOptions, VideoMode,
+};
 use support::{
-    adts_frame, adts_frame_with_payload, adts_stream, mux_programs, mux_transport_stream,
-    read_fixture, wrap_mpeg2_es_in_ts, PesUnit, AUDIO_PID, STREAM_TYPE_AAC_ADTS,
-    STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID,
+    adts_frame, adts_frame_with_payload, adts_stream, init_segments, mux_programs,
+    mux_transport_stream, non_intra_matrix_extension, picture_starts, read_fixture, track_samples,
+    with_extension_in_pictures, wrap_mpeg2_es_in_ts, PesUnit, TrackSample, AUDIO_PID, FIXTURES,
+    STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID,
 };
 
 /// Offset of the first `00 00 01 B8` group header.
@@ -2491,4 +2496,664 @@ fn a_reported_restart_position_reopens_at_the_same_fragment() {
         audio_samples > 0,
         "the safe restart carries the audio track"
     );
+}
+
+// ------------------------------------------------------------- split groups
+
+fn splitting(options: TranscodeOptions) -> TranscodeOptions {
+    TranscodeOptions {
+        split_groups: true,
+        ..options
+    }
+}
+
+/// Say where two sample lists first disagree, rather than printing both.
+fn assert_same_samples(
+    label: &str,
+    track: &str,
+    whole: &[TrackSample],
+    split: &[TrackSample],
+    compare_bytes: bool,
+) {
+    assert_eq!(
+        whole.len(),
+        split.len(),
+        "{label}: {track} sample count, whole groups against split"
+    );
+    for (index, (whole, split)) in whole.iter().zip(split).enumerate() {
+        let timing = |sample: &TrackSample| {
+            (
+                sample.decode_time,
+                sample.composition_time,
+                sample.duration,
+                sample.sync,
+            )
+        };
+        assert_eq!(
+            timing(whole),
+            timing(split),
+            "{label}: {track} sample {index} (decode time, composition time, duration, sync)"
+        );
+        if compare_bytes {
+            assert!(
+                whole.data == split.data,
+                "{label}: {track} sample {index} has other bytes"
+            );
+        }
+    }
+}
+
+/// Cutting the groups changes where the fragments end and nothing else: the
+/// initialization segments and every sample of both tracks come out as they do
+/// when the groups go out whole.
+fn assert_split_matches_whole(label: &str, stream: &[u8], options: TranscodeOptions) {
+    let whole = run_session_with_options(stream, 64 * 1024, options);
+    let split = run_session_with_options(stream, 64 * 1024, splitting(options));
+    assert!(
+        init_segments(&whole) == init_segments(&split),
+        "{label}: the initialization segments differ"
+    );
+    let (whole, split) = (track_samples(&whole), track_samples(&split));
+    assert!(!whole.video.is_empty(), "{label}: the stream made no video");
+    assert_same_samples(label, "video", &whole.video, &split.video, true);
+    assert_same_samples(label, "audio", &whole.audio, &split.audio, true);
+}
+
+/// Every video sample the session makes, split or not.
+fn video_sample_count(fragments: &[Fragment]) -> usize {
+    fragments
+        .iter()
+        .map(|fragment| match fragment {
+            Fragment::Media { video_samples, .. } => *video_samples,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// One PES per group, stamped where the group plays, as a broadcast does.
+fn grouped_video_stream(groups: &[Vec<u8>]) -> Vec<u8> {
+    let units: Vec<PesUnit<'_>> = groups
+        .iter()
+        .enumerate()
+        .map(|(index, payload)| PesUnit {
+            pid: VIDEO_PID,
+            stream_id: 0xe0,
+            payload,
+            pts: Some(900_000 + index as u64 * GOP_TICKS),
+        })
+        .collect();
+    mux_transport_stream(
+        &[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)],
+        &units,
+        &mut HashMap::new(),
+    )
+}
+
+#[test]
+fn cutting_groups_changes_the_fragments_and_not_the_samples() {
+    let mut streams: Vec<(String, Vec<u8>)> = vec![
+        ("ibbp".into(), video_only_stream(5)),
+        ("ibbp with sound".into(), timed_av_stream(5)),
+        (
+            "open gop".into(),
+            wrap_mpeg2_es_in_ts(
+                &read_fixture("open_gop_leading_bb.m2v"),
+                Some(900_000),
+                &mut HashMap::new(),
+            ),
+        ),
+        ("mixed reordering".into(), mixed_reordering_stream()),
+    ];
+    for name in FIXTURES {
+        let copies = if name == "hd1080i.m2v" { 2 } else { 4 };
+        streams.push((name.into(), video_stream_from_fixture(name, copies)));
+    }
+    // No fixture is coded as field pictures, so a group that mixes frame
+    // pictures with field pairs, whose access unit delimiters the cut would
+    // move, has no stream here to compare.
+    for (name, stream) in &streams {
+        for video in [VideoMode::Transcode, VideoMode::Passthrough] {
+            for open_gop_recovery in [
+                OpenGopRecovery::Idr,
+                OpenGopRecovery::RecoveryPoint,
+                OpenGopRecovery::Discard,
+            ] {
+                let options = TranscodeOptions {
+                    video,
+                    open_gop_recovery,
+                    recovery_interval: 2,
+                    ..TranscodeOptions::default()
+                };
+                assert_split_matches_whole(
+                    &format!("{name}, {video:?}, {open_gop_recovery:?}"),
+                    stream,
+                    options,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn cutting_groups_splits_them_into_an_anchor_and_the_b_pictures_after_it() {
+    // The fixture codes I P B B P B B P B B P B B P B, so the units are the
+    // opening I with its P and their two B pictures, three more anchors with
+    // two, and a last with one. The opening fragment has the IDR's clone as
+    // well.
+    let fragments = run_session_with_options(
+        &video_only_stream(2),
+        64 * 1024,
+        splitting(TranscodeOptions::default()),
+    );
+    let (_, media) = split_fragments(&fragments);
+    let samples: Vec<usize> = media
+        .iter()
+        .map(|fragment| match fragment {
+            Fragment::Media { video_samples, .. } => *video_samples,
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(samples, vec![5, 3, 3, 3, 2, 4, 3, 3, 3, 2]);
+
+    let restarts: Vec<_> = media
+        .iter()
+        .map(|fragment| match fragment {
+            Fragment::Media {
+                random_access,
+                restart_offset,
+                ..
+            } => (*random_access, *restart_offset),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(
+        restarts,
+        vec![
+            (true, Some(0)),
+            (false, None),
+            (false, None),
+            (false, None),
+            (false, None),
+            (false, Some(0)),
+            (false, None),
+            (false, None),
+            (false, None),
+            (false, None),
+        ],
+        "only a fragment that opens a group can be reopened from"
+    );
+}
+
+/// How many transport packets had gone in when the first media fragment came
+/// out.
+fn packets_before_the_first_fragment(stream: &[u8], options: TranscodeOptions) -> usize {
+    let mut session = Session::new(options);
+    for (index, packet) in stream.chunks(188).enumerate() {
+        let fragments = session.push(packet).expect("push succeeds");
+        if fragments
+            .iter()
+            .any(|fragment| matches!(fragment, Fragment::Media { .. }))
+        {
+            return index + 1;
+        }
+    }
+    panic!("no media fragment came out");
+}
+
+#[test]
+fn a_fragment_comes_out_before_its_group_is_complete() {
+    let stream = video_only_stream(3);
+    let whole = packets_before_the_first_fragment(&stream, TranscodeOptions::default());
+    let split = packets_before_the_first_fragment(&stream, splitting(TranscodeOptions::default()));
+    // The first unit is complete once the second anchor picture's header is in,
+    // which is a third of the way into the group, where a whole group needs the
+    // header of the one after it.
+    assert!(
+        split * 2 < whole,
+        "the first fragment came after {split} packets where the group needs {whole}"
+    );
+}
+
+#[test]
+fn a_split_stream_gets_a_recovery_point_every_twenty_fourth_group() {
+    let options = splitting(TranscodeOptions {
+        recovery_interval: 24,
+        ..TranscodeOptions::default()
+    });
+    let fragments = run_session_with_options(&video_only_stream(26), 256 * 1024, options);
+    let (_, media) = split_fragments(&fragments);
+    let restarts: Vec<usize> = media
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| {
+            matches!(
+                f,
+                Fragment::Media {
+                    random_access: true,
+                    ..
+                }
+            )
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        restarts,
+        vec![0, 24 * 5],
+        "the opening fragment, then the first of every 24th group's five"
+    );
+}
+
+#[test]
+fn the_result_of_a_split_stream_does_not_depend_on_how_the_input_is_chunked() {
+    let options = splitting(TranscodeOptions::default());
+    let stream = timed_av_stream(3);
+    let coarse = run_session_with_options(&stream, 1 << 20, options);
+    let fine = run_session_with_options(&stream, 1000, options);
+    assert_eq!(video_sample_count(&coarse), video_sample_count(&fine));
+    assert!(init_segments(&coarse) == init_segments(&fine));
+    let (coarse, fine) = (track_samples(&coarse), track_samples(&fine));
+    assert_same_samples("chunking", "video", &coarse.video, &fine.video, true);
+    assert_same_samples("chunking", "audio", &coarse.audio, &fine.audio, true);
+
+    let video_only = video_only_stream(3);
+    let coarse = run_session_with_options(&video_only, 1 << 20, options);
+    let fine = run_session_with_options(&video_only, 1000, options);
+    assert_eq!(coarse.len(), fine.len());
+    for (a, b) in coarse.iter().zip(&fine) {
+        match (a, b) {
+            (Fragment::Init { data: a, .. }, Fragment::Init { data: b, .. }) => assert_eq!(a, b),
+            (
+                Fragment::Media {
+                    data: a, start: sa, ..
+                },
+                Fragment::Media {
+                    data: b, start: sb, ..
+                },
+            ) => {
+                assert_eq!(a, b);
+                assert_eq!(sa, sb);
+            }
+            _ => panic!("fragment kinds diverged"),
+        }
+    }
+}
+
+/// The picture at `index` of `source` with the second half of its last slice
+/// overwritten, so that it will not decode.
+fn with_picture_damaged(source: &[u8], index: usize) -> Vec<u8> {
+    let pictures = parse_elementary_stream(source).expect("parses");
+    let slice = pictures[index]
+        .slices
+        .last()
+        .expect("the picture has slices");
+    let start = slice.data_start_bit.div_ceil(8);
+    let end = slice.data_end_bit.expect("the last slice ends") / 8;
+    let mut damaged = source.to_vec();
+    damaged[(start + end) / 2..end].fill(0xff);
+    damaged
+}
+
+#[test]
+fn a_picture_that_will_not_decode_leaves_the_others_where_they_were() {
+    // The B picture of the second group's third unit is damaged. Sent whole,
+    // the pictures after it keep their display slots and the decode clock
+    // simply runs one sample short; the units have to say the same between
+    // them.
+    let one = read_fixture("ibbp.m2v");
+    let mut groups = vec![one.clone(), one.clone(), one.clone(), one.clone()];
+    // Pictures 0-14 are the first group; the third unit of the second is
+    // P9 B7 B8, at 22, 23 and 24.
+    groups[1] = with_picture_damaged(&one, 8);
+    let stream = grouped_video_stream(&groups);
+
+    for video in [VideoMode::Transcode, VideoMode::Passthrough] {
+        let options = TranscodeOptions {
+            video,
+            ..TranscodeOptions::default()
+        };
+        let whole = run_session_with_options(&stream, 64 * 1024, options);
+        let split = run_session_with_options(&stream, 64 * 1024, splitting(options));
+        let (whole_samples, split_samples) = (track_samples(&whole), track_samples(&split));
+        // The converted stream loses the damaged picture, and gains the clone
+        // of the IDR the hole in front of the next group makes it open with.
+        // Passthrough carries the damaged picture, which is the decoder's to
+        // deal with, and has no clone to add.
+        let expected = if video == VideoMode::Transcode {
+            61
+        } else {
+            60
+        };
+        assert_eq!(video_sample_count(&whole), expected, "{video:?}");
+        assert_same_samples(
+            &format!("damaged group, {video:?}"),
+            "video",
+            &whole_samples.video,
+            &split_samples.video,
+            true,
+        );
+        let restarts = |fragments: &[Fragment]| {
+            fragments
+                .iter()
+                .filter(|fragment| {
+                    matches!(
+                        fragment,
+                        Fragment::Media {
+                            random_access: true,
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+        assert_eq!(
+            restarts(&split),
+            restarts(&whole),
+            "{video:?}: no restart point appears before the next group"
+        );
+    }
+}
+
+#[test]
+fn a_hole_inside_a_group_leaves_what_follows_it_in_its_place() {
+    // Losing a packet part way into the second group, at several places, so
+    // that the group is cut at every kind of boundary. The pictures complete
+    // before the hole are the ones that are kept, and nothing of the group
+    // comes after it.
+    let stream = grouped_video_stream(&vec![read_fixture("ibbp.m2v"); 3]);
+    let packets = stream.len() / 188;
+    let mut cases = 0;
+    for at in (packets / 3..packets * 2 / 3).step_by(23) {
+        let lossy = with_packets_dropped(&stream, at, 1);
+        let whole = run_session_with_options(&lossy, 64 * 1024, TranscodeOptions::default());
+        let split =
+            run_session_with_options(&lossy, 64 * 1024, splitting(TranscodeOptions::default()));
+        let (whole, split) = (track_samples(&whole), track_samples(&split));
+        assert_same_samples(
+            &format!("packet {at} lost"),
+            "video",
+            &whole.video,
+            &split.video,
+            true,
+        );
+        cases += 1;
+    }
+    assert!(cases > 4);
+}
+
+#[test]
+fn a_unit_continuing_a_group_is_coded_against_the_scale_its_group_opened_with() {
+    // Every picture but the first of each group loads a matrix of its own, so
+    // the first picture of a unit in the middle of a group does too. The group
+    // sent whole is coded against the list its first picture has, and a unit
+    // that took the list from its own would come out differently.
+    let one = read_fixture("ibbp.m2v");
+    let extension = non_intra_matrix_extension(&[24; 64]);
+    let pictures: Vec<usize> = (0..45).filter(|index| index % 15 != 0).collect();
+    let adapted = with_extension_in_pictures(&one.repeat(3), &pictures, &extension);
+    let stream = wrap_mpeg2_es_in_ts(&adapted, Some(900_000), &mut HashMap::new());
+    assert_split_matches_whole(
+        "matrix on every later picture",
+        &stream,
+        TranscodeOptions::default(),
+    );
+}
+
+#[test]
+fn a_unit_continuing_a_group_keeps_the_matrices_the_group_loaded() {
+    // The first picture of a group loads a matrix, and the pictures after it
+    // inherit it. The units after the first have to be decoded against it as
+    // well, though nothing in them says so.
+    let one = read_fixture("ibbp.m2v");
+    let extension = non_intra_matrix_extension(&[24; 64]);
+    let adapted = with_extension_in_pictures(&one.repeat(3), &[0, 15, 30], &extension);
+    let plain = wrap_mpeg2_es_in_ts(&one.repeat(3), Some(900_000), &mut HashMap::new());
+    let stream = wrap_mpeg2_es_in_ts(&adapted, Some(900_000), &mut HashMap::new());
+    assert_split_matches_whole(
+        "matrix on the first picture",
+        &stream,
+        TranscodeOptions::default(),
+    );
+
+    let plain = track_samples(&run_session(&plain, 64 * 1024));
+    let adapted = track_samples(&run_session(&stream, 64 * 1024));
+    assert!(
+        plain.video[..]
+            .iter()
+            .zip(&adapted.video)
+            .any(|(a, b)| a.data != b.data),
+        "the matrix reaches the pictures"
+    );
+}
+
+#[test]
+fn a_picture_whose_slot_an_earlier_unit_covered_is_dropped_by_both_sides() {
+    // A B picture coded again in the middle of the second unit, with a
+    // temporal reference the first unit has used already. The timeline and the
+    // transcoder both leave it out, or the fragment would claim a sample the
+    // access units do not have.
+    let one = read_fixture("ibbp.m2v");
+    let starts = picture_starts(&one);
+    let stray = one[starts[2]..starts[3]].to_vec();
+    let mut doubled = one[..starts[6]].to_vec();
+    doubled.extend_from_slice(&stray);
+    doubled.extend_from_slice(&one[starts[6]..]);
+    let stream = grouped_video_stream(&[doubled, one.clone()]);
+
+    for video in [VideoMode::Transcode, VideoMode::Passthrough] {
+        let options = TranscodeOptions {
+            video,
+            ..TranscodeOptions::default()
+        };
+        let whole = run_session_with_options(&stream, 64 * 1024, options);
+        let split = run_session_with_options(&stream, 64 * 1024, splitting(options));
+        assert_eq!(
+            video_sample_count(&split) + 1,
+            video_sample_count(&whole),
+            "{video:?}: the repeated slot's picture is the one left out"
+        );
+    }
+}
+
+/// Every unit a splitter cuts `chunks` into, with the timestamp each chunk
+/// carries.
+fn split_into_units(splitter: &mut Mpeg2GopStream, chunks: &[(&[u8], u64)]) -> Vec<Mpeg2Gop> {
+    let mut units = Vec::new();
+    for &(chunk, pts) in chunks {
+        units.extend(splitter.push(chunk, Some(pts)));
+    }
+    units.extend(splitter.finish());
+    units
+}
+
+fn picture_types(unit: &Mpeg2Gop) -> Vec<PictureType> {
+    parse_elementary_stream(&unit.data)
+        .expect("a unit parses")
+        .iter()
+        .map(|picture| picture.header.picture_coding_type)
+        .collect()
+}
+
+#[test]
+fn cuts_a_group_before_each_anchor_that_follows_a_b_picture() {
+    use PictureType::{B, I, P};
+    let one = read_fixture("ibbp.m2v");
+    let starts = picture_starts(&one);
+    let header = &one[..first_gop_offset(&one)];
+    let mut splitter = Mpeg2GopStream::with_split_groups(true);
+    let units = split_into_units(&mut splitter, &[(&one.repeat(2), 0)]);
+
+    let types: Vec<Vec<PictureType>> = units.iter().map(picture_types).collect();
+    let group = vec![
+        vec![I, P, B, B],
+        vec![P, B, B],
+        vec![P, B, B],
+        vec![P, B, B],
+        vec![P, B],
+    ];
+    assert_eq!(types, [group.clone(), group].concat());
+    assert_eq!(
+        units
+            .iter()
+            .map(|unit| unit.continues_group)
+            .collect::<Vec<_>>(),
+        [false, true, true, true, true].repeat(2)
+    );
+    assert_eq!(
+        units
+            .iter()
+            .map(|unit| unit.group_goes_on)
+            .collect::<Vec<_>>(),
+        [true, true, true, true, false].repeat(2)
+    );
+
+    // A unit in the middle of a group is the sequence header put in front of
+    // the pictures, which are the source's own bytes.
+    let second = &units[1];
+    assert_eq!(
+        second.data,
+        [header, &one[starts[4]..starts[7]]].concat(),
+        "no group header, and the pictures are untouched"
+    );
+    let continuing = parse_elementary_stream(&second.data).expect("parses");
+    assert!(continuing.iter().all(|picture| !picture.starts_gop));
+    assert!(parse_elementary_stream(&units[0].data).expect("parses")[0].starts_gop);
+}
+
+#[test]
+fn a_unit_cut_from_a_group_has_a_timestamp_only_where_a_pes_begins() {
+    let one = read_fixture("ibbp.m2v");
+    let starts = picture_starts(&one);
+
+    // One PES per picture, so every unit begins where a timestamp does.
+    let mut bounds = vec![0];
+    bounds.extend_from_slice(&starts[1..]);
+    bounds.push(one.len());
+    let chunks: Vec<(&[u8], u64)> = bounds
+        .windows(2)
+        .enumerate()
+        .map(|(index, pair)| (&one[pair[0]..pair[1]], 1_000 + index as u64 * 100))
+        .collect();
+    let units = split_into_units(&mut Mpeg2GopStream::with_split_groups(true), &chunks);
+    assert_eq!(
+        units.iter().map(|unit| unit.pts).collect::<Vec<_>>(),
+        [0, 4, 7, 10, 13]
+            .iter()
+            .map(|&picture| Some(1_000 + picture * 100))
+            .collect::<Vec<_>>()
+    );
+
+    // One PES for the whole group: the timestamp that covers a later unit
+    // belongs to the picture the group opens with.
+    let units = split_into_units(
+        &mut Mpeg2GopStream::with_split_groups(true),
+        &[(&one, 1_000)],
+    );
+    assert_eq!(
+        units.iter().map(|unit| unit.pts).collect::<Vec<_>>(),
+        vec![Some(1_000), None, None, None, None]
+    );
+}
+
+#[test]
+fn leaves_a_group_without_b_pictures_whole() {
+    let stream = read_fixture("ip.m2v").repeat(3);
+    let whole = split_into_units(&mut Mpeg2GopStream::new(), &[(&stream, 0)]);
+    let split = split_into_units(
+        &mut Mpeg2GopStream::with_split_groups(true),
+        &[(&stream, 0)],
+    );
+    assert_eq!(whole.len(), 6);
+    assert_eq!(
+        split.iter().map(|unit| &unit.data).collect::<Vec<_>>(),
+        whole.iter().map(|unit| &unit.data).collect::<Vec<_>>()
+    );
+    assert!(split
+        .iter()
+        .all(|unit| !unit.continues_group && !unit.group_goes_on));
+}
+
+/// A picture header and one slice, with the bytes the splitter reads and
+/// nothing else: it looks at start codes and the coding type, and decodes
+/// nothing.
+fn stub_picture(temporal_reference: u16, coding_type: u8) -> Vec<u8> {
+    vec![
+        0,
+        0,
+        1,
+        0x00,
+        (temporal_reference >> 2) as u8,
+        ((temporal_reference & 3) << 6) as u8 | coding_type << 3 | 0x07,
+        0xff,
+        0xf8,
+        0,
+        0,
+        1,
+        0x01,
+        0x55,
+        0x55,
+        0x55,
+    ]
+}
+
+#[test]
+fn keeps_the_two_fields_of_an_anchor_frame_together() {
+    // Coding types in decode order: an I field with its P field, two B frames
+    // as field pairs, a P pair, and two more B pairs. Only the pair that
+    // follows a B picture starts a unit.
+    let sequence = [
+        0, 0, 1, 0xb3, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf1,
+    ];
+    let group = [0, 0, 1, 0xb8, 0x11, 0x22, 0x33, 0x44];
+    let types = [1, 2, 3, 3, 3, 3, 2, 2, 3, 3];
+    let mut es = [sequence.as_slice(), group.as_slice()].concat();
+    for (index, coding_type) in types.into_iter().enumerate() {
+        es.extend(stub_picture(index as u16, coding_type));
+    }
+    // The next group, which is what closes the first.
+    es.extend_from_slice(&sequence);
+    es.extend_from_slice(&group);
+    es.extend(stub_picture(0, 1));
+
+    let units = split_into_units(&mut Mpeg2GopStream::with_split_groups(true), &[(&es, 0)]);
+    let coding_types = |unit: &Mpeg2Gop| -> Vec<u8> {
+        picture_starts(&unit.data)
+            .iter()
+            .map(|&at| (unit.data[at + 5] >> 3) & 7)
+            .collect()
+    };
+    assert_eq!(
+        units.iter().map(coding_types).collect::<Vec<_>>(),
+        vec![vec![1, 2, 3, 3, 3, 3], vec![2, 2, 3, 3], vec![1]]
+    );
+}
+
+#[test]
+fn does_not_cut_in_the_rest_of_a_group_after_a_gap() {
+    use PictureType::{B, I, P};
+    let one = read_fixture("ibbp.m2v");
+    let starts = picture_starts(&one);
+    let mut splitter = Mpeg2GopStream::with_split_groups(true);
+    let mut units = splitter.push(&one[..starts[8]], None);
+    // The tail of the group arrives after the gap, with picture starts of every
+    // kind in it, and none of it is a unit: what it follows was lost.
+    splitter.discard_pending();
+    units.extend(splitter.push(&one[starts[8]..], None));
+    units.extend(splitter.push(&one, None));
+    units.extend(splitter.finish());
+
+    let types: Vec<Vec<PictureType>> = units.iter().map(picture_types).collect();
+    assert_eq!(
+        types,
+        vec![
+            vec![I, P, B, B],
+            vec![P, B, B],
+            // The group opened after the tail, which is cut as any other.
+            vec![I, P, B, B],
+            vec![P, B, B],
+            vec![P, B, B],
+            vec![P, B, B],
+            vec![P, B],
+        ]
+    );
+    assert!(!units[2].continues_group);
 }

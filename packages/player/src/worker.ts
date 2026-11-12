@@ -597,6 +597,9 @@ class Playback {
         this.#command.splitFieldSamples,
         this.#command.passthrough,
         this.#command.openGopRecovery,
+        // Live input: send small fragments so media reaches the buffer
+        // without waiting for its whole group of pictures.
+        this.#totalBytes === null,
       );
       converter.usePool(this.#pool);
       // A PID the program map has yet to name is remembered until it does, so

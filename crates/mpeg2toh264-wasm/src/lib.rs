@@ -170,7 +170,13 @@ impl Session {
     /// conversion costs almost nothing -- but a browser that does not decode
     /// MPEG-2 plays none of it. Ask `MediaSource.isTypeSupported` with the
     /// `mimeCodec` the init fragment reports before relying on it.
+    ///
+    /// `splitGroups` cuts each group of pictures into fragments of one anchor
+    /// picture and the B pictures coded after it, so that media reaches the
+    /// player as soon as it has arrived instead of once its group has. The
+    /// samples are the same either way. `undefined` sends whole groups.
     #[wasm_bindgen(constructor)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         oversample: Option<f64>,
         origin_ticks: Option<f64>,
@@ -179,6 +185,7 @@ impl Session {
         split_field_samples: Option<bool>,
         passthrough: Option<bool>,
         open_gop_recovery: Option<String>,
+        split_groups: Option<bool>,
     ) -> Result<Session, JsError> {
         let defaults = TranscodeOptions::default();
         let oversample = oversample.unwrap_or(defaults.oversample);
@@ -219,6 +226,7 @@ impl Session {
                     } else {
                         VideoMode::Transcode
                     },
+                    split_groups: split_groups.unwrap_or(defaults.split_groups),
                 },
                 origin,
                 service_id,

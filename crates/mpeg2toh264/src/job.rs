@@ -352,6 +352,8 @@ impl PictureContext {
                     1 | 3 => VideoMode::Passthrough,
                     other => bail!("picture job names video mode {other}"),
                 },
+                // Where a unit is cut has no bearing on how a picture is coded.
+                split_groups: false,
             },
             mbaff: flags & FLAG_MBAFF != 0,
             real_idr: flags & FLAG_REAL_IDR != 0,
@@ -446,6 +448,7 @@ mod tests {
                 open_gop_recovery: OpenGopRecovery::Idr,
                 split_field_samples: true,
                 video: VideoMode::Transcode,
+                split_groups: false,
             },
             mbaff: true,
             real_idr: false,

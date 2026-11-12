@@ -137,6 +137,12 @@ pub struct TranscodeOptions {
     /// Ignored by [`transcode`] itself, which is the conversion; it is
     /// [`crate::Session`] that decides between the two paths.
     pub video: VideoMode,
+    /// Cut each group of pictures into units of one anchor picture and the B
+    /// pictures coded after it, each of which becomes a fragment of its own.
+    /// The pictures and their timing are the same either way; only the
+    /// fragment boundaries move, so that media can be handed on as soon as it
+    /// has arrived rather than once its group has.
+    pub split_groups: bool,
 }
 
 impl Default for TranscodeOptions {
@@ -147,6 +153,7 @@ impl Default for TranscodeOptions {
             open_gop_recovery: OpenGopRecovery::default(),
             split_field_samples: true,
             video: VideoMode::default(),
+            split_groups: false,
         }
     }
 }
@@ -289,6 +296,15 @@ pub struct UnitRequest {
     /// the sound has changed its configuration, say, and the video's own
     /// description is as it was.
     pub description: bool,
+    /// How many display slots of its group earlier units have already covered,
+    /// for a unit that continues one, and zero for one that opens its group. A
+    /// picture whose slot is among them is dropped, as the MP4 timeline does.
+    pub consumed: u32,
+    /// The scaling list the unit is coded against, when it is not to be taken
+    /// from the unit's own first picture: a unit that continues a group uses
+    /// the list the group's first unit did, whatever matrices its own first
+    /// picture carries.
+    pub scaling: Option<[i32; 64]>,
 }
 
 /// What one unit becomes, worked out from its headers alone.
@@ -310,6 +326,8 @@ pub struct UnitPlan {
     /// Whether the parameter sets went in front of this unit, which is what
     /// gives the fragment it becomes an initialization segment.
     described: bool,
+    /// The scaling list the unit was coded against.
+    scaling: [i32; 64],
 }
 
 impl UnitPlan {
@@ -394,7 +412,7 @@ pub fn plan_unit(
     // several times within one group -- is coded against this one rather than
     // dropped, and the quantiser search absorbs the difference: the step it
     // picks scales with the list the decoder holds.
-    let scaling = first.quant.non_intra;
+    let scaling = request.scaling.unwrap_or(first.quant.non_intra);
 
     let mut parts: Vec<Part> = Vec::new();
     let mut description_parts: Vec<Part> = Vec::new();
@@ -440,6 +458,7 @@ pub fn plan_unit(
     let mut pictures_skipped = 0usize;
     let mut recovery_emitted = false;
     let mut pending_recovery_copy: Option<(usize, Option<usize>, u32)> = None;
+    let mut group_consumed = request.consumed;
 
     // A stream restarting at a random access point has an empty decoded picture
     // buffer and an unstarted display order, so it begins from nothing.
@@ -566,12 +585,23 @@ pub fn plan_unit(
             continue;
         }
         let tr = pic.header.temporal_reference;
-        if pic.starts_gop && state.seen_picture {
-            state.gop_base += state.max_tr_in_gop + 1;
-            state.max_tr_in_gop = 0;
+        if pic.starts_gop {
+            group_consumed = 0;
+            if state.seen_picture {
+                state.gop_base += state.max_tr_in_gop + 1;
+                state.max_tr_in_gop = 0;
+            }
         }
         state.seen_picture = true;
         state.max_tr_in_gop = state.max_tr_in_gop.max(tr);
+
+        // The slot belongs to a picture an earlier unit already sent. The MP4
+        // timeline drops it for the same reason and has to make the identical
+        // decision.
+        if tr < group_consumed {
+            pictures_skipped += 1;
+            continue;
+        }
 
         // A lone field is no frame. The MP4 timeline drops it for the same
         // reason and has to make the identical decision.
@@ -742,6 +772,7 @@ pub fn plan_unit(
         pictures_skipped,
         recovery_emitted,
         described,
+        scaling,
     })
 }
 
@@ -937,6 +968,9 @@ pub struct IncrementalTranscoder {
     random_access_pending: bool,
     recovery_point_pending: bool,
     description_pending: bool,
+    /// The scaling list of the last unit that opened a group, which the units
+    /// that continue it are coded against.
+    group_scaling: Option<[i32; 64]>,
     pictures_converted: usize,
     pictures_skipped: usize,
     stats: Stats,
@@ -973,6 +1007,7 @@ impl IncrementalTranscoder {
             random_access_pending: false,
             recovery_point_pending: false,
             description_pending: false,
+            group_scaling: None,
             pictures_converted: 0,
             pictures_skipped: 0,
             stats: Stats::default(),
@@ -1025,7 +1060,13 @@ impl IncrementalTranscoder {
 
     /// Convert one unit here and now.
     pub fn push(&mut self, data: &[u8]) -> Result<TranscodeResult> {
-        let mut jobs = self.begin(data)?;
+        self.push_continuing(data, 0)
+    }
+
+    /// [`Self::push`] for a unit that continues a group, when `consumed` display
+    /// slots of that group have already gone out.
+    pub fn push_continuing(&mut self, data: &[u8], consumed: u32) -> Result<TranscodeResult> {
+        let mut jobs = self.begin_continuing(data, consumed)?;
         loop {
             let mut outputs = Vec::with_capacity(jobs.len());
             for job in &jobs {
@@ -1046,10 +1087,23 @@ impl IncrementalTranscoder {
     /// the transcoder moves until then, so a unit that is begun and abandoned
     /// costs only what it took to plan.
     pub fn begin(&mut self, data: &[u8]) -> Result<Vec<Vec<u8>>> {
+        self.begin_continuing(data, 0)
+    }
+
+    /// [`Self::begin`] for a unit that continues a group, when `consumed`
+    /// display slots of that group have already gone out. Zero means the unit
+    /// opens its group.
+    pub fn begin_continuing(&mut self, data: &[u8], consumed: u32) -> Result<Vec<Vec<u8>>> {
         let request = UnitRequest {
             random_access: self.state.initialized && self.random_access_pending,
             recovery_point: self.state.initialized && self.recovery_point_pending,
             description: self.description_pending,
+            consumed,
+            scaling: if consumed > 0 {
+                self.group_scaling
+            } else {
+                None
+            },
         };
         let undecodable = Vec::new();
         let mut plan = plan_unit(data, &self.state, self.options, request, &undecodable)?;
@@ -1115,6 +1169,9 @@ impl IncrementalTranscoder {
             self.stats.add(&output.stats);
         }
         self.state = flight.plan.state;
+        if flight.request.consumed == 0 {
+            self.group_scaling = Some(flight.plan.scaling);
+        }
         self.random_access_pending = false;
         self.recovery_point_pending =
             flight.request.recovery_point && !flight.plan.recovery_emitted;

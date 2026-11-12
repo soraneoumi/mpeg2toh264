@@ -77,7 +77,8 @@ pub enum Fragment {
         width: u32,
         height: u32,
     },
-    /// One GOP of media.
+    /// One unit of media: a whole GOP, or, when the session cuts groups, one
+    /// anchor picture of it with the B pictures coded after it.
     Media {
         data: Vec<u8>,
         /// Where this fragment starts on the presentation timeline, in seconds.
@@ -87,6 +88,8 @@ pub enum Fragment {
         random_access: bool,
         /// Recent PAT/PMT start from which a new session for the same service
         /// can demux this GOP, relative to this session's first input byte.
+        /// None for a fragment that continues a group: a session opening
+        /// there would skip to the next group, which starts later than this.
         restart_offset: Option<u64>,
         video_samples: usize,
         audio_samples: usize,
@@ -171,6 +174,19 @@ struct Ready {
     audio: Vec<AacFrame>,
     plan: UnitPlan,
     starts_at_idr: bool,
+    /// The display slots of its group that went out before it, which the plan
+    /// was drawn knowing and the transcoder has to be told as well.
+    consumed: u32,
+}
+
+/// How a unit sits against the display clock of its group, worked out from the
+/// timeline that is finally packaged.
+struct UnitLag {
+    /// Ticks to add to every composition offset of the unit.
+    ticks: u32,
+    /// How far the display clock runs ahead of the decode clock once the unit
+    /// has gone out, or `None` when nothing of the group has been laid down.
+    after: Option<u64>,
 }
 
 /// How far a session got, for a caller converting the pictures itself.
@@ -300,10 +316,28 @@ pub struct Session {
     open_gop_recovery: OpenGopRecovery,
 
     sequence_number: u32,
-    /// Where the next fragment starts, in 90 kHz ticks.
+    /// Where the next fragment starts, in 90 kHz ticks. This is the decode
+    /// clock: it advances by what the pictures laid down last, and the sound is
+    /// paired against it.
     video_presentation_start: u64,
     audio_frames_emitted: u64,
+    /// Groups that went out, which is what the recovery interval counts: the
+    /// units of a cut group count once.
     gops_emitted: usize,
+    /// How many display slots of the group the last unit belonged to have been
+    /// used up, so that the next unit, if it continues that group, counts its
+    /// own from there. It moves when a unit is finished and not while one is
+    /// only being planned, which happens again for as long as the unit waits
+    /// for its sound.
+    slots_consumed: u32,
+    /// How far the group's display clock runs ahead of the decode clock, once a
+    /// unit of it has been laid down. Pictures the source lost leave their
+    /// display slots empty without moving the decode clock, and the units
+    /// after them have to keep their places all the same.
+    group_lag: Option<u64>,
+    /// Ticks the next unit of the group gives up, because recovery copies that
+    /// ended the last one took their decode instants from it.
+    owed_ticks: u32,
     media_bytes_since_random_access: usize,
     initialized: bool,
     /// What the initialization segment that went out describes, and so what a
@@ -466,7 +500,7 @@ impl Session {
     pub fn anchored(options: TranscodeOptions, origin_ticks: Option<u64>) -> Self {
         Self {
             demuxer: MpegTsAvDemuxer::new(),
-            gops: Mpeg2GopStream::new(),
+            gops: Mpeg2GopStream::with_split_groups(options.split_groups),
             adts: AdtsStream::new(),
             video: match options.video {
                 VideoMode::Transcode => {
@@ -484,6 +518,9 @@ impl Session {
             video_presentation_start: 0,
             audio_frames_emitted: 0,
             gops_emitted: 0,
+            slots_consumed: 0,
+            group_lag: None,
+            owed_ticks: 0,
             media_bytes_since_random_access: 0,
             initialized: false,
             described: None,
@@ -646,7 +683,7 @@ impl Session {
                 self.finish_gop(ready, None, &mut out)?;
                 continue;
             };
-            let jobs = transcoder.begin(&ready.gop.data)?;
+            let jobs = transcoder.begin_continuing(&ready.gop.data, ready.consumed)?;
             self.converting = Some(ready);
             return Ok(Progress::Pending {
                 fragments: out,
@@ -826,9 +863,33 @@ impl Session {
     /// Whether the fragment about to be emitted opens at an IDR. This includes
     /// periodic recovery in discard mode so the timeline and transcoder omit
     /// the same leading pictures.
-    fn starts_at_idr(&self) -> bool {
+    fn starts_at_idr(&self, gop: &Mpeg2Gop) -> bool {
         self.video.awaiting_random_access()
-            || (self.open_gop_recovery == OpenGopRecovery::Discard && self.is_random_access_point())
+            || (self.open_gop_recovery == OpenGopRecovery::Discard && self.recovery_due(gop))
+    }
+
+    /// Whether a periodic restart point falls on this unit. Only a unit that
+    /// opens a group can carry one: the interval counts groups, and a restart
+    /// in the middle of one would cut across the pictures its leading units
+    /// predict from.
+    fn recovery_due(&self, gop: &Mpeg2Gop) -> bool {
+        !gop.continues_group && self.is_random_access_point()
+    }
+
+    /// The display slots of the unit's group that went out before it.
+    fn consumed_before(&self, gop: &Mpeg2Gop) -> u32 {
+        if gop.continues_group {
+            self.slots_consumed
+        } else {
+            0
+        }
+    }
+
+    /// Whether the unit follows the one before it on the decode clock and in
+    /// the source's timestamps, with nothing to settle against either: it
+    /// continues a group that is being laid down, and starts nothing new.
+    fn follows_on(gop: &Mpeg2Gop, starts_at_idr: bool) -> bool {
+        gop.continues_group && !starts_at_idr
     }
 
     /// Work out what one unit turns into, on whichever path this session is on.
@@ -838,10 +899,22 @@ impl Session {
     /// measured against; a unit that turns out to hold a damaged picture is
     /// drawn again by [`Self::package`] once the transcoder has said so.
     fn plan_unit(&self, gop: &Mpeg2Gop, starts_at_idr: bool) -> Result<UnitPlan> {
-        let mut timed = timed_mpeg2_unit(&gop.data, !starts_at_idr, &[], self.rff)?;
+        let mut timed = timed_mpeg2_unit(
+            &gop.data,
+            !starts_at_idr,
+            &[],
+            self.rff,
+            self.consumed_before(gop),
+        )?;
         // A seek, missing GOP, or timestamp jump resets the timing phase.
         // The ordinary hole handling accounts for any outstanding half field.
-        if let (Some(pts), Some(expected)) = (gop.pts, self.expected_pts) {
+        // A unit in the middle of a group is timed against the ones before it
+        // in the group, whose own timestamps it does not carry.
+        if let (Some(pts), Some(expected), false) = (
+            gop.pts,
+            self.expected_pts,
+            Self::follows_on(gop, starts_at_idr),
+        ) {
             let difference = (pts as i64 - timed.source_offset - expected + PTS_MODULUS / 2)
                 .rem_euclid(PTS_MODULUS)
                 - PTS_MODULUS / 2;
@@ -850,6 +923,61 @@ impl Session {
             }
         }
         Ok(self.plan_from_timed(timed))
+    }
+
+    /// Tell a unit's timeline where it sits in its group: how far its display
+    /// slots sit from the decode clock, what the unit before it left for it to
+    /// give up, and whether a unit after it will have to.
+    ///
+    /// This is set when the unit is planned, since what the fragment spans
+    /// decides how much sound goes in it.
+    fn place_in_group(&self, gop: &Mpeg2Gop, starts_at_idr: bool, plan: &mut UnitPlan) {
+        let lag = Self::unit_lag(self.group_lag, gop, starts_at_idr, plan.timed());
+        let timeline = plan.timeline_mut();
+        timeline.lag_ticks = lag.ticks;
+        timeline.borrowed_ticks = if Self::follows_on(gop, starts_at_idr) {
+            self.owed_ticks
+        } else {
+            0
+        };
+        timeline.defer_recovery_borrow = gop.group_goes_on;
+    }
+
+    /// Where a unit's display slots sit against the decode clock, given what
+    /// the group has laid down so far.
+    ///
+    /// A unit that opens a group, or restarts the decoder, starts its group's
+    /// display clock afresh; so does one that continues a group nothing has
+    /// been laid down for. The rest are timed against the clock the group's
+    /// earlier units have kept: the slots between the end of what they laid
+    /// down and the unit's first picture were empty, and are kept empty here.
+    ///
+    /// This is read off the timeline that is packaged, which is not always the
+    /// one that was planned: a picture that proves undecodable draws it again.
+    fn unit_lag(
+        group_lag: Option<u64>,
+        gop: &Mpeg2Gop,
+        starts_at_idr: bool,
+        timed: &TimedUnit,
+    ) -> UnitLag {
+        let timeline = &timed.unit.timeline;
+        let first = timeline.first_presentation_time();
+        let laid_down: u64 = timeline
+            .sample_durations
+            .iter()
+            .map(|&duration| u64::from(duration))
+            .sum();
+        match group_lag.filter(|_| Self::follows_on(gop, starts_at_idr)) {
+            Some(lag) => UnitLag {
+                ticks: (lag + first) as u32,
+                after: Some((lag + timed.span_ticks).saturating_sub(laid_down)),
+            },
+            None => UnitLag {
+                ticks: 0,
+                after: (!timeline.presentation_indices.is_empty())
+                    .then(|| timed.span_ticks.saturating_sub(first + laid_down)),
+            },
+        }
     }
 
     fn plan_from_timed(&self, mut timed: TimedUnit) -> UnitPlan {
@@ -945,6 +1073,11 @@ impl Session {
     /// A jump too long to sit through is left as a gap instead; see
     /// [`Session::open_a_gap`].
     fn hold_over_hole(&mut self, gop: &Mpeg2Gop, plan: &mut UnitPlan) -> Result<()> {
+        // A unit in the middle of a group has no sample to hold with, and its
+        // place against the ones before it is kept by the group's lag instead.
+        if Self::follows_on(gop, self.starts_at_idr(gop)) {
+            return Ok(());
+        }
         let (Some(expected), Some(start)) = (self.expected_pts, Self::unit_start_pts(gop, plan))
         else {
             return Ok(());
@@ -967,11 +1100,11 @@ impl Session {
             self.open_a_gap(ahead as u64, start);
             return Ok(());
         }
-        if !self.starts_at_idr() {
+        if !self.starts_at_idr(gop) {
             self.video.request_random_access();
             // The plan was drawn for a unit that continues the one before it,
             // and this one no longer does.
-            let timed = timed_mpeg2_unit(&gop.data, false, &[], plan.timed().before)?;
+            let timed = timed_mpeg2_unit(&gop.data, false, &[], plan.timed().before, 0)?;
             *plan = self.plan_from_timed(timed);
         }
         plan.timeline_mut().hold_ticks = ahead as u32;
@@ -1043,8 +1176,9 @@ impl Session {
             }
             let gop = self.pending_gops.remove(0);
             self.note_description(&gop);
-            let mut plan = self.plan_unit(&gop, self.starts_at_idr())?;
+            let mut plan = self.plan_unit(&gop, self.starts_at_idr(&gop))?;
             self.hold_over_hole(&gop, &mut plan)?;
+            self.place_in_group(&gop, self.starts_at_idr(&gop), &mut plan);
             return Ok(Some(self.commit(gop, Vec::new(), plan)));
         }
         // A unit goes out as soon as the sound that belongs beside it has
@@ -1068,11 +1202,12 @@ impl Session {
         // changing calls for a new one.
         self.note_description(&gop);
         self.note_audio_description();
-        let mut plan = self.plan_unit(&gop, self.starts_at_idr())?;
+        let mut plan = self.plan_unit(&gop, self.starts_at_idr(&gop))?;
         // Before the audio is measured against the video, since a hole held
         // over is part of what the fragment spans and so of what it carries.
         self.hold_over_hole(&gop, &mut plan)?;
-        let starts_at_idr = self.starts_at_idr();
+        let starts_at_idr = self.starts_at_idr(&gop);
+        self.place_in_group(&gop, starts_at_idr, &mut plan);
         self.align_timelines(&gop, &plan);
         let video_duration = mpeg2_fragment_duration(plan.timeline(), plan.lead_in(starts_at_idr));
         // Audio is measured from where the audio track itself starts, not
@@ -1104,7 +1239,7 @@ impl Session {
     /// Settle what a unit that is going out will be: whether it carries a
     /// restart point, and so what its plan is.
     fn commit(&mut self, gop: Mpeg2Gop, audio: Vec<AacFrame>, plan: UnitPlan) -> Ready {
-        if self.is_random_access_point() {
+        if self.recovery_due(&gop) {
             match self.open_gop_recovery {
                 OpenGopRecovery::Idr | OpenGopRecovery::RecoveryPoint => {
                     self.video.request_recovery_point();
@@ -1114,6 +1249,7 @@ impl Session {
         }
         let starts_at_idr = self.video.awaiting_random_access();
         Ready {
+            consumed: self.consumed_before(&gop),
             gop,
             audio,
             plan,
@@ -1203,11 +1339,52 @@ impl Session {
             audio: audio_frames,
             plan,
             starts_at_idr,
+            consumed,
         } = ready;
         let gop = &gop;
-        // Aligning can still move the origin, so read the start after it.
         self.align_timelines(gop, &plan);
-        let start = self.video_presentation_start as f64 / TIMESCALE as f64;
+
+        let config = audio_frames
+            .first()
+            .map(|frame| frame.config.clone())
+            .or_else(|| self.audio_config.clone());
+        let audio_track = config.as_ref().map(|config| Fmp4AudioSamples {
+            config: config.clone(),
+            samples: audio_frames
+                .iter()
+                .map(|frame| frame.data.clone())
+                .collect(),
+            base_decode_time: self.audio_base_decode_time(config.sample_rate),
+        });
+        let (fragment, recovery_point, lag) = self.package(
+            gop,
+            &plan,
+            starts_at_idr,
+            consumed,
+            config.as_ref(),
+            audio_track.as_ref(),
+            h264,
+        )?;
+        // What the group has used up and laid down counts for the units after
+        // it whether or not this one made a fragment. So does the field clock,
+        // for a unit in the middle of a group: the next one has nothing else to
+        // be timed from.
+        self.slots_consumed = plan.timed().slots_after;
+        self.group_lag = lag.after;
+        if gop.continues_group {
+            self.rff = plan.timed().after;
+        }
+        // A unit that yielded no picture, with no audio to carry alongside it,
+        // makes a moof describing no samples of anything. A recording cut mid
+        // group ends with one, and there is nothing in it for a SourceBuffer to
+        // play. The transcoder has already seen it, which is what the unit was
+        // worth.
+        if fragment.sample_count == 0 && audio_frames.is_empty() {
+            return Ok(());
+        }
+        // Aligning can still move the origin, so read the start after it.
+        let start =
+            (self.video_presentation_start + u64::from(lag.ticks)) as f64 / TIMESCALE as f64;
         let first_time = plan.timeline().first_presentation_time();
         let mut scans: Vec<VideoScan> = (0..plan.timeline().presentation_indices.len())
             .map(|index| {
@@ -1223,47 +1400,33 @@ impl Session {
         scans.sort_by(|a, b| a.start.total_cmp(&b.start));
         scans.dedup_by(|next, previous| next.scan == previous.scan);
 
-        let config = audio_frames
-            .first()
-            .map(|frame| frame.config.clone())
-            .or_else(|| self.audio_config.clone());
-        let audio_track = config.as_ref().map(|config| Fmp4AudioSamples {
-            config: config.clone(),
-            samples: audio_frames
-                .iter()
-                .map(|frame| frame.data.clone())
-                .collect(),
-            base_decode_time: self.audio_base_decode_time(config.sample_rate),
-        });
-        let (fragment, recovery_point) = self.package(
-            gop,
-            &plan,
-            starts_at_idr,
-            config.as_ref(),
-            audio_track.as_ref(),
-            h264,
-        )?;
-        // A unit that yielded no picture, with no audio to carry alongside it,
-        // makes a moof describing no samples of anything. A recording cut mid
-        // group ends with one, and there is nothing in it for a SourceBuffer to
-        // play. The transcoder has already seen it, which is what the unit was
-        // worth.
-        if fragment.sample_count == 0 && audio_frames.is_empty() {
-            return Ok(());
-        }
         self.sequence_number += 1;
         self.video_presentation_start += fragment.duration;
+        if fragment.sample_count > 0 {
+            self.owed_ticks = fragment.deferred_ticks;
+        }
         // Where the unit after this one is expected to open, read from this
         // one's own timestamp rather than accumulated, so that the presentation
         // and the source cannot creep apart. The hold at the front covered the
         // hole in front of this unit and is not part of what it spans.
+        //
+        // A unit in the middle of a group has no timestamp of its own to read
+        // it from, and its predecessor's expectation moves on by what it laid
+        // down.
         let hold = plan.timeline().hold_ticks as u64;
-        if let Some(start) = Self::unit_start_pts(gop, &plan) {
-            self.expected_pts = Some(start + fragment.duration.saturating_sub(hold) as i64);
+        let span = fragment.duration.saturating_sub(hold) as i64;
+        if Self::follows_on(gop, starts_at_idr) {
+            if let Some(expected) = self.expected_pts.as_mut() {
+                *expected += span;
+            }
+        } else if let Some(start) = Self::unit_start_pts(gop, &plan) {
+            self.expected_pts = Some(start + span);
         }
         self.rff = plan.timed().after;
         self.audio_frames_emitted += audio_frames.len() as u64;
-        self.gops_emitted += 1;
+        if !gop.continues_group {
+            self.gops_emitted += 1;
+        }
 
         // Whichever path made the fragment describes it exactly when the
         // pictures in it are the first coded under their description, which is
@@ -1293,7 +1456,7 @@ impl Session {
             data: fragment.media_segment,
             start,
             random_access,
-            restart_offset: gop.restart_offset,
+            restart_offset: gop.restart_offset.filter(|_| !gop.continues_group),
             video_samples: fragment.sample_count,
             audio_samples: audio_frames.len(),
             scans,
@@ -1302,22 +1465,25 @@ impl Session {
     }
 
     /// Turn one unit into a fragment, by whichever path this session is on,
-    /// and say whether a decoder can be started on it.
+    /// say whether a decoder can be started on it, and where it sits against
+    /// the group's display clock.
+    #[allow(clippy::too_many_arguments)]
     fn package(
         &mut self,
         gop: &Mpeg2Gop,
         plan: &UnitPlan,
         starts_at_idr: bool,
+        consumed: u32,
         audio: Option<&AacConfig>,
         audio_track: Option<&Fmp4AudioSamples>,
         converted: Option<TranscodeResult>,
-    ) -> Result<(Fmp4Fragment, bool)> {
+    ) -> Result<(Fmp4Fragment, bool, UnitLag)> {
         match (&mut self.video, plan) {
             (VideoPipeline::Transcode(transcoder), UnitPlan::Transcode(timed)) => {
                 let timeline = &timed.unit.timeline;
                 let h264 = match converted {
                     Some(h264) => h264,
-                    None => transcoder.push(&gop.data)?,
+                    None => transcoder.push_continuing(&gop.data, consumed)?,
                 };
                 // The plan reached this unit without decoding a slice, so it
                 // reserved a sample for every picture that had one. A picture
@@ -1331,17 +1497,21 @@ impl Session {
                         !starts_at_idr,
                         &h264.undecodable,
                         timed.before,
+                        consumed,
                     )?;
                     redrawn.unit.timeline.split_field_samples = timeline.split_field_samples;
                     redrawn.unit.timeline.hold_ticks = timeline.hold_ticks;
+                    redrawn.unit.timeline.borrowed_ticks = timeline.borrowed_ticks;
+                    redrawn.unit.timeline.defer_recovery_borrow = timeline.defer_recovery_borrow;
+                    redrawn.unit.timeline.lag_ticks =
+                        Self::unit_lag(self.group_lag, gop, starts_at_idr, &redrawn).ticks;
                     Some(redrawn)
                 } else {
                     None
                 };
-                let timeline = match &redrawn {
-                    Some(redrawn) => &redrawn.unit.timeline,
-                    None => timeline,
-                };
+                let timed = redrawn.as_ref().unwrap_or(timed);
+                let lag = Self::unit_lag(self.group_lag, gop, starts_at_idr, timed);
+                let timeline = &timed.unit.timeline;
                 let fragment = h264_gop_to_fmp4(
                     &h264.bitstream,
                     timeline,
@@ -1350,7 +1520,7 @@ impl Session {
                     audio,
                     audio_track,
                 )?;
-                Ok((fragment, h264.recovery_point))
+                Ok((fragment, h264.recovery_point, lag))
             }
             (
                 VideoPipeline::Passthrough {
@@ -1361,6 +1531,7 @@ impl Session {
                 UnitPlan::Passthrough(timed),
             ) => {
                 let unit = &timed.unit;
+                let lag = Self::unit_lag(self.group_lag, gop, starts_at_idr, timed);
                 // A unit yields samples only once a picture a decoder can
                 // begin at has arrived, which is what this was waiting for.
                 *awaiting_intra &= unit.samples.is_empty();
@@ -1384,7 +1555,7 @@ impl Session {
                     audio,
                     audio_track,
                 )?;
-                Ok((fragment, recovery_point))
+                Ok((fragment, recovery_point, lag))
             }
             // The pipeline is chosen once, at construction, and the plan is
             // made by it.

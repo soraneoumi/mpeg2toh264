@@ -8,7 +8,7 @@ use mpeg2toh264::mpeg2::{gop_stream::Mpeg2GopStream, headers::parse_elementary_s
 use mpeg2toh264::{
     mpeg2_video_timeline, Fragment, PictureEncoder, Progress, Session, TranscodeOptions, VideoMode,
 };
-use support::{read_fixture, wrap_mpeg2_es_in_ts};
+use support::{init_segments, read_fixture, track_samples, wrap_mpeg2_es_in_ts};
 
 const ORIGIN: u64 = 891_000;
 const START: u64 = 900_000;
@@ -504,6 +504,52 @@ fn video_and_rff_emit_without_any_following_picture_on_all_paths() {
                     assert_eq!(frames, samples(&with_next));
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn cutting_groups_leaves_the_field_clock_and_the_samples_where_they_were() {
+    // Fields repeated by the picture before a unit are carried into the first
+    // picture of the next, so a cut in the middle of a group has to carry them
+    // as a group boundary does. The streams alternate soft telecine and plain
+    // video across the groups, with and without a hole in front of one.
+    let groups = [None, Some(0), Some(1), Some(1), None, Some(0)];
+    for gap_before in [None, Some(3)] {
+        let stream = stream(&groups, gap_before);
+        for video in [VideoMode::Transcode, VideoMode::Passthrough] {
+            let options = TranscodeOptions {
+                video,
+                recovery_interval: 2,
+                ..TranscodeOptions::default()
+            };
+            let mut results = Vec::new();
+            for split_groups in [false, true] {
+                let mut session = Session::anchored(
+                    TranscodeOptions {
+                        split_groups,
+                        ..options
+                    },
+                    Some(ORIGIN),
+                );
+                let mut fragments = Vec::new();
+                for bytes in stream.chunks(64 * 1024) {
+                    fragments.extend(session.push(bytes).unwrap());
+                }
+                fragments.extend(session.finish().unwrap());
+                results.push(fragments);
+            }
+            let (whole, split) = (&results[0], &results[1]);
+            let label = format!("{video:?}, gap {gap_before:?}");
+            assert!(
+                init_segments(whole) == init_segments(split),
+                "{label}: initialization segments"
+            );
+            assert!(
+                track_samples(whole) == track_samples(split),
+                "{label}: samples"
+            );
+            assert!(split.len() > whole.len(), "{label}: the groups were cut");
         }
     }
 }

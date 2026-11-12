@@ -7,6 +7,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use mpeg2toh264::Fragment;
+
 const PACKET_SIZE: usize = 188;
 
 pub fn testdata(name: &str) -> PathBuf {
@@ -392,3 +394,197 @@ pub const STREAM_TYPE_PRIVATE_DATA: u8 = 0x06;
 pub const STREAM_TYPE_AAC_ADTS: u8 = 0x0f;
 pub const VIDEO_PID: u16 = 0x101;
 pub const AUDIO_PID: u16 = 0x102;
+
+/// One sample of a track as the fragments carrying it lay it out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrackSample {
+    pub decode_time: u64,
+    pub composition_time: i64,
+    pub duration: u32,
+    pub sync: bool,
+    pub data: Vec<u8>,
+}
+
+/// Every sample of both tracks, in the order the fragments carry them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrackSamples {
+    pub video: Vec<TrackSample>,
+    pub audio: Vec<TrackSample>,
+}
+
+fn child_boxes(data: &[u8]) -> Vec<([u8; 4], &[u8])> {
+    let mut boxes = Vec::new();
+    let mut at = 0;
+    while at + 8 <= data.len() {
+        let size = u32::from_be_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+        assert!(
+            size >= 8 && at + size <= data.len(),
+            "a box fits its parent"
+        );
+        boxes.push((
+            data[at + 4..at + 8].try_into().unwrap(),
+            &data[at + 8..at + size],
+        ));
+        at += size;
+    }
+    boxes
+}
+
+fn be32(data: &[u8], at: usize) -> u32 {
+    u32::from_be_bytes(data[at..at + 4].try_into().unwrap())
+}
+
+/// The samples of every `traf` in one media fragment, as `(track id, samples)`,
+/// read back out of the `moof` and `mdat` the muxer wrote.
+pub fn fragment_samples(media: &[u8]) -> Vec<(u32, Vec<TrackSample>)> {
+    let top = child_boxes(media);
+    let moof = top
+        .iter()
+        .find(|(kind, _)| kind == b"moof")
+        .expect("a fragment opens with a moof")
+        .1;
+    let mut tracks = Vec::new();
+    for (kind, traf) in child_boxes(moof) {
+        if &kind != b"traf" {
+            continue;
+        }
+        let mut track = 0;
+        let mut decode_time = 0;
+        let mut samples = Vec::new();
+        for (kind, body) in child_boxes(traf) {
+            match &kind {
+                b"tfhd" => track = be32(body, 4),
+                b"tfdt" => {
+                    assert_eq!(body[0], 1, "a version 1 tfdt");
+                    decode_time = u64::from_be_bytes(body[4..12].try_into().unwrap());
+                }
+                b"trun" => {
+                    let version = body[0];
+                    let flags = be32(body, 0) & 0x00ff_ffff;
+                    let count = be32(body, 4) as usize;
+                    assert_ne!(flags & 0x1, 0, "a data offset");
+                    // Relative to the start of the moof, which is the start of
+                    // the fragment.
+                    let mut data_at = be32(body, 8) as usize;
+                    let mut at = 12;
+                    for _ in 0..count {
+                        let mut field = |bit: u32| {
+                            (flags & bit != 0).then(|| {
+                                let value = be32(body, at);
+                                at += 4;
+                                value
+                            })
+                        };
+                        let duration = field(0x100).expect("a duration per sample");
+                        let size = field(0x200).expect("a size per sample") as usize;
+                        let sample_flags = field(0x400);
+                        let offset = field(0x800).unwrap_or(0);
+                        let composition = if version == 1 {
+                            i64::from(offset as i32)
+                        } else {
+                            i64::from(offset)
+                        };
+                        samples.push(TrackSample {
+                            decode_time,
+                            composition_time: decode_time as i64 + composition,
+                            duration,
+                            // Bit 16 is sample_is_non_sync_sample.
+                            sync: sample_flags.is_none_or(|flags| flags & 0x0001_0000 == 0),
+                            data: media[data_at..data_at + size].to_vec(),
+                        });
+                        decode_time += u64::from(duration);
+                        data_at += size;
+                    }
+                }
+                _ => {}
+            }
+        }
+        tracks.push((track, samples));
+    }
+    tracks
+}
+
+/// Every sample the media fragments carry, per track: video is track 1 and
+/// audio track 2, as the initialization segment numbers them.
+pub fn track_samples(fragments: &[Fragment]) -> TrackSamples {
+    let mut out = TrackSamples::default();
+    for fragment in fragments {
+        let Fragment::Media { data, .. } = fragment else {
+            continue;
+        };
+        for (track, samples) in fragment_samples(data) {
+            match track {
+                1 => out.video.extend(samples),
+                2 => out.audio.extend(samples),
+                other => panic!("unexpected track {other}"),
+            }
+        }
+    }
+    out
+}
+
+/// The initialization segments, in the order they went out.
+pub fn init_segments(fragments: &[Fragment]) -> Vec<&[u8]> {
+    fragments
+        .iter()
+        .filter_map(|fragment| match fragment {
+            Fragment::Init { data, .. } => Some(data.as_slice()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Where each picture's start code is in an elementary stream.
+pub fn picture_starts(es: &[u8]) -> Vec<usize> {
+    (0..es.len().saturating_sub(3))
+        .filter(|&at| es[at..at + 4] == [0, 0, 1, 0x00])
+        .collect()
+}
+
+/// A `quant_matrix_extension` loading `weights` as the non-intra matrix, which
+/// is legal anywhere between a picture's coding extension and its first slice.
+///
+/// Clause 6.2.3.2: the four-bit identifier, then a flag per matrix with the
+/// sixty-four weights of each one that is loaded.
+pub fn non_intra_matrix_extension(weights: &[u8; 64]) -> Vec<u8> {
+    // 0011, then load_intra_quantiser_matrix and load_non_intra_quantiser_matrix.
+    let mut bits: Vec<u8> = vec![0, 0, 1, 1, 0, 1];
+    for weight in weights {
+        bits.extend((0..8).map(|shift| (weight >> (7 - shift)) & 1));
+    }
+    bits.extend([0, 0]);
+    let mut out = vec![0x00, 0x00, 0x01, 0xb5];
+    out.extend(bits.chunks(8).map(|byte| {
+        byte.iter()
+            .enumerate()
+            .fold(0u8, |packed, (at, bit)| packed | (bit << (7 - at)))
+    }));
+    out
+}
+
+/// `source` with `extension` put in front of the first slice of each of the
+/// listed pictures, counting from zero.
+pub fn with_extension_in_pictures(source: &[u8], pictures: &[usize], extension: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(source.len() + pictures.len() * extension.len());
+    let mut current = None;
+    let mut waiting = false;
+    let mut at = 0;
+    while at < source.len() {
+        if at + 4 <= source.len() && source[at..at + 3] == [0, 0, 1] {
+            let code = source[at + 3];
+            if code == 0x00 {
+                current = Some(current.map_or(0, |index| index + 1));
+                waiting = current.is_some_and(|index| pictures.contains(&index));
+            } else if waiting && (0x01..=0xaf).contains(&code) {
+                out.extend_from_slice(extension);
+                waiting = false;
+            }
+            out.extend_from_slice(&source[at..at + 4]);
+            at += 4;
+            continue;
+        }
+        out.push(source[at]);
+        at += 1;
+    }
+    out
+}

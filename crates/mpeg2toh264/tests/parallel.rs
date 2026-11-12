@@ -427,3 +427,78 @@ fn a_job_carries_the_headers_its_picture_is_described_by() {
         }
     }
 }
+
+#[test]
+fn a_split_session_driven_picture_by_picture_produces_the_same_fragments() {
+    // Units cut out of a group are planned and completed one after another
+    // like any others, and each is told how much of its group has gone out.
+    for (name, stream) in [
+        ("ibbp.m2v", broadcast_stream("ibbp.m2v", 400)),
+        (
+            "open_gop_leading_bb.m2v",
+            broadcast_stream("open_gop_leading_bb.m2v", 400),
+        ),
+    ] {
+        for chunk_size in [4096, 65536] {
+            let options = TranscodeOptions {
+                split_groups: true,
+                recovery_interval: 2,
+                ..TranscodeOptions::default()
+            };
+            let mut sequential = Session::new(options);
+            let mut expected = Vec::new();
+            for chunk in stream.chunks(chunk_size) {
+                expected.extend(sequential.push(chunk).expect("push"));
+            }
+            expected.extend(sequential.finish().expect("finish"));
+
+            let mut deferred = Session::new(options);
+            let mut encoder = PictureEncoder::new();
+            let mut actual = Vec::new();
+            let mut drive =
+                |progress: Progress, session: &mut Session, actual: &mut Vec<Fragment>| {
+                    let mut progress = progress;
+                    loop {
+                        let jobs = match progress {
+                            Progress::Idle(fragments) => {
+                                actual.extend(fragments);
+                                return;
+                            }
+                            Progress::Pending { fragments, jobs } => {
+                                actual.extend(fragments);
+                                jobs
+                            }
+                        };
+                        let outputs: Vec<PictureOutput> = jobs
+                            .iter()
+                            .map(|job| encoder.encode(job).expect("encodes"))
+                            .collect();
+                        progress = session.complete(&outputs).expect("complete");
+                    }
+                };
+            for chunk in stream.chunks(chunk_size) {
+                let progress = deferred.push_deferred(chunk).expect("push");
+                drive(progress, &mut deferred, &mut actual);
+            }
+            let progress = deferred.finish_deferred().expect("finish");
+            drive(progress, &mut deferred, &mut actual);
+
+            let media = |fragments: &[Fragment]| {
+                fragments
+                    .iter()
+                    .filter(|fragment| matches!(fragment, Fragment::Media { .. }))
+                    .count()
+            };
+            assert!(
+                media(&expected) >= 5,
+                "{name}: the groups were cut into units"
+            );
+            assert_eq!(
+                digest(&actual),
+                digest(&expected),
+                "{name} in {chunk_size} byte chunks: driving a split session \
+                 picture by picture changed its fragments"
+            );
+        }
+    }
+}

@@ -295,6 +295,32 @@ pub struct Mpeg2VideoTimeline {
     /// IDR clone or the first picture -- so a caller that sets it asks for a
     /// random access point as well.
     pub hold_ticks: u32,
+    /// Extra ticks added to every composition offset of the unit, for a unit
+    /// that continues a group whose earlier units left display slots empty.
+    ///
+    /// Units are laid end to end on the decode clock, which advances by the
+    /// pictures the units actually hold. A picture the source lost leaves its
+    /// slot empty in the display order, and in a group sent whole the pictures
+    /// after it simply keep their later slots. A unit sent separately has to
+    /// be told how far behind the display clock the decode clock has fallen,
+    /// and this is that. Set by the caller, like `hold_ticks`; zero otherwise.
+    pub lag_ticks: u32,
+    /// Ticks the unit's first sample gives up, because recovery copies of the
+    /// intra picture ending the unit before it took their decode instants
+    /// from the sample that follows them -- this one. See
+    /// [`Self::defer_recovery_borrow`]. Set by the caller; zero otherwise.
+    pub borrowed_ticks: u32,
+    /// Leave recovery copies that fall after the unit's last sample to the next
+    /// unit to pay for, instead of taking their instants from that sample.
+    ///
+    /// Sent whole, a group has its recovery copies take their instants from the
+    /// first sample after them, even when the unit ends on the intra picture
+    /// they repeat. A unit sent on its own has no such sample yet, and moving
+    /// the borrowing to the one before it would move every decode time after
+    /// it by the same ticks. So the copies are left to the unit that follows,
+    /// which is told through [`Self::borrowed_ticks`]. Set by the caller when
+    /// one will; false otherwise.
+    pub defer_recovery_borrow: bool,
 }
 
 impl Mpeg2VideoTimeline {
@@ -413,7 +439,7 @@ pub fn mpeg2_video_timeline(
     undecodable: &[bool],
 ) -> Result<Mpeg2VideoTimeline> {
     Ok(
-        timed_mpeg2_unit(data, has_references, undecodable, RffState::default())?
+        timed_mpeg2_unit(data, has_references, undecodable, RffState::default(), 0)?
             .unit
             .timeline,
     )
@@ -426,7 +452,7 @@ pub fn mpeg2_video_timeline(
 /// bar the ones it drops for being undecodable: nothing is decoded on this
 /// path, and a damaged slice is the decoder's business rather than this one's.
 pub fn mpeg2_passthrough_unit(data: &[u8], has_references: bool) -> Result<Mpeg2Unit> {
-    Ok(timed_mpeg2_unit(data, has_references, &[], RffState::default())?.unit)
+    Ok(timed_mpeg2_unit(data, has_references, &[], RffState::default(), 0)?.unit)
 }
 
 /// Source-clock information kept alongside the public, retimed MP4 unit.
@@ -437,6 +463,13 @@ pub(crate) struct TimedUnit {
     pub source_offset: i64,
     pub before: RffState,
     pub after: RffState,
+    /// How many display slots of the group the unit ends in the group has now
+    /// used up, whether or not the pictures in them were kept. A unit that
+    /// continues that group is told this as the slots it starts after.
+    pub slots_after: u32,
+    /// From the start of the unit's first display slot to the end of its last,
+    /// as the slots are laid out, so empty ones count.
+    pub span_ticks: u64,
     display_fields: Vec<u8>,
     repeats: Vec<bool>,
     rate: (u32, u32),
@@ -461,6 +494,10 @@ impl TimedUnit {
             .iter()
             .map(|&index| timing.durations[index as usize])
             .collect();
+        self.span_ticks = match self.display_fields.len() {
+            0 | 1 => 0,
+            len => timing.starts[len - 1] + u64::from(timing.durations[len - 1]),
+        };
         self.before = before;
         self.after = timing.after;
     }
@@ -469,11 +506,17 @@ impl TimedUnit {
 /// Walk a unit's pictures, keeping exactly those the transcoder can emit.
 /// Parsing reserves their display slots even when a damaged or missing picture
 /// leaves one empty; retiming must not close up that hole.
+///
+/// `consumed` is how many display slots of its group earlier units have already
+/// covered, for a unit that continues one, and zero for one that opens its
+/// group. The unit's slots are counted from there, and a picture that belongs
+/// to a slot already covered is dropped: the transcoder does the same.
 pub(crate) fn timed_mpeg2_unit(
     data: &[u8],
     has_references: bool,
     undecodable: &[bool],
     before: RffState,
+    consumed: u32,
 ) -> Result<TimedUnit> {
     let pictures = parse_elementary_stream(data)?;
     let Some(first) = pictures.first() else {
@@ -510,8 +553,11 @@ pub(crate) fn timed_mpeg2_unit(
     // samples the H.264 stream does not have.
     let mut awaiting_intra = !has_references;
     let mut gop_base: u32 = 0;
-    let mut seen_picture = false;
-    let mut max_tr_in_gop: u32 = 0;
+    // The slots of the group in hand that are behind the unit, and how many the
+    // group has used up so far, which is the highest temporal reference seen
+    // plus one.
+    let mut group_consumed = consumed;
+    let mut slots_in_group = consumed;
     let mut presentation_indices = Vec::new();
     let mut sample_scans = Vec::new();
     // Indexed by the one-based presentation index. Missing entries retain two
@@ -525,7 +571,15 @@ pub(crate) fn timed_mpeg2_unit(
     // Where the picture in hand starts, which is where the one before it ended.
     // A picture that is dropped leaves its bytes to the sample that follows,
     // since a sequence header among them describes that picture too.
-    let mut sample_start = 0;
+    //
+    // A unit that continues a group opens with the sequence header the splitter
+    // put in front of it, which is not part of its first picture: the group
+    // sent whole carries nothing there.
+    let mut sample_start = if consumed > 0 {
+        sequence_header_len(data)
+    } else {
+        0
+    };
     while picture_index < pictures.len() {
         let picture = &pictures[picture_index];
         // Where this picture sits among the unit's own, which is how the
@@ -561,13 +615,18 @@ pub(crate) fn timed_mpeg2_unit(
             continue;
         }
         let tr = picture.header.temporal_reference;
-        if picture.starts_gop && seen_picture {
-            gop_base += max_tr_in_gop + 1;
-            max_tr_in_gop = 0;
+        if picture.starts_gop {
+            gop_base += slots_in_group - group_consumed;
+            group_consumed = 0;
+            slots_in_group = 0;
         }
-        seen_picture = true;
-        max_tr_in_gop = max_tr_in_gop.max(tr);
-        let presentation_index = (gop_base + tr + 1) as usize;
+        slots_in_group = slots_in_group.max(tr + 1);
+        // A slot an earlier unit covered is not given again. The transcoder
+        // drops the picture for the same reason.
+        if tr < group_consumed {
+            continue;
+        }
+        let presentation_index = (gop_base + tr + 1 - group_consumed) as usize;
         if display_fields.len() <= presentation_index {
             display_fields.resize(presentation_index + 1, 2);
             repeats.resize(presentation_index + 1, false);
@@ -610,7 +669,7 @@ pub(crate) fn timed_mpeg2_unit(
         if picture_type == PictureType::B && references < 2 {
             continue;
         }
-        presentation_indices.push(gop_base + tr + 1);
+        presentation_indices.push(gop_base + tr + 1 - group_consumed);
         let interlacing = match picture.coding.picture_structure {
             PictureStructure::TopField => Interlacing {
                 interlaced: true,
@@ -652,6 +711,9 @@ pub(crate) fn timed_mpeg2_unit(
             split_field_samples: TranscodeOptions::default().split_field_samples,
             sample_aspect_ratio: sequence_sample_aspect_ratio(&first.sequence),
             hold_ticks: 0,
+            lag_ticks: 0,
+            borrowed_ticks: 0,
+            defer_recovery_borrow: false,
         },
         samples,
         sequence_header_len: sequence_header_len(data),
@@ -661,6 +723,8 @@ pub(crate) fn timed_mpeg2_unit(
         source_offset: 0,
         before,
         after: RffState::default(),
+        slots_after: slots_in_group,
+        span_ticks: 0,
         display_fields,
         repeats,
         rate: frame_rate(first),
@@ -759,15 +823,32 @@ fn insert_recovery_copy_timing(
     index: usize,
     copies: usize,
 ) -> Result<()> {
+    place_recovery_copies(timing, index, copies, false).map(|_| ())
+}
+
+/// [`insert_recovery_copy_timing`], for a unit that may leave copies ending it
+/// to the unit after it, as `defer` says. Returns how many ticks were left for
+/// that unit to give up.
+fn place_recovery_copies(
+    timing: &mut SampleTiming,
+    index: usize,
+    copies: usize,
+    defer: bool,
+) -> Result<u32> {
     let borrowed = copies as u32;
+    let mut deferred = 0;
     if index == timing.durations.len() {
         let Some(previous_duration) = timing.durations.last_mut() else {
             bail!("recovery copy has no content sample to borrow from");
         };
-        if *previous_duration <= borrowed {
-            bail!("recovery copies cannot borrow time from their preceding sample");
+        if defer {
+            deferred = borrowed;
+        } else {
+            if *previous_duration <= borrowed {
+                bail!("recovery copies cannot borrow time from their preceding sample");
+            }
+            *previous_duration -= borrowed;
         }
-        *previous_duration -= borrowed;
     } else {
         let next_duration = &mut timing.durations[index];
         let next_composition = &mut timing.compositions[index];
@@ -806,7 +887,7 @@ fn insert_recovery_copy_timing(
         // carries them all and they stay a tick apart on screen too.
         timing.compositions.insert(index + offset, composition);
     }
-    Ok(())
+    Ok(deferred)
 }
 
 /// What the sample that opens a unit has to stand in for.
@@ -893,8 +974,15 @@ pub fn mpeg2_sample_timing(timeline: &Mpeg2VideoTimeline, lead_in: UnitLeadIn) -
     let reorder_delay = measured.max(duration);
     let mut compositions: Vec<u32> = offsets
         .iter()
-        .map(|offset| (offset + reorder_delay) as u32)
+        .map(|offset| (offset + reorder_delay) as u32 + timeline.lag_ticks)
         .collect();
+    // The recovery copies behind the unit before this one are decoded in front
+    // of this unit's first sample, which gives the time back out of its own
+    // duration and out of its offset, as the copies would have taken it.
+    if let (Some(duration), Some(composition)) = (durations.first_mut(), compositions.first_mut()) {
+        *duration = duration.saturating_sub(timeline.borrowed_ticks);
+        *composition = composition.saturating_sub(timeline.borrowed_ticks);
+    }
     // The hole in front of the unit, which the sample covering its leading
     // slots is held over. A unit that has no such sample cannot hold anything,
     // and the caller keeps the hole for the next one that can.
@@ -1630,6 +1718,9 @@ pub struct Fmp4Fragment {
     pub sample_count: usize,
     /// Presentation time this fragment covers; see [`mpeg2_sample_timing`].
     pub duration: u64,
+    /// Ticks of recovery copies that end the fragment and that the fragment
+    /// after it has to give up; see [`Mpeg2VideoTimeline::defer_recovery_borrow`].
+    pub deferred_ticks: u32,
 }
 
 /// Package one independently transcoded GOP for incremental appending.
@@ -1683,8 +1774,14 @@ pub fn h264_gop_to_fmp4(
     if let Some(index) = recovery.filter(|&index| index < sync_samples.len()) {
         sync_samples[index] = true;
     }
+    let mut deferred_ticks = 0;
     if let Some(index) = recovery_copy.filter(|&index| index < sync_samples.len()) {
-        insert_recovery_copy_timing(&mut timing, index, extra_samples)?;
+        deferred_ticks = place_recovery_copies(
+            &mut timing,
+            index,
+            extra_samples,
+            timeline.defer_recovery_borrow,
+        )?;
     }
     if let (Some(index), Some(sei)) = (recovery, sei) {
         samples[index].insert(0, sei);
@@ -1695,7 +1792,7 @@ pub fn h264_gop_to_fmp4(
         (Some(sps), Some(pps)) => Some(VideoCodec::Avc { sps, pps }),
         _ => None,
     };
-    make_fragment(
+    let mut fragment = make_fragment(
         VideoPayload::avc(samples, &[]),
         timeline,
         &timing,
@@ -1705,7 +1802,9 @@ pub fn h264_gop_to_fmp4(
         presentation_start,
         audio,
         audio_track,
-    )
+    )?;
+    fragment.deferred_ticks = deferred_ticks;
+    Ok(fragment)
 }
 
 /// Package one unit of MPEG-2 video for incremental appending, carrying the
@@ -1799,6 +1898,7 @@ fn make_fragment(
         mime_codec,
         sample_count: video.len(),
         duration: timing.durations.iter().map(|&d| d as u64).sum(),
+        deferred_ticks: 0,
     })
 }
 
@@ -1880,6 +1980,9 @@ mod tests {
             split_field_samples: split,
             sample_aspect_ratio: None,
             hold_ticks: 0,
+            lag_ticks: 0,
+            borrowed_ticks: 0,
+            defer_recovery_borrow: false,
         }
     }
 

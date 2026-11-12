@@ -95,6 +95,10 @@ export class Transcoder {
    *
    * `passthrough` carries the MPEG-2 video into the MP4 as it stands rather
    * than converting it, for a browser whose decoder takes MPEG-2.
+   *
+   * `splitGroups` makes a fragment of each anchor picture and the B pictures
+   * coded after it, instead of one of each whole group of pictures, so that
+   * media reaches the buffer as soon as it has arrived.
    */
   constructor(
     oversample: number | undefined,
@@ -105,6 +109,7 @@ export class Transcoder {
     passthrough = false,
     openGopRecovery:
       "idr" | "recovery-point" | "discard" | undefined = undefined,
+    splitGroups = false,
   ) {
     this.#session = new Session(
       oversample,
@@ -114,6 +119,7 @@ export class Transcoder {
       splitFieldSamples,
       passthrough,
       openGopRecovery,
+      splitGroups,
     );
   }
 
