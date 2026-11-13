@@ -1,5 +1,5 @@
-//! Command line front end: MPEG-TS or MPEG-2 elementary stream in, raw Annex B
-//! H.264 or fragmented MP4 out.
+//! Command line front end: MPEG-TS or MPEG-2 elementary stream in, fragmented
+//! MP4 with the MPEG-2 video carried through out.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
@@ -7,45 +7,41 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use mpeg2toh264::job::PictureOutput;
 use mpeg2toh264::mpeg2::decode::{DecodedFrame, StreamDecoder};
 use mpeg2toh264::{
-    extract_mpeg2_video_es, h264_to_fmp4, is_mpeg_transport_stream, mpeg2_passthrough_unit,
-    mpeg2_to_fmp4, mpeg2_video_timeline, transcode, AudioGain, Fragment, OpenGopRecovery,
-    PictureEncoder, Progress, Session, TranscodeOptions, VideoMode,
+    extract_mpeg2_video_es, is_mpeg_transport_stream, mpeg2_passthrough_unit, mpeg2_to_fmp4,
+    AudioGain, Fragment, OpenGopRecovery, Session, SessionOptions, VideoMode,
 };
 
 const USAGE: &str = "\
-Usage: mpeg2toh264 [options] <input.ts|input.m2v> <output.h264|output.mp4>
+Usage: mpeg2toh264 [options] <input.ts|input.m2v> <output.mp4>
 
-Transcode an MPEG transport stream or MPEG-2 video elementary stream to raw
-Annex B H.264 or fragmented MP4. MP4 is the default; use the .h264 output
-extension for raw Annex B. MP4 output from a transport stream includes its AAC
-audio track. The first MPEG-2 video program in a TS is selected.
+Carry the MPEG-2 video of an MPEG transport stream or elementary stream into a
+fragmented MP4 unconverted, for a player that decodes it. MP4 output from a
+transport stream includes its AAC audio track. The first MPEG-2 video program
+in a TS is selected.
 
 Arguments:
   input.ts|input.m2v        MPEG-TS or MPEG-2 video elementary stream
-  output.h264|output.mp4    Raw H.264/AVC or timestamped fragmented MP4
+  output.mp4                Timestamped fragmented MP4
 
 Options:
-  -o, --oversample <n>      Quantiser search oversampling factor (default: 2)
   -r, --recovery-interval <n>
-                            GOPs between recovery points (default: 24)
-      --open-gop <idr|recovery-point|discard>
-                            Preserve leading pictures, then use a real IDR
-                            (default) or a non-IDR recovery point; discard drops
-                            leading pictures and begins at an IDR
+                            GOPs between recovery points (default: 24).
+                            Transport stream input only
+      --open-gop <recovery-point|discard>
+                            At a recovery point, preserve the leading pictures
+                            of an open GOP and mark the fragment as a random
+                            access point (default), or discard them and begin
+                            at the intra picture. Transport stream input only
   -s, --split-field-samples Give each field of a complementary pair its own MP4
-                            sample (default). A pair sharing one sample breaks
-                            Firefox on Windows and Safari where frame pictures
-                            give way to field pictures.
+                            sample (default)
       --no-split-field-samples
                             Keep a complementary field pair in one MP4 sample
-  -p, --passthrough         Carry the MPEG-2 video into the MP4 unconverted,
-                            for a player that decodes it. MP4 output only
       --audio-gain <n>      Raise the AAC audio by n steps of about 1.5 dB,
                             4 doubling it, by rewriting each channel's
-                            global_gain (default: 0). MP4 output only
+                            global_gain (default: 0). Transport stream input
+                            only
       --surround-audio-gain <n>
                             The same for audio of more than two channels
                             (default: the --audio-gain value)
@@ -53,10 +49,7 @@ Options:
                             picture and the B pictures coded after it, each its
                             own fragment, so that the media can be played as
                             soon as it has arrived. The samples are the same as
-                            without it. MP4 output from a transport stream only
-  -j, --threads <n>         Convert this many pictures at once (default: 1).
-                            The output is the same whatever this is set to.
-                            MP4 output from a transport stream only
+                            without it. Transport stream input only
   -q, --quiet               Do not print conversion progress or summary
   -h, --help                Show this help
 
@@ -251,8 +244,7 @@ struct CliOptions {
     input: PathBuf,
     output: PathBuf,
     quiet: bool,
-    threads: usize,
-    transcode: TranscodeOptions,
+    session: SessionOptions,
     audio_gain: AudioGain,
 }
 
@@ -271,14 +263,12 @@ fn fail(message: &str) -> ! {
 
 fn parse_args(args: &[String]) -> Invocation {
     let mut positional: Vec<&str> = Vec::new();
-    let mut oversample: f64 = 2.0;
-    let mut recovery_interval: usize = 24;
-    let mut open_gop_recovery = OpenGopRecovery::Idr;
-    let mut split_field_samples = true;
-    let mut split_groups = false;
+    let defaults = SessionOptions::new(VideoMode::Passthrough);
+    let mut recovery_interval = defaults.recovery_interval;
+    let mut open_gop_recovery = defaults.open_gop_recovery;
+    let mut split_field_samples = defaults.split_field_samples;
+    let mut split_groups = defaults.split_groups;
     let mut quiet = false;
-    let mut passthrough = false;
-    let mut threads: usize = 1;
     let mut audio_gain: Option<u8> = Some(0);
     let mut surround_audio_gain: Option<Option<u8>> = None;
 
@@ -290,18 +280,7 @@ fn parse_args(args: &[String]) -> Invocation {
             "-q" | "--quiet" => quiet = true,
             "-s" | "--split-field-samples" => split_field_samples = true,
             "--no-split-field-samples" => split_field_samples = false,
-            "-p" | "--passthrough" => passthrough = true,
             "--split-groups" => split_groups = true,
-            "-o" | "--oversample" => {
-                i += 1;
-                let Some(value) = args.get(i) else {
-                    fail(&format!("{arg} requires a value"));
-                };
-                oversample = value.parse().unwrap_or(f64::NAN);
-            }
-            _ if arg.starts_with("--oversample=") => {
-                oversample = arg["--oversample=".len()..].parse().unwrap_or(f64::NAN);
-            }
             "-r" | "--recovery-interval" => {
                 i += 1;
                 let Some(value) = args.get(i) else {
@@ -321,16 +300,6 @@ fn parse_args(args: &[String]) -> Invocation {
             }
             _ if arg.starts_with("--open-gop=") => {
                 open_gop_recovery = parse_open_gop(&arg["--open-gop=".len()..]);
-            }
-            "-j" | "--threads" => {
-                i += 1;
-                let Some(value) = args.get(i) else {
-                    fail(&format!("{arg} requires a value"));
-                };
-                threads = value.parse().unwrap_or(0);
-            }
-            _ if arg.starts_with("--threads=") => {
-                threads = arg["--threads=".len()..].parse().unwrap_or(0);
             }
             "--audio-gain" | "--surround-audio-gain" => {
                 i += 1;
@@ -355,14 +324,8 @@ fn parse_args(args: &[String]) -> Invocation {
         i += 1;
     }
 
-    if !oversample.is_finite() || oversample <= 0.0 {
-        fail("oversample must be a positive number");
-    }
     if recovery_interval == 0 {
         fail("recovery interval must be a positive integer");
-    }
-    if threads == 0 {
-        fail("thread count must be a positive integer");
     }
     let (Some(stereo), Some(surround)) = (audio_gain, surround_audio_gain.unwrap_or(audio_gain))
     else {
@@ -379,28 +342,15 @@ fn parse_args(args: &[String]) -> Invocation {
     if input == output {
         fail("input and output must be different files");
     }
-    if passthrough
-        && output
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("h264"))
-    {
-        fail("passthrough carries MPEG-2 video, which raw H.264 output cannot hold");
-    }
     Invocation::Run(Box::new(CliOptions {
         input,
         output,
         quiet,
-        threads,
-        transcode: TranscodeOptions {
-            oversample,
+        session: SessionOptions {
             recovery_interval,
             open_gop_recovery,
             split_field_samples,
-            video: if passthrough {
-                VideoMode::Passthrough
-            } else {
-                VideoMode::Transcode
-            },
+            video: VideoMode::Passthrough,
             split_groups,
         },
         audio_gain: AudioGain { stereo, surround },
@@ -409,10 +359,9 @@ fn parse_args(args: &[String]) -> Invocation {
 
 fn parse_open_gop(value: &str) -> OpenGopRecovery {
     match value {
-        "idr" => OpenGopRecovery::Idr,
         "recovery-point" => OpenGopRecovery::RecoveryPoint,
         "discard" => OpenGopRecovery::Discard,
-        _ => fail("open GOP mode must be 'idr', 'recovery-point', or 'discard'"),
+        _ => fail("open GOP mode must be 'recovery-point' or 'discard'"),
     }
 }
 
@@ -423,81 +372,38 @@ fn absolute(path: &Path) -> PathBuf {
 fn run(options: &CliOptions) -> Result<(), Box<dyn std::error::Error>> {
     let mut input = BufReader::new(File::open(&options.input)?);
     let transport_stream = is_mpeg_transport_stream(input.fill_buf()?);
-    let raw_h264 = options
-        .output
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("h264"));
 
-    if transport_stream && !raw_h264 {
+    if transport_stream {
         return run_session_mp4(options, input);
     }
 
-    let mut container = Vec::new();
-    input.read_to_end(&mut container)?;
-    let source = if transport_stream {
-        extract_mpeg2_video_es(&container)?
-    } else {
-        container
-    };
+    let mut source = Vec::new();
+    input.read_to_end(&mut source)?;
 
     let started = Instant::now();
-    let passthrough = options.transcode.video == VideoMode::Passthrough;
-    let (output_data, output_kind, converted, skipped) = if passthrough {
-        let mut unit = mpeg2_passthrough_unit(&source, false)?;
-        unit.timeline.split_field_samples = options.transcode.split_field_samples;
-        let carried = unit.samples.len();
-        let mp4 = mpeg2_to_fmp4(&source, &unit)?;
-        let mut data = mp4.init_segment;
-        data.extend_from_slice(&mp4.media_segment);
-        (data, "fragmented MP4", carried, 0)
-    } else if !raw_h264 {
-        let result = transcode(&source, options.transcode)?;
-        // The transcode has already found the pictures that would not decode,
-        // so the timeline is told rather than made to look for itself.
-        let mut timeline = mpeg2_video_timeline(&source, false, &result.undecodable)?;
-        timeline.split_field_samples = options.transcode.split_field_samples;
-        let mp4 = h264_to_fmp4(&result.bitstream, &timeline)?;
-        let mut data = mp4.init_segment;
-        data.extend_from_slice(&mp4.media_segment);
-        (
-            data,
-            "fragmented MP4",
-            result.pictures_converted,
-            result.pictures_skipped,
-        )
-    } else {
-        let result = transcode(&source, options.transcode)?;
-        (
-            result.bitstream,
-            "raw H.264",
-            result.pictures_converted,
-            result.pictures_skipped,
-        )
-    };
+    let mut unit = mpeg2_passthrough_unit(&source, false)?;
+    unit.timeline.split_field_samples = options.session.split_field_samples;
+    let carried = unit.samples.len();
+    let mp4 = mpeg2_to_fmp4(&source, &unit);
+    let mut output_data = mp4.init_segment;
+    output_data.extend_from_slice(&mp4.media_segment);
     let elapsed = started.elapsed();
     std::fs::write(&options.output, &output_data)?;
 
     if !options.quiet {
         let seconds = elapsed.as_secs_f64();
         let fps = if seconds > 0.0 {
-            converted as f64 / seconds
+            carried as f64 / seconds
         } else {
             f64::INFINITY
         };
         println!(
-            "{} ({}) -> {} ({output_kind})",
+            "{} (MPEG-2 ES) -> {} (fragmented MP4)",
             options.input.display(),
-            if transport_stream {
-                "MPEG-TS"
-            } else {
-                "MPEG-2 ES"
-            },
             options.output.display(),
         );
         println!(
-            "{} pictures {}, {skipped} skipped, {} bytes, {:.1} ms ({fps:.2} fps)",
-            converted,
-            if passthrough { "carried" } else { "converted" },
+            "{carried} pictures carried, {} bytes, {:.1} ms ({fps:.2} fps)",
             output_data.len(),
             seconds * 1000.0,
         );
@@ -516,150 +422,28 @@ struct SessionTotals {
     inits: usize,
 }
 
-/// A handful of threads, each with a picture encoder of its own, taking jobs
-/// off a queue.
-///
-/// A queue rather than a share each, because the pictures of one unit are not
-/// the same size of job: the one that opens a random access point is the only
-/// one that reconstructs samples, and it costs several times what the rest do.
-struct EncoderPool<'scope> {
-    send_work: Option<std::sync::mpsc::Sender<(usize, Vec<u8>)>>,
-    take_done: std::sync::mpsc::Receiver<(usize, mpeg2toh264::Result<PictureOutput>)>,
-    _threads: Vec<std::thread::ScopedJoinHandle<'scope, ()>>,
-}
-
-impl<'scope> EncoderPool<'scope> {
-    fn new(scope: &'scope std::thread::Scope<'scope, '_>, threads: usize) -> Self {
-        let (send_work, take_work) = std::sync::mpsc::channel::<(usize, Vec<u8>)>();
-        let (send_done, take_done) = std::sync::mpsc::channel();
-        let take_work = std::sync::Arc::new(std::sync::Mutex::new(take_work));
-        let handles = (0..threads)
-            .map(|_| {
-                let take_work = std::sync::Arc::clone(&take_work);
-                let send_done = send_done.clone();
-                scope.spawn(move || {
-                    let mut encoder = PictureEncoder::new();
-                    loop {
-                        let job = take_work.lock().expect("not poisoned").recv();
-                        let Ok((index, job)) = job else { return };
-                        if send_done.send((index, encoder.encode(&job))).is_err() {
-                            return;
-                        }
-                    }
-                })
-            })
-            .collect();
-        Self {
-            send_work: Some(send_work),
-            take_done,
-            _threads: handles,
-        }
-    }
-
-    /// Convert one unit's pictures, giving them back in the order they came.
-    fn run(&self, jobs: Vec<Vec<u8>>) -> Result<Vec<PictureOutput>, Box<dyn std::error::Error>> {
-        let wanted = jobs.len();
-        let send_work = self.send_work.as_ref().expect("the pool is open");
-        for (index, job) in jobs.into_iter().enumerate() {
-            send_work.send((index, job))?;
-        }
-        let mut outputs: Vec<Option<PictureOutput>> = (0..wanted).map(|_| None).collect();
-        for _ in 0..wanted {
-            let (index, output) = self.take_done.recv()?;
-            outputs[index] = Some(output?);
-        }
-        Ok(outputs
-            .into_iter()
-            .map(|output| output.expect("filled"))
-            .collect())
-    }
-}
-
-impl Drop for EncoderPool<'_> {
-    fn drop(&mut self) {
-        // Closing the queue is what tells the threads to stop; the scope then
-        // waits for them.
-        self.send_work = None;
-    }
-}
-
 fn run_session_mp4(
     options: &CliOptions,
-    input: BufReader<File>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if options.threads > 1 {
-        return std::thread::scope(|scope| {
-            let pool = EncoderPool::new(scope, options.threads);
-            run_session_mp4_with(options, input, Some(&pool))
-        });
-    }
-    run_session_mp4_with(options, input, None)
-}
-
-fn run_session_mp4_with(
-    options: &CliOptions,
     mut input: BufReader<File>,
-    pool: Option<&EncoderPool<'_>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let started = Instant::now();
     let mut output = BufWriter::new(File::create(&options.output)?);
-    let mut session = Session::new(options.transcode);
+    let mut session = Session::new(options.session);
     session.set_audio_gain(options.audio_gain);
     let mut totals = SessionTotals::default();
     let mut chunk = vec![0; 1 << 20];
-
-    // Without a pool the session converts each picture as it reaches it, which
-    // is the same work in the same order on one thread.
-    let Some(pool) = pool else {
-        loop {
-            let read = input.read(&mut chunk)?;
-            if read == 0 {
-                break;
-            }
-            for fragment in session.push(&chunk[..read])? {
-                write_fragment(&mut output, fragment, &mut totals, options.quiet, started)?;
-            }
-        }
-        for fragment in session.finish()? {
-            write_fragment(&mut output, fragment, &mut totals, options.quiet, started)?;
-        }
-        output.flush()?;
-        report_session(options, &totals, started);
-        return Ok(());
-    };
-
-    // With one, the session stops at each unit and hands its pictures over.
-    let drain = |mut progress: Progress,
-                 output: &mut BufWriter<File>,
-                 totals: &mut SessionTotals,
-                 session: &mut Session|
-     -> Result<(), Box<dyn std::error::Error>> {
-        loop {
-            for fragment in progress.fragments() {
-                write_fragment(output, fragment, totals, options.quiet, started)?;
-            }
-            let Progress::Pending { jobs, .. } = progress else {
-                return Ok(());
-            };
-            progress = session.complete(&pool.run(jobs)?)?;
-        }
-    };
 
     loop {
         let read = input.read(&mut chunk)?;
         if read == 0 {
             break;
         }
-        let progress = session.push_deferred(&chunk[..read])?;
-        drain(progress, &mut output, &mut totals, &mut session)?;
-    }
-    loop {
-        let progress = session.finish_deferred()?;
-        let done = matches!(progress, Progress::Idle(_));
-        drain(progress, &mut output, &mut totals, &mut session)?;
-        if done {
-            break;
+        for fragment in session.push(&chunk[..read])? {
+            write_fragment(&mut output, fragment, &mut totals, options.quiet, started)?;
         }
+    }
+    for fragment in session.finish()? {
+        write_fragment(&mut output, fragment, &mut totals, options.quiet, started)?;
     }
     output.flush()?;
     report_session(options, &totals, started);

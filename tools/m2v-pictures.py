@@ -2,17 +2,17 @@
 """
 Count the picture types and structures of an MPEG-2 elementary stream.
 
-What a source does with field pictures decides which paths the transcoder takes,
-and the awkward ones are rare enough to miss by sampling: a 30-minute broadcast
-recording held five field-coded I pictures among 3612, and each one is a random
-access point that reaches the transcoder differently from the other 3607.
+What a source does with field pictures decides which paths a unit's timeline
+takes, and the awkward ones are rare enough to miss by sampling: a 30-minute
+broadcast recording held five field-coded I pictures among 3612, and each one is
+a random access point that reaches the session differently from the other 3607.
 
     ffmpeg -v error -i recording.m2ts -map 0:v:0 -c copy -f data - \\
       | python3 tools/m2v-pictures.py
 
 Every field-coded I picture is reported with the frame it lands on, since those
 are the ones worth cutting a test stream at -- take the sequence header in front
-of one and the transcoder opens its random access point on a field pair.
+of one and a unit opens its random access point on a field pair.
 """
 import sys
 from collections import Counter

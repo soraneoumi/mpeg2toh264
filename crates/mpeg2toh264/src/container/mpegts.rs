@@ -1572,7 +1572,7 @@ fn walk_pts(data: &[u8], mut visit: impl FnMut(u64) -> ControlFlow<()>) {
 ///
 /// This is what time it is at the byte the slice was taken from, which is what
 /// a player seeking by byte needs to know: a hundred kilobytes answers it,
-/// where transcoding to find out costs seconds of video.
+/// where playing through the file to find out costs seconds of video.
 pub fn first_pts(data: &[u8]) -> Option<u64> {
     let mut first = None;
     walk_pts(data, |pts| {

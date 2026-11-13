@@ -1,9 +1,8 @@
 //! MPEG-2 macroblock layer decoding.
 //!
-//! Coefficients come out as quantised levels, not pixels: this transcoder maps
-//! levels straight into H.264 syntax, so nothing here dequantises, inverse
-//! transforms, or motion compensates. Motion vectors are reconstructed because
-//! the H.264 side needs their actual values.
+//! Coefficients come out as quantised levels, not pixels: nothing here
+//! dequantises, inverse transforms, or motion compensates. Motion vectors are
+//! reconstructed, because prediction needs their actual values.
 
 use std::sync::LazyLock;
 
@@ -565,9 +564,7 @@ fn make_skipped(
             }
         } else {
             // Field pictures use same-parity field prediction (7.6.6.3). Keep
-            // the decoded predictor values here; field pictures are rejected
-            // later by this transcoder, but the elementary-stream decoder
-            // remains coherent.
+            // the decoded predictor values here.
             skipped.motion_type = motion_type::FIELD;
             skipped.mv[..4].copy_from_slice(&state.pmv[..4]);
         }

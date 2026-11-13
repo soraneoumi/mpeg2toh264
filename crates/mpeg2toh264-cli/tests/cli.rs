@@ -90,10 +90,15 @@ fn rejects_an_unknown_option() {
 }
 
 #[test]
-fn rejects_a_nonsensical_oversample() {
-    let result = run(&["--oversample=0", "a", "b"]);
-    assert_eq!(result.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&result.stderr).contains("oversample"));
+fn rejects_options_the_conversion_does_not_have() {
+    for option in ["--oversample=2", "-p", "--passthrough", "--threads=2"] {
+        let result = run(&[option, "a", "b"]);
+        assert_eq!(result.status.code(), Some(2), "{option}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("unknown option"),
+            "{option}"
+        );
+    }
 }
 
 #[test]
@@ -122,84 +127,44 @@ fn accepts_a_recovery_interval() {
             .matches("restart point")
             .count(),
         4,
-        "the opening IDR and all three later GOPs are restart points"
+        "the opening fragment and all three later GOPs are restart points"
     );
 }
 
 #[test]
 fn rejects_an_unknown_open_gop_mode() {
-    let result = run(&["--open-gop=closed", "a", "b"]);
-    assert_eq!(result.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&result.stderr).contains("open GOP mode"));
-}
-
-#[test]
-fn rejects_a_nonsensical_thread_count() {
-    let result = run(&["--threads=0", "a", "b"]);
-    assert_eq!(result.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&result.stderr).contains("thread count"));
-}
-
-#[test]
-fn converting_on_several_threads_writes_the_same_file() {
-    // The whole point of splitting a unit into pictures is that where they are
-    // converted cannot reach the output. One thread and four have to agree
-    // byte for byte, or the split has carried something between them.
-    let temp = TempDir::new("threads");
-    let input = temp.join("input.ts");
-    let video = std::fs::read(fixture("open_gop_leading_bb.m2v")).expect("video fixture");
-    std::fs::write(
-        &input,
-        wrap_mpeg2_es_in_ts(&video, Some(900_000), &mut HashMap::new()),
-    )
-    .expect("transport stream fixture");
-
-    let mut written = Vec::new();
-    for threads in ["1", "4"] {
-        let output = temp.join(&format!("output-{threads}.mp4"));
-        let result = run(&["--threads", threads, path(&input), path(&output)]);
-        assert!(result.status.success(), "{:?}", result);
-        written.push(std::fs::read(&output).expect("output"));
+    for mode in ["closed", "idr"] {
+        let result = run(&[&format!("--open-gop={mode}"), "a", "b"]);
+        assert_eq!(result.status.code(), Some(2), "{mode}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("open GOP mode"),
+            "{mode}"
+        );
     }
-    assert!(!written[0].is_empty(), "the conversion wrote nothing");
-    assert_eq!(
-        written[0], written[1],
-        "converting on four threads changed the file"
-    );
 }
 
 #[test]
 fn reports_a_missing_input_without_panicking() {
     let temp = TempDir::new("missing");
-    let result = run(&["/nonexistent/input.m2v", path(&temp.join("out.h264"))]);
+    let result = run(&["/nonexistent/input.m2v", path(&temp.join("out.mp4"))]);
     assert_eq!(result.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&result.stderr).starts_with("mpeg2toh264: "));
 }
 
 #[test]
-fn writes_a_raw_annex_b_stream_and_a_summary() {
-    let temp = TempDir::new("h264");
-    let output = temp.join("output.h264");
-    let result = run(&[
-        "--oversample",
-        "2",
-        path(&fixture("i_only.m2v")),
-        path(&output),
-    ]);
+fn writes_a_fragmented_mp4_and_a_summary() {
+    let temp = TempDir::new("mp4");
+    let output = temp.join("output.mp4");
+    let result = run(&[path(&fixture("ibbp.m2v")), path(&output)]);
     assert!(result.status.success(), "{:?}", result);
-
     let summary = String::from_utf8_lossy(&result.stdout);
     assert!(summary.contains("MPEG-2 ES"), "{summary}");
-    assert!(summary.contains("raw H.264"), "{summary}");
-    assert!(summary.contains("pictures converted"), "{summary}");
-
-    let bytes = std::fs::read(&output).expect("output exists");
-    assert_eq!(&bytes[..5], &[0, 0, 0, 1, 0x67], "opens with an SPS NAL");
+    assert!(summary.contains("pictures carried"), "{summary}");
 }
 
 #[test]
-fn writes_a_fragmented_mp4_when_the_output_says_so() {
-    let temp = TempDir::new("mp4");
+fn quiet_suppresses_the_summary() {
+    let temp = TempDir::new("quiet");
     let output = temp.join("output.mp4");
     let result = run(&["-q", path(&fixture("ibbp.m2v")), path(&output)]);
     assert!(result.status.success(), "{:?}", result);
@@ -217,7 +182,7 @@ fn writes_a_fragmented_mp4_when_the_output_says_so() {
 }
 
 #[test]
-fn mp4_is_the_default_for_other_output_extensions() {
+fn mp4_is_written_whatever_the_output_extension() {
     let temp = TempDir::new("default-mp4");
     let output = temp.join("output.bin");
     let result = run(&[path(&fixture("ibbp.m2v")), path(&output)]);
@@ -278,14 +243,11 @@ fn ts_mp4_carries_its_aac_audio_track() {
 }
 
 #[test]
-fn passthrough_writes_an_mpeg_2_track_instead_of_converting() {
-    let temp = TempDir::new("passthrough");
+fn writes_an_mpeg_2_track() {
+    let temp = TempDir::new("mpeg2-track");
     let output = temp.join("output.mp4");
-    let result = run(&["--passthrough", path(&fixture("ibbp.m2v")), path(&output)]);
+    let result = run(&[path(&fixture("ibbp.m2v")), path(&output)]);
     assert!(result.status.success(), "{:?}", result);
-
-    let summary = String::from_utf8_lossy(&result.stdout);
-    assert!(summary.contains("pictures carried"), "{summary}");
 
     let bytes = std::fs::read(&output).expect("output exists");
     assert_eq!(&bytes[4..8], b"ftyp");
@@ -293,30 +255,9 @@ fn passthrough_writes_an_mpeg_2_track_instead_of_converting() {
         bytes.windows(4).any(|window| window == b"mp4v"),
         "the sample entry is an MPEG-4 visual one"
     );
-    assert!(
-        !bytes.windows(4).any(|window| window == b"avcC"),
-        "nothing was converted, so nothing describes H.264"
-    );
-    // The MPEG-2 start codes are the samples themselves, not something the
-    // conversion path would ever put in an mdat.
+    // The MPEG-2 start codes are the samples themselves.
     assert!(
         bytes.windows(4).any(|window| window == [0, 0, 1, 0xb3]),
         "the sequence header reached the file"
-    );
-}
-
-#[test]
-fn refuses_to_pass_mpeg_2_through_to_a_raw_h264_file() {
-    let temp = TempDir::new("passthrough-h264");
-    let result = run(&[
-        "-p",
-        path(&fixture("ibbp.m2v")),
-        path(&temp.join("output.h264")),
-    ]);
-    assert_eq!(result.status.code(), Some(2));
-    assert!(
-        String::from_utf8_lossy(&result.stderr).contains("passthrough"),
-        "{:?}",
-        String::from_utf8_lossy(&result.stderr)
     );
 }

@@ -82,11 +82,11 @@ try {
   const newInit = new Uint8Array([3]).buffer;
   const newMedia = new Uint8Array([4]).buffer;
 
-  await sink.open("video/mp4; codecs=avc1.640028", oldInit);
+  await sink.open("video/mp4; codecs=mp4v.61", oldInit);
   const sourceBuffer = sink.mediaSource.sourceBuffer;
   sink.push(oldMedia, 0, true);
   sink.reset();
-  await sink.open("video/mp4; codecs=avc1.640028", newInit);
+  await sink.open("video/mp4; codecs=mp4v.61", newInit);
   sink.push(newMedia, 10, true);
 
   sourceBuffer.complete();
@@ -111,7 +111,7 @@ try {
       new Promise((resolve) => setTimeout(() => resolve(false), 20)),
     ]);
   const held = new MseSink(options);
-  await held.open("video/mp4; codecs=avc1.640028", fragment(0));
+  await held.open("video/mp4; codecs=mp4v.61", fragment(0));
   held.holdStart(0.75);
   const heldBuffer = held.mediaSource.sourceBuffer;
   heldBuffer.complete();
@@ -135,7 +135,7 @@ try {
 
   // The end of the input releases a hold that never filled.
   const short = new MseSink(options);
-  await short.open("video/mp4; codecs=avc1.640028", fragment(0));
+  await short.open("video/mp4; codecs=mp4v.61", fragment(0));
   short.holdStart(0.8);
   const shortBuffer = short.mediaSource.sourceBuffer;
   shortBuffer.complete();

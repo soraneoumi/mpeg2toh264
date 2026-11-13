@@ -5,11 +5,9 @@ mod support;
 use std::collections::HashMap;
 
 use mpeg2toh264::mpeg2::{gop_stream::Mpeg2GopStream, headers::parse_elementary_stream};
-use mpeg2toh264::{
-    mpeg2_video_timeline, Fragment, PictureEncoder, Progress, Session, TranscodeOptions, VideoMode,
-};
+use mpeg2toh264::{mpeg2_video_timeline, Fragment, Session, SessionOptions};
 use support::{
-    assert_decode_matches_passthrough, decoding, init_segments, mux_with_sound,
+    assert_decode_matches_passthrough, decoding, init_segments, mux_with_sound, passthrough,
     passthrough_like_decode, read_fixture, track_samples, wrap_mpeg2_es_in_ts,
 };
 
@@ -76,12 +74,11 @@ fn stream(groups: &[Option<usize>], gap_before: Option<usize>) -> Vec<u8> {
     stream
 }
 
-fn run(stream: &[u8], mode: VideoMode, chunk: usize) -> Vec<Fragment> {
+fn run(stream: &[u8], chunk: usize) -> Vec<Fragment> {
     let mut session = Session::anchored(
-        TranscodeOptions {
-            video: mode,
+        SessionOptions {
             recovery_interval: 1000,
-            ..TranscodeOptions::default()
+            ..passthrough()
         },
         Some(ORIGIN),
     );
@@ -141,13 +138,10 @@ fn samples(fragments: &[Fragment]) -> Vec<Sample> {
             let at = 12 + index * 16;
             let duration = u32::from_be_bytes(trun[at..at + 4].try_into().unwrap()) as u64;
             let offset = u32::from_be_bytes(trun[at + 12..at + 16].try_into().unwrap()) as u64;
-            // The initial IDR clone is a one-tick sample, not a film frame.
-            if duration > 1 {
-                out.push(Sample {
-                    pts: dts + offset,
-                    duration,
-                });
-            }
+            out.push(Sample {
+                pts: dts + offset,
+                duration,
+            });
             dts += duration;
         }
         previous_end = Some(dts);
@@ -168,7 +162,7 @@ fn film_pts(index: usize, starts_with_repeat: bool) -> u64 {
 }
 
 #[test]
-fn rff_is_even_across_odd_gops_on_both_paths() {
+fn rff_is_even_across_odd_gops() {
     for phase in 0..2 {
         let source = stream(
             &[
@@ -179,25 +173,23 @@ fn rff_is_even_across_odd_gops_on_both_paths() {
             ],
             None,
         );
-        for mode in [VideoMode::Transcode, VideoMode::Passthrough] {
-            for chunk in [97, 1024 * 1024] {
-                let frames = samples(&run(&source, mode, chunk));
-                assert_eq!(frames.len(), 60);
-                for (index, sample) in frames.iter().enumerate() {
-                    assert_eq!(
-                        sample.pts - frames[0].pts,
-                        film_pts(index, phase == 1),
-                        "frame {index}, {mode:?}, phase {phase}"
-                    );
-                    if phase == 1 || index > 0 {
-                        assert!((3753..=3754).contains(&sample.duration), "{sample:?}");
-                    }
-                }
+        for chunk in [97, 1024 * 1024] {
+            let frames = samples(&run(&source, chunk));
+            assert_eq!(frames.len(), 60);
+            for (index, sample) in frames.iter().enumerate() {
                 assert_eq!(
-                    frames.iter().map(|s| s.duration).sum::<u64>(),
-                    film_pts(60, phase == 1)
+                    sample.pts - frames[0].pts,
+                    film_pts(index, phase == 1),
+                    "frame {index}, phase {phase}"
                 );
+                if phase == 1 || index > 0 {
+                    assert!((3753..=3754).contains(&sample.duration), "{sample:?}");
+                }
             }
+            assert_eq!(
+                frames.iter().map(|s| s.duration).sum::<u64>(),
+                film_pts(60, phase == 1)
+            );
         }
     }
 }
@@ -220,21 +212,16 @@ fn a_frame_rate_change_clears_the_previous_repeat_shift() {
             Some(START + ticks(field_count(Some(1)))),
             &mut continuity,
         ));
-        for mode in [VideoMode::Transcode, VideoMode::Passthrough] {
-            let fragments = run(&source, mode, 97);
-            let next = fragments
-                .iter()
-                .filter(|fragment| matches!(fragment, Fragment::Media { .. }))
-                .nth(1)
-                .expect("the new frame rate has its own fragment");
-            let frames = samples(std::slice::from_ref(next));
-            assert_eq!(frames.len(), 15);
-            for frame in frames {
-                assert_eq!(
-                    frame.duration, frame_ticks,
-                    "{mode:?}, rate code {rate_code}"
-                );
-            }
+        let fragments = run(&source, 97);
+        let next = fragments
+            .iter()
+            .filter(|fragment| matches!(fragment, Fragment::Media { .. }))
+            .nth(1)
+            .expect("the new frame rate has its own fragment");
+        let frames = samples(std::slice::from_ref(next));
+        assert_eq!(frames.len(), 15);
+        for frame in frames {
+            assert_eq!(frame.duration, frame_ticks, "rate code {rate_code}");
         }
     }
 }
@@ -242,39 +229,36 @@ fn a_frame_rate_change_clears_the_previous_repeat_shift() {
 #[test]
 fn mixed_video_has_no_gap_and_returns_to_source_time_after_one_picture() {
     let source = stream(&[None, Some(0), Some(15), None], None);
-    for mode in [VideoMode::Transcode, VideoMode::Passthrough] {
-        let frames = samples(&run(&source, mode, 1009));
-        assert_eq!(frames.len(), 60);
-        for (index, frame) in frames.iter().enumerate() {
-            let expected = if index < 15 {
-                index as u64 * 3003
-            } else if index < 45 {
-                45_045 + film_pts(index - 15, false)
-            } else if index == 45 {
-                // The preceding RFF already committed this boundary. It must
-                // not be changed by discovering that native video follows.
-                156_907
-            } else {
-                157_658 + (index - 45) as u64 * 3003
-            };
-            assert_eq!(frame.pts - frames[0].pts, expected, "frame {index}");
-            if let Some(next) = frames.get(index + 1) {
-                // Transcode's initial reference clone borrows one tick.
-                assert!(next.pts.abs_diff(frame.pts + frame.duration) <= 1);
-            }
+    let frames = samples(&run(&source, 1009));
+    assert_eq!(frames.len(), 60);
+    for (index, frame) in frames.iter().enumerate() {
+        let expected = if index < 15 {
+            index as u64 * 3003
+        } else if index < 45 {
+            45_045 + film_pts(index - 15, false)
+        } else if index == 45 {
+            // The preceding RFF already committed this boundary. It must
+            // not be changed by discovering that native video follows.
+            156_907
+        } else {
+            157_658 + (index - 45) as u64 * 3003
+        };
+        assert_eq!(frame.pts - frames[0].pts, expected, "frame {index}");
+        if let Some(next) = frames.get(index + 1) {
+            assert_eq!(next.pts, frame.pts + frame.duration);
         }
-        assert!(frames[16..=45]
-            .iter()
-            .all(|s| (3753..=3754).contains(&s.duration)));
-        assert!(frames[46..].iter().all(|s| s.duration == 3003));
-        assert_eq!(frames.iter().map(|s| s.duration).sum::<u64>(), 202_703);
     }
+    assert!(frames[16..=45]
+        .iter()
+        .all(|s| (3753..=3754).contains(&s.duration)));
+    assert!(frames[46..].iter().all(|s| s.duration == 3003));
+    assert_eq!(frames.iter().map(|s| s.duration).sum::<u64>(), 202_703);
 }
 
 #[test]
-fn standalone_timing_matches_display_order_and_preserves_picture_selection() {
+fn standalone_timing_matches_display_order() {
     let source = [gop(Some(0)), gop(Some(15))].concat();
-    let timeline = mpeg2_video_timeline(&source, false, &[]).unwrap();
+    let timeline = mpeg2_video_timeline(&source, false).unwrap();
     for (&index, &pts) in timeline
         .presentation_indices
         .iter()
@@ -282,33 +266,12 @@ fn standalone_timing_matches_display_order_and_preserves_picture_selection() {
     {
         assert_eq!(pts, film_pts((index - 1) as usize, false));
     }
-    let mut damaged = vec![false; 30];
-    damaged[7] = true;
-    let dropped = mpeg2_video_timeline(&source, false, &damaged).unwrap();
-    assert_eq!(
-        dropped.presentation_indices.len(),
-        timeline.presentation_indices.len() - 1
-    );
-    for (&index, &pts) in dropped
-        .presentation_indices
-        .iter()
-        .zip(&dropped.presentation_times)
-    {
-        assert_eq!(
-            pts,
-            timeline.presentation_times[timeline
-                .presentation_indices
-                .iter()
-                .position(|i| *i == index)
-                .unwrap()]
-        );
-    }
 }
 
 #[test]
 fn missing_gops_cannot_change_an_already_emitted_duration() {
     let source = stream(&[Some(0), Some(15)], Some(1));
-    let fragments = run(&source, VideoMode::Passthrough, 97);
+    let fragments = run(&source, 97);
     let first = fragments
         .iter()
         .find_map(|f| match f {
@@ -319,11 +282,7 @@ fn missing_gops_cannot_change_an_already_emitted_duration() {
     let frames = samples(std::slice::from_ref(first));
     assert!((3753..=3754).contains(&frames.last().unwrap().duration));
     assert_eq!(frames.iter().map(|s| s.duration).sum::<u64>(), 55_556);
-    let continuous = run(
-        &stream(&[Some(0), Some(15)], None),
-        VideoMode::Passthrough,
-        97,
-    );
+    let continuous = run(&stream(&[Some(0), Some(15)], None), 97);
     let continuous_first = continuous
         .iter()
         .find(|f| matches!(f, Fragment::Media { .. }))
@@ -347,24 +306,22 @@ fn open_gop_pts_stay_on_the_source_clock_and_seeks_land_at_the_same_time() {
         pieces.push(wrap_mpeg2_es_in_ts(&data, Some(pts), &mut continuity));
         index += pictures.len();
     }
-    for mode in [VideoMode::Transcode, VideoMode::Passthrough] {
-        let all = samples(&run(&pieces.concat(), mode, 919));
-        assert_eq!(all.len(), 46);
-        for (index, sample) in all.iter().enumerate() {
-            assert_eq!(sample.pts - all[0].pts, film_pts(index, false));
-            if index > 0 {
-                assert!((3753..=3754).contains(&sample.duration));
-            }
+    let all = samples(&run(&pieces.concat(), 919));
+    assert_eq!(all.len(), 46);
+    for (index, sample) in all.iter().enumerate() {
+        assert_eq!(sample.pts - all[0].pts, film_pts(index, false));
+        if index > 0 {
+            assert!((3753..=3754).contains(&sample.duration));
         }
-        let seeked = samples(&run(&pieces[1..].concat(), mode, 919));
-        // A seek holds its opening picture over the unavailable leading Bs.
-        // The following pictures must still agree with continuous playback.
-        for (actual, expected) in seeked.iter().rev().zip(all.iter().rev()).take(28) {
-            assert!(
-                actual.pts.abs_diff(expected.pts) <= 1,
-                "{actual:?} versus {expected:?}"
-            );
-        }
+    }
+    let seeked = samples(&run(&pieces[1..].concat(), 919));
+    // A seek holds its opening picture over the unavailable leading Bs.
+    // The following pictures must still agree with continuous playback.
+    for (actual, expected) in seeked.iter().rev().zip(all.iter().rev()).take(28) {
+        assert!(
+            actual.pts.abs_diff(expected.pts) <= 1,
+            "{actual:?} versus {expected:?}"
+        );
     }
 }
 
@@ -392,12 +349,10 @@ fn consecutive_repeats_keep_decode_time_continuous_through_the_last_open_gop() {
         ));
         index += pictures.len();
     }
-    for mode in [VideoMode::Transcode, VideoMode::Passthrough] {
-        let frames = samples(&run(&source, mode, 97));
-        assert_eq!(frames.len(), index);
-        for pair in frames[1..].windows(2) {
-            assert!((4504..=4505).contains(&(pair[1].pts - pair[0].pts)));
-        }
+    let frames = samples(&run(&source, 97));
+    assert_eq!(frames.len(), index);
+    for pair in frames[1..].windows(2) {
+        assert!((4504..=4505).contains(&(pair[1].pts - pair[0].pts)));
     }
 }
 
@@ -415,7 +370,7 @@ fn interlaced_pictures_and_progressive_sequences_keep_their_source_durations() {
                 _ => {}
             }
         }
-        let timeline = mpeg2_video_timeline(&source, false, &[]).unwrap();
+        let timeline = mpeg2_video_timeline(&source, false).unwrap();
         assert!(timeline
             .sample_durations
             .iter()
@@ -426,47 +381,17 @@ fn interlaced_pictures_and_progressive_sequences_keep_their_source_durations() {
 /// Send one whole GOP followed by only a prefix of the next. The final PES
 /// starts with a byte of slice payload: it flushes the previous PES without
 /// contributing another picture header or completing the second GOP.
-fn push_prefix(
-    first: &[u8],
-    prefix: &[u8],
-    next_pts: u64,
-    mode: VideoMode,
-    deferred: bool,
-) -> Vec<Fragment> {
+fn push_prefix(first: &[u8], prefix: &[u8], next_pts: u64) -> Vec<Fragment> {
     let mut continuity = HashMap::new();
     let mut source = wrap_mpeg2_es_in_ts(first, Some(START), &mut continuity);
     source.extend(wrap_mpeg2_es_in_ts(prefix, Some(next_pts), &mut continuity));
     source.extend(wrap_mpeg2_es_in_ts(&[0], None, &mut continuity));
-    let mut session = Session::anchored(
-        TranscodeOptions {
-            video: mode,
-            ..TranscodeOptions::default()
-        },
-        Some(ORIGIN),
-    );
-    if !deferred {
-        return session.push(&source).unwrap();
-    }
-    let mut progress = session.push_deferred(&source).unwrap();
-    let mut encoder = PictureEncoder::new();
-    let mut out = Vec::new();
-    loop {
-        out.extend(progress.fragments());
-        match progress {
-            Progress::Idle(_) => return out,
-            Progress::Pending { jobs, .. } => {
-                let outputs = jobs
-                    .iter()
-                    .map(|job| encoder.encode(job).unwrap())
-                    .collect::<Vec<_>>();
-                progress = session.complete(&outputs).unwrap();
-            }
-        }
-    }
+    let mut session = Session::anchored(passthrough(), Some(ORIGIN));
+    session.push(&source).unwrap()
 }
 
 #[test]
-fn video_and_rff_emit_without_any_following_picture_on_all_paths() {
+fn video_and_rff_emit_without_any_following_picture() {
     for open in [false, true] {
         for phase in [None, Some(0), Some(1)] {
             let (first, next, count) = if open {
@@ -486,27 +411,19 @@ fn video_and_rff_emit_without_any_following_picture_on_all_paths() {
                 .unwrap();
             // Both fixtures' next first coded picture is at display slot 15.
             let next_pts = START + ticks(field_count(phase));
-            for mode in [VideoMode::Transcode, VideoMode::Passthrough] {
-                for deferred in [false, true] {
-                    // Only the existing splitter's boundary marker arrives.
-                    // No picture header, RFF flag, or slice of the next GOP is
-                    // present, and finish() is deliberately never called.
-                    let out = push_prefix(&first, &next[..picture], next_pts, mode, deferred);
-                    let frames = samples(&out);
-                    assert_eq!(
-                        frames.len(),
-                        count,
-                        "{mode:?}, phase {phase:?}, open {open}, deferred {deferred}"
-                    );
-                    if phase.is_some() {
-                        assert!((3753..=3754).contains(&frames.last().unwrap().duration));
-                    }
-                    // Supplying the following GOP cannot revise an output
-                    // that was committed without knowing its picture flags.
-                    let with_next = push_prefix(&first, &next, next_pts, mode, deferred);
-                    assert_eq!(frames, samples(&with_next));
-                }
+            // Only the existing splitter's boundary marker arrives.
+            // No picture header, RFF flag, or slice of the next GOP is
+            // present, and finish() is deliberately never called.
+            let out = push_prefix(&first, &next[..picture], next_pts);
+            let frames = samples(&out);
+            assert_eq!(frames.len(), count, "phase {phase:?}, open {open}");
+            if phase.is_some() {
+                assert!((3753..=3754).contains(&frames.last().unwrap().duration));
             }
+            // Supplying the following GOP cannot revise an output
+            // that was committed without knowing its picture flags.
+            let with_next = push_prefix(&first, &next, next_pts);
+            assert_eq!(frames, samples(&with_next));
         }
     }
 }
@@ -520,40 +437,37 @@ fn cutting_groups_leaves_the_field_clock_and_the_samples_where_they_were() {
     let groups = [None, Some(0), Some(1), Some(1), None, Some(0)];
     for gap_before in [None, Some(3)] {
         let stream = stream(&groups, gap_before);
-        for video in [VideoMode::Transcode, VideoMode::Passthrough] {
-            let options = TranscodeOptions {
-                video,
-                recovery_interval: 2,
-                ..TranscodeOptions::default()
-            };
-            let mut results = Vec::new();
-            for split_groups in [false, true] {
-                let mut session = Session::anchored(
-                    TranscodeOptions {
-                        split_groups,
-                        ..options
-                    },
-                    Some(ORIGIN),
-                );
-                let mut fragments = Vec::new();
-                for bytes in stream.chunks(64 * 1024) {
-                    fragments.extend(session.push(bytes).unwrap());
-                }
-                fragments.extend(session.finish().unwrap());
-                results.push(fragments);
+        let options = SessionOptions {
+            recovery_interval: 2,
+            ..passthrough()
+        };
+        let mut results = Vec::new();
+        for split_groups in [false, true] {
+            let mut session = Session::anchored(
+                SessionOptions {
+                    split_groups,
+                    ..options
+                },
+                Some(ORIGIN),
+            );
+            let mut fragments = Vec::new();
+            for bytes in stream.chunks(64 * 1024) {
+                fragments.extend(session.push(bytes).unwrap());
             }
-            let (whole, split) = (&results[0], &results[1]);
-            let label = format!("{video:?}, gap {gap_before:?}");
-            assert!(
-                init_segments(whole) == init_segments(split),
-                "{label}: initialization segments"
-            );
-            assert!(
-                track_samples(whole) == track_samples(split),
-                "{label}: samples"
-            );
-            assert!(split.len() > whole.len(), "{label}: the groups were cut");
+            fragments.extend(session.finish().unwrap());
+            results.push(fragments);
         }
+        let (whole, split) = (&results[0], &results[1]);
+        let label = format!("gap {gap_before:?}");
+        assert!(
+            init_segments(whole) == init_segments(split),
+            "{label}: initialization segments"
+        );
+        assert!(
+            track_samples(whole) == track_samples(split),
+            "{label}: samples"
+        );
+        assert!(split.len() > whole.len(), "{label}: the groups were cut");
     }
 }
 
@@ -580,7 +494,7 @@ fn decode_mode_times_repeated_fields_as_the_passthrough_samples() {
     let groups = [None, Some(0), Some(1), Some(1), None, Some(0)];
     for gap_before in [None, Some(3)] {
         let stream = stream_with_sound(&groups, gap_before);
-        let run_with = |options: TranscodeOptions| {
+        let run_with = |options: SessionOptions| {
             let mut session = Session::anchored(options, Some(ORIGIN));
             let mut fragments = Vec::new();
             for bytes in stream.chunks(64 * 1024) {
@@ -589,9 +503,9 @@ fn decode_mode_times_repeated_fields_as_the_passthrough_samples() {
             fragments.extend(session.finish().unwrap());
             fragments
         };
-        let options = TranscodeOptions {
+        let options = SessionOptions {
             recovery_interval: 2,
-            ..TranscodeOptions::default()
+            ..passthrough()
         };
         let decoded = run_with(decoding(options));
         let muxed = run_with(passthrough_like_decode(options));

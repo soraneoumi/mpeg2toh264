@@ -1,4 +1,4 @@
-//! WebAssembly bindings for the streaming transcoder.
+//! WebAssembly bindings for the streaming MPEG-2 packager and decoder.
 //!
 //! This is a translation layer and nothing else: the pipeline, and in
 //! particular the timeline arithmetic that decides where each fragment sits,
@@ -6,11 +6,9 @@
 //! What is here turns Rust values into the shapes JavaScript expects.
 
 use js_sys::{Array, Object, Reflect, Uint8Array};
-use mpeg2toh264::job::PictureOutput;
 use mpeg2toh264::mpeg2::decode::{packed_planes, DecodedFrame, UnitDecoder};
 use mpeg2toh264::{
-    AudioGain, DualMono, Fragment, OpenGopRecovery, Progress, TranscodeOptions, VideoMode,
-    YcbcrMatrix,
+    AudioGain, DualMono, Fragment, OpenGopRecovery, SessionOptions, VideoMode, YcbcrMatrix,
 };
 use wasm_bindgen::prelude::*;
 
@@ -118,20 +116,6 @@ export type DecodedPictureInfo = {
 };
 
 /**
- * How far a session got, for a caller converting the pictures itself.
- *
- * `jobs` is one opaque buffer per picture. Hand each to `PictureEncoder.encode`
- * -- here, or in as many workers as there are to spare -- and give the results
- * back to `Session.complete` in the same order. Until then the session produces
- * nothing further.
- */
-export type Progress = {
-  fragments: Fragment[];
-  /** Empty when nothing is owed. */
-  jobs: Uint8Array[];
-};
-
-/**
  * One sound stream a service offers, as its program map describes it.
  *
  * All of it comes from the map, so the choice can be offered before a byte of
@@ -164,8 +148,6 @@ export type AudioStream = {
 extern "C" {
     #[wasm_bindgen(typescript_type = "Fragment[]")]
     pub type FragmentArray;
-    #[wasm_bindgen(typescript_type = "Progress")]
-    pub type ProgressObject;
     #[wasm_bindgen(typescript_type = "AudioStream[]")]
     pub type AudioStreamArray;
     #[wasm_bindgen(typescript_type = "Extract<Fragment, { kind: \"video\" }>")]
@@ -174,12 +156,12 @@ extern "C" {
     pub type DecodedPictureInfoObject;
 }
 
-/// Streaming transcode of one transport stream.
+/// Streaming conversion of one transport stream to fragmented MP4.
 ///
 /// Feed it the file in slices and append what comes back:
 ///
 /// ```js
-/// const session = new Session();
+/// const session = new Session(undefined, undefined, undefined, undefined, "passthrough");
 /// for (const fragment of session.push(chunk)) append(fragment);
 /// for (const fragment of session.finish()) append(fragment);
 /// ```
@@ -208,8 +190,7 @@ pub struct Session {
 
 #[wasm_bindgen]
 impl Session {
-    /// Start a session. `oversample` is the quantiser search factor, and
-    /// `undefined` takes the default of 2.
+    /// Start a session.
     ///
     /// `originTicks` measures the timeline from a PES timestamp of the
     /// caller's choosing rather than from wherever this input opens, which is
@@ -220,28 +201,40 @@ impl Session {
     /// carries several. `undefined` takes the first that turns up with a
     /// picture in it. See `serviceIds` for what a recording is offering.
     ///
-    /// `splitFieldSamples` gives each field of a complementary pair its own MP4
-    /// sample, working around decoders that freeze on field pictures.
-    /// `undefined` leaves the pair in one sample, which is what more decoders
-    /// accept.
+    /// `recoveryInterval` is how many groups of pictures lie between recovery
+    /// boundaries, a positive integer; `undefined` takes 24. What a boundary
+    /// does is `openGopRecovery`'s to say.
     ///
-    /// `video` is what becomes of the pictures. `"transcode"`, the default,
-    /// converts them to H.264. `"passthrough"` carries the MPEG-2 into the MP4
-    /// as it stands, for a browser whose decoder takes MPEG-2: nothing is
-    /// requantised, but a browser that does not decode MPEG-2 plays none of
-    /// it, so ask `MediaSource.isTypeSupported` with the `mimeCodec` the init
-    /// fragment reports first. `"decode"` muxes only the sound and hands each
-    /// unit out as a `video` fragment for `PictureDecoder`; a stream without
-    /// AAC sound then fails with an error named `NoAacAudioError`.
+    /// `splitFieldSamples` gives each field of a complementary pair its own MP4
+    /// sample, which `undefined` does too. `false` keeps the pair in one. Only
+    /// `"passthrough"` has a video track to split.
+    ///
+    /// `video` is what becomes of the pictures, and has no default: anything
+    /// but the two values below, `undefined` included, is an error.
+    /// `"passthrough"` carries the MPEG-2 into the MP4 as it stands, for a
+    /// browser whose decoder takes MPEG-2: a browser that does not decode MPEG-2
+    /// plays none of it, so ask `MediaSource.isTypeSupported` with the
+    /// `mimeCodec` the init fragment reports first. `"decode"` muxes only the
+    /// sound and hands each unit out as a `video` fragment for
+    /// `PictureDecoder`; a stream without AAC sound then fails with an error
+    /// named `NoAacAudioError`.
+    ///
+    /// `openGopRecovery` is what a recovery boundary does with the leading
+    /// pictures of an open group. `"recovery-point"`, which `undefined` takes,
+    /// keeps them, and `"passthrough"` marks the fragment that opens at the
+    /// boundary as a random access point; `"decode"` has no video track to
+    /// mark, so there it changes nothing. `"discard"` drops them and begins
+    /// again at the boundary's intra picture, as at the start of the stream:
+    /// `"passthrough"` marks the fragment a random access point, and `"decode"`
+    /// sends the unit with `restart` set.
     ///
     /// `splitGroups` cuts each group of pictures into fragments of one anchor
     /// picture and the B pictures coded after it, so that media reaches the
     /// player as soon as it has arrived instead of once its group has. The
-    /// samples are the same either way. `undefined` sends whole groups.
+    /// samples are the same either way. `undefined` sends whole groups;
+    /// `"decode"` always cuts them.
     #[wasm_bindgen(constructor)]
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        oversample: Option<f64>,
         origin_ticks: Option<f64>,
         service_id: Option<u16>,
         recovery_interval: Option<u32>,
@@ -250,11 +243,12 @@ impl Session {
         open_gop_recovery: Option<String>,
         split_groups: Option<bool>,
     ) -> Result<Session, JsError> {
-        let defaults = TranscodeOptions::default();
-        let oversample = oversample.unwrap_or(defaults.oversample);
-        if !oversample.is_finite() || oversample <= 0.0 {
-            return Err(JsError::new("oversample must be a positive number"));
-        }
+        let video = match video.as_deref() {
+            Some("passthrough") => VideoMode::Passthrough,
+            Some("decode") => VideoMode::Decode,
+            _ => return Err(JsError::new("video must be 'passthrough' or 'decode'")),
+        };
+        let defaults = SessionOptions::new(video);
         let recovery_interval = recovery_interval.unwrap_or(defaults.recovery_interval as u32);
         if recovery_interval == 0 {
             return Err(JsError::new("recoveryInterval must be a positive integer"));
@@ -266,30 +260,18 @@ impl Session {
             Some(ticks) => Some(ticks as u64),
             None => None,
         };
-        let video = match video.as_deref() {
-            None | Some("transcode") => VideoMode::Transcode,
-            Some("passthrough") => VideoMode::Passthrough,
-            Some("decode") => VideoMode::Decode,
-            Some(_) => {
-                return Err(JsError::new(
-                    "video must be 'transcode', 'passthrough' or 'decode'",
-                ))
-            }
-        };
         let open_gop_recovery = match open_gop_recovery.as_deref() {
-            None | Some("idr") => OpenGopRecovery::Idr,
-            Some("recovery-point") => OpenGopRecovery::RecoveryPoint,
+            None | Some("recovery-point") => OpenGopRecovery::RecoveryPoint,
             Some("discard") => OpenGopRecovery::Discard,
             Some(_) => {
                 return Err(JsError::new(
-                    "openGopRecovery must be 'idr', 'recovery-point', or 'discard'",
+                    "openGopRecovery must be 'recovery-point' or 'discard'",
                 ))
             }
         };
         Ok(Self {
             inner: mpeg2toh264::Session::for_service(
-                TranscodeOptions {
-                    oversample,
+                SessionOptions {
                     recovery_interval: recovery_interval as usize,
                     open_gop_recovery,
                     split_field_samples: split_field_samples
@@ -439,80 +421,6 @@ impl Session {
     /// Flush everything held back, at end of input.
     pub fn finish(&mut self) -> Result<FragmentArray, JsError> {
         to_js_array(self.inner.finish().map_err(to_js_error)?)
-    }
-
-    /// [`Session::push`], for a caller that converts the pictures itself.
-    ///
-    /// Stops at the first unit whose video has to be coded and hands its
-    /// pictures back as `jobs`. Nothing more comes out of the session until
-    /// those are returned to `complete`.
-    #[wasm_bindgen(js_name = pushDeferred)]
-    pub fn push_deferred(&mut self, chunk: &[u8]) -> Result<ProgressObject, JsError> {
-        to_js_progress(self.inner.push_deferred(chunk).map_err(to_js_error)?)
-    }
-
-    /// [`Session::finish`], for the same caller. Call it until `jobs` is empty.
-    #[wasm_bindgen(js_name = finishDeferred)]
-    pub fn finish_deferred(&mut self) -> Result<ProgressObject, JsError> {
-        to_js_progress(self.inner.finish_deferred().map_err(to_js_error)?)
-    }
-
-    /// Hand back one converted picture per job, in the order they were given
-    /// out, and carry on.
-    pub fn complete(&mut self, outputs: Vec<Uint8Array>) -> Result<ProgressObject, JsError> {
-        let outputs: Result<Vec<PictureOutput>, JsError> = outputs
-            .iter()
-            .map(|output| PictureOutput::decode(&output.to_vec()).map_err(to_js_error))
-            .collect();
-        to_js_progress(self.inner.complete(&outputs?).map_err(to_js_error)?)
-    }
-}
-
-/// Converts one picture at a time, and nothing else.
-///
-/// This is what a picture worker holds. It knows nothing of the stream around
-/// it -- everything a picture is coded against arrives with it -- so a pool of
-/// these, each in its own worker and so its own WebAssembly instance, converts
-/// a unit's pictures at the same time without sharing any memory.
-///
-/// ```js
-/// const encoder = new PictureEncoder();
-/// self.onmessage = ({ data: job }) => {
-///   const output = encoder.encode(job);
-///   self.postMessage(output, [output.buffer]);
-/// };
-/// ```
-///
-/// Keep one for as long as the worker lives: what it holds between pictures is
-/// several megabytes of scratch at an HD macroblock count, and asking the
-/// allocator for that per picture costs more than the coding does.
-#[wasm_bindgen]
-pub struct PictureEncoder {
-    inner: mpeg2toh264::PictureEncoder,
-}
-
-#[wasm_bindgen]
-impl PictureEncoder {
-    #[wasm_bindgen(constructor)]
-    pub fn new() -> Self {
-        Self {
-            inner: mpeg2toh264::PictureEncoder::new(),
-        }
-    }
-
-    /// Convert one of the jobs a `Progress` handed out. The result is opaque
-    /// and goes straight back to `Session.complete`; a picture whose slices
-    /// will not decode comes back as a result saying so rather than as an
-    /// error, because that is a fact about the source and not a failure here.
-    pub fn encode(&mut self, job: &[u8]) -> Result<Uint8Array, JsError> {
-        let output = self.inner.encode(job).map_err(to_js_error)?;
-        Ok(Uint8Array::from(output.encode().as_slice()))
-    }
-}
-
-impl Default for PictureEncoder {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -739,25 +647,10 @@ pub fn last_timestamp(data: &[u8]) -> Option<f64> {
 /// This is what time it is at the byte the slice was read from. A player
 /// seeking in a file with no index asks this of a slice at the byte its
 /// estimate points to, and asks again nearer the mark, which costs a hundred
-/// kilobytes where transcoding to find out costs seconds of video.
+/// kilobytes where playing through the file to find out costs seconds of video.
 #[wasm_bindgen(js_name = firstTimestamp)]
 pub fn first_timestamp(data: &[u8]) -> Option<f64> {
     mpeg2toh264::first_pts(data).map(|ticks| ticks as f64)
-}
-
-fn to_js_progress(progress: Progress) -> Result<ProgressObject, JsError> {
-    let (fragments, jobs) = match progress {
-        Progress::Idle(fragments) => (fragments, Vec::new()),
-        Progress::Pending { fragments, jobs } => (fragments, jobs),
-    };
-    let object = Object::new();
-    set(&object, "fragments", &to_js_array(fragments)?.into())?;
-    let array = Array::new_with_length(jobs.len() as u32);
-    for (index, job) in jobs.iter().enumerate() {
-        array.set(index as u32, copy_out(job));
-    }
-    set(&object, "jobs", &array.into())?;
-    Ok(JsValue::from(object).unchecked_into())
 }
 
 fn to_js_array(fragments: Vec<Fragment>) -> Result<FragmentArray, JsError> {
@@ -879,8 +772,8 @@ fn set(object: &Object, key: &str, value: &JsValue) -> Result<(), JsError> {
 
 /// Every failure here is "this stream is not something we can handle", so the
 /// message is the whole of what a caller can act on -- except for a stream
-/// decode mode cannot play, which is named so that a caller can transcode it
-/// instead.
+/// decode mode cannot play, which is named so that a caller can fall back to
+/// another mode.
 fn to_js_error(error: mpeg2toh264::Error) -> JsError {
     let js_error = JsError::new(&error.to_string());
     if error.is_no_aac_audio() {

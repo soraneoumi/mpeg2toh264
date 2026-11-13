@@ -1,9 +1,8 @@
 /**
  * The WebAssembly `Session`, plus the arithmetic for reporting how fast it is.
  *
- * There is no pipeline here: demux, GOP splitting, transcoding, muxing and the
- * two-track timeline all live inside the `Session`. This is the bookkeeping
- * around it.
+ * There is no pipeline here: demux, GOP splitting, muxing and the timeline all
+ * live inside the `Session`. This is the bookkeeping around it.
  */
 import init, {
   firstTimestamp as wasmFirstTimestamp,
@@ -13,9 +12,7 @@ import init, {
   type AudioStream,
   type DecodedPictureInfo,
   type Fragment,
-  type Progress,
 } from "../wasm/mpeg2toh264_wasm.js";
-import type { PicturePool } from "./pool.js";
 import type { Stats, VideoMode } from "./protocol.js";
 
 export { PictureDecoder };
@@ -30,26 +27,17 @@ const DEFAULT_WASM_URL = new URL(
   import.meta.url,
 );
 
-let loaded: { url: string; module: Promise<WebAssembly.Module> } | null = null;
+let loaded: { url: string; ready: Promise<void> } | null = null;
 
-/**
- * Instantiate the module once per worker, however many loads run through it,
- * and keep what it was compiled from.
- *
- * The compiled module is what the picture workers are started with: a
- * `WebAssembly.Module` goes over `postMessage` as it stands, so the bytes are
- * fetched and compiled here and nowhere else however many workers there are.
- */
-export function loadWasm(wasmUrl: string | null): Promise<WebAssembly.Module> {
+/** Instantiate the module once per worker, however many loads run through it. */
+export function loadWasm(wasmUrl: string | null): Promise<void> {
   const url = wasmUrl ?? DEFAULT_WASM_URL.href;
-  if (loaded?.url !== url) loaded = { url, module: compileAndInit(url) };
-  return loaded.module;
+  if (loaded?.url !== url) loaded = { url, ready: compileAndInit(url) };
+  return loaded.ready;
 }
 
-async function compileAndInit(url: string): Promise<WebAssembly.Module> {
-  const module = await compile(url);
-  await init({ module_or_path: module });
-  return module;
+async function compileAndInit(url: string): Promise<void> {
+  await init({ module_or_path: await compile(url) });
 }
 
 async function compile(url: string): Promise<WebAssembly.Module> {
@@ -81,9 +69,8 @@ export function firstTimestamp(data: Uint8Array): number | null {
   return wasmFirstTimestamp(data) ?? null;
 }
 
-export class Transcoder {
+export class Packager {
   #session: Session;
-  #pool: PicturePool | null = null;
   /** Whether the pictures are decoded elsewhere; see `countDecoded`. */
   readonly #decode: boolean;
   /** The session's own time in decode mode, which the rates leave out. */
@@ -106,24 +93,22 @@ export class Transcoder {
    *
    * `video` is what becomes of the pictures; see `VideoMode`.
    *
-   * `splitGroups` makes a fragment of each anchor picture and the B pictures
+   * `splitFieldSamples` and `splitGroups` shape the passthrough fragments and
+   * change nothing in decode mode. `splitGroups` makes a fragment of each anchor picture and the B pictures
    * coded after it, instead of one of each whole group of pictures, so that
    * media reaches the buffer as soon as it has arrived.
    */
   constructor(
-    oversample: number | undefined,
     recoveryInterval: number | undefined,
     originTicks: number | null,
     serviceId: number | null,
     splitFieldSamples: boolean | undefined,
-    video: VideoMode = "transcode",
-    openGopRecovery:
-      "idr" | "recovery-point" | "discard" | undefined = undefined,
+    video: VideoMode,
+    openGopRecovery: "recovery-point" | "discard" | undefined = undefined,
     splitGroups = false,
   ) {
     this.#decode = video === "decode";
     this.#session = new Session(
-      oversample,
       originTicks,
       serviceId,
       recoveryInterval,
@@ -139,7 +124,7 @@ export class Transcoder {
     return this.#session.originTicks ?? null;
   }
 
-  /** The service being converted, once a program map has named it. */
+  /** The service being packaged, once a program map has named it. */
   get serviceId(): number | null {
     return this.#session.serviceId ?? null;
   }
@@ -188,52 +173,12 @@ export class Transcoder {
     this.#session.setAudioGain(stereo, surround);
   }
 
-  /**
-   * Convert the pictures of every unit in a pool rather than here.
-   *
-   * Null puts them back on this thread, which is what happens where a worker
-   * cannot spawn workers. The output is the same either way; only where the
-   * coding runs changes.
-   */
-  usePool(pool: PicturePool | null): void {
-    this.#pool = pool;
-  }
-
   async push(chunk: Uint8Array): Promise<Fragment[]> {
-    if (!this.#pool) return this.#timed(() => this.#session.push(chunk));
-    return this.#deferred(() => this.#session.pushDeferred(chunk));
+    return this.#timed(() => this.#session.push(chunk));
   }
 
   async finish(): Promise<Fragment[]> {
-    if (!this.#pool) return this.#timed(() => this.#session.finish());
-    return this.#deferred(() => this.#session.finishDeferred());
-  }
-
-  /**
-   * Run one step of the session and satisfy whatever it asks for, until it
-   * asks for nothing.
-   *
-   * Completing a unit lets the session reach the one behind it, so this runs
-   * down everything that is ready rather than one unit per call.
-   *
-   * The time counted is the wall clock across the whole of it, pool included,
-   * which is what the rate on screen should mean: how fast the conversion is
-   * going, rather than how busy this thread was while it went.
-   */
-  async #deferred(step: () => Progress): Promise<Fragment[]> {
-    const started = performance.now();
-    const fragments: Fragment[] = [];
-    let progress = step();
-    for (;;) {
-      fragments.push(...progress.fragments);
-      if (progress.jobs.length === 0) break;
-      progress = this.#session.complete(await this.#pool!.run(progress.jobs));
-    }
-    const elapsed = performance.now() - started;
-    this.#totalMs += elapsed;
-    this.#intervalMs += elapsed;
-    this.#account(fragments);
-    return fragments;
+    return this.#timed(() => this.#session.finish());
   }
 
   /**
@@ -295,7 +240,7 @@ export class Transcoder {
     return fragments;
   }
 
-  /** Count what a batch of fragments carried, however it was converted. */
+  /** Count what a batch of fragments carried. */
   #account(fragments: Fragment[]): void {
     let videoFrames = 0;
     for (const fragment of fragments) {

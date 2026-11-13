@@ -95,22 +95,6 @@ await build({
   bundle: true,
   format: "esm",
   platform: "neutral",
-  plugins: [
-    {
-      // The picture workers are not used in decode mode.
-      name: "worker-import",
-      setup(build) {
-        build.onResolve({ filter: /\?worker&inline$/ }, () => ({
-          path: "picture-worker",
-          namespace: "stub",
-        }));
-        build.onLoad({ filter: /.*/, namespace: "stub" }, () => ({
-          contents:
-            "export default class { constructor() { throw new Error('no picture workers here'); } }",
-        }));
-      },
-    },
-  ],
 });
 try {
   await import(pathToFileURL(output));
@@ -211,17 +195,14 @@ try {
     id,
     url: INPUT_URL,
     wasmUrl: WASM_URL,
-    oversample: undefined,
     recoveryInterval: undefined,
     openGopRecovery: undefined,
     splitFieldSamples: undefined,
     audioGainSteps: 0,
     surroundAudioGainSteps: 0,
     video: "decode",
-    pictureWorkers: undefined,
     serviceId: null,
     sink: "main",
-    encodedVideo: false,
     preferManagedMediaSource: false,
     queueHighWaterMark: 1 << 30,
     maxAheadSeconds: 1e9,

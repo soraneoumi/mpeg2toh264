@@ -2,32 +2,25 @@
 //!
 //! This is the surface a browser needs: hand it file chunks, take fragments
 //! back, append them to a `SourceBuffer`. Everything between -- demuxing, GOP
-//! splitting, transcoding, muxing, and putting the two tracks on a common
-//! timeline -- happens here rather than in the caller, because the timeline
-//! arithmetic is the part most easily got wrong and it belongs next to the code
-//! it constrains.
-
-use std::collections::VecDeque;
+//! splitting, muxing, and putting the two tracks on a common timeline --
+//! happens here rather than in the caller, because the timeline arithmetic is
+//! the part most easily got wrong and it belongs next to the code it
+//! constrains.
 
 use crate::container::adts::{
     aac_frame_count_through_video_time, silent_frame, AacConfig, AacFrame, AdtsStream, AudioGain,
     DualMono, AAC_FRAME_SAMPLES,
 };
 use crate::container::fmp4::{
-    h264_gop_to_fmp4, mpeg2_decode_unit_to_fmp4, mpeg2_fragment_duration, mpeg2_gop_to_fmp4,
-    timed_mpeg2_unit, Fmp4AudioSamples, Fmp4Fragment, Mpeg2VideoTimeline, PicturePresentation,
-    TimedUnit, UnitLeadIn,
+    mpeg2_decode_unit_to_fmp4, mpeg2_fragment_duration, mpeg2_gop_to_fmp4, timed_mpeg2_unit,
+    Fmp4AudioSamples, Fmp4Fragment, Mpeg2VideoTimeline, PicturePresentation, TimedUnit, UnitLeadIn,
 };
 use crate::container::mpegts::{AudioStream, ElementaryKind, ElementaryPacket, MpegTsAvDemuxer};
 use crate::container::rff::RffState;
-use crate::error::{bail, Error, Result};
-use crate::job::PictureOutput;
+use crate::error::{Error, Result};
 use crate::mpeg2::gop_stream::{Mpeg2Gop, Mpeg2GopStream};
 use crate::mpeg2::headers::{stream_sequence_description, Interlacing, SequenceDescription};
 use crate::round_half_up;
-use crate::transcode::{
-    IncrementalTranscoder, OpenGopRecovery, Step, TranscodeOptions, TranscodeResult, VideoMode,
-};
 
 const TIMESCALE: u64 = 90_000;
 /// Put a restart point before one MSE eviction span grows beyond this size.
@@ -51,6 +44,81 @@ const PTS_MODULUS: i64 = 1 << 33;
 /// Ticks from `origin` to `pts`, across however many wraps lie between them.
 fn ticks_since(origin: i64, pts: i64) -> u64 {
     (pts - origin).rem_euclid(PTS_MODULUS) as u64
+}
+
+/// What to do with the source video. There is no default: a caller names one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VideoMode {
+    /// Carry the MPEG-2 through into the MP4 as it stands, for a player whose
+    /// decoder handles it. The picture is the broadcast's own and the
+    /// packaging costs almost nothing -- but a decoder that does not take
+    /// MPEG-2 plays none of it.
+    Passthrough,
+    /// Hand the MPEG-2 out for the caller to decode, and put only the sound
+    /// into the MP4: the media element plays the sound and keeps the clock
+    /// the pictures are shown by. Groups are always cut into anchor units.
+    /// Needs AAC sound.
+    Decode,
+}
+
+/// What a periodic recovery boundary does with the leading pictures of an open
+/// group, which are predicted from the group before it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OpenGopRecovery {
+    /// Keep every leading picture. Passthrough marks the fragment that opens
+    /// at the boundary as a random access point when it opens with an intra
+    /// picture; decode mode has no video track to mark, so nothing changes
+    /// there.
+    RecoveryPoint,
+    /// Drop the leading pictures and begin again at the intra picture, as at
+    /// the start of the stream. Passthrough marks the fragment a random access
+    /// point, and decode mode hands the unit out with `restart` set so that
+    /// nothing from before it is used as a reference.
+    Discard,
+}
+
+/// Whether a pair of fields is split into two samples unless the options say
+/// otherwise.
+pub(crate) const DEFAULT_SPLIT_FIELD_SAMPLES: bool = true;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SessionOptions {
+    /// Put a recovery boundary at every this many groups. What the boundary
+    /// does is selected by [`Self::open_gop_recovery`]. A boundary also falls
+    /// once 32 MiB of media has gone out since the last random access point,
+    /// and zero leaves only that.
+    pub recovery_interval: usize,
+    /// What a recovery boundary does with an open group's leading pictures.
+    pub open_gop_recovery: OpenGopRecovery,
+    /// Put the two coded fields of a complementary pair in separate MP4
+    /// samples. Only [`VideoMode::Passthrough`] reads it: decode mode has no
+    /// video track, and a pair is one picture to whoever decodes it. The bytes
+    /// of the elementary stream are the same either way; what moves is where
+    /// one sample ends and the next begins.
+    pub split_field_samples: bool,
+    /// What becomes of the pictures.
+    pub video: VideoMode,
+    /// Cut each group of pictures into units of one anchor picture and the B
+    /// pictures coded after it, each of which becomes a fragment of its own.
+    /// The pictures and their timing are the same either way; only the
+    /// fragment boundaries move, so that media can be handed on as soon as it
+    /// has arrived rather than once its group has. [`VideoMode::Decode`]
+    /// always cuts them.
+    pub split_groups: bool,
+}
+
+impl SessionOptions {
+    /// The options for `video`, with a recovery boundary every 24 groups that
+    /// keeps the leading pictures, split field samples, and whole groups.
+    pub fn new(video: VideoMode) -> Self {
+        Self {
+            recovery_interval: 24,
+            open_gop_recovery: OpenGopRecovery::RecoveryPoint,
+            split_field_samples: DEFAULT_SPLIT_FIELD_SAMPLES,
+            video,
+            split_groups: false,
+        }
+    }
 }
 
 /// Field metadata taking effect at one media time.
@@ -145,15 +213,11 @@ pub struct VideoPicture {
 /// What the video of one unit turns into, and what the muxer needs to know
 /// about it.
 ///
-/// Both paths cut the same source pictures out of a unit -- the passthrough one
-/// keeps damaged slices, which are the decoder's business rather than this
-/// crate's, and is otherwise the same walk -- so the timeline underneath is the
-/// same. They differ in what covers the display slots of an open GOP's leading
-/// pictures where a fragment opens the presentation: the transcoder puts an
-/// extra copy of its IDR there, and passthrough and decoding simply show the
-/// first picture for longer.
+/// Both paths cut the same source pictures out of a unit, so the timeline
+/// underneath is the same. Where a fragment opens the presentation, the display
+/// slots of an open GOP's leading pictures are covered by showing the first
+/// picture for longer.
 enum UnitPlan {
-    Transcode(TimedUnit),
     Passthrough(TimedUnit),
     Decode(TimedUnit),
 }
@@ -161,7 +225,7 @@ enum UnitPlan {
 impl UnitPlan {
     fn timed(&self) -> &TimedUnit {
         match self {
-            Self::Transcode(unit) | Self::Passthrough(unit) | Self::Decode(unit) => unit,
+            Self::Passthrough(unit) | Self::Decode(unit) => unit,
         }
     }
 
@@ -171,49 +235,25 @@ impl UnitPlan {
 
     fn timeline_mut(&mut self) -> &mut Mpeg2VideoTimeline {
         match self {
-            Self::Transcode(unit) | Self::Passthrough(unit) | Self::Decode(unit) => {
-                &mut unit.unit.timeline
-            }
+            Self::Passthrough(unit) | Self::Decode(unit) => &mut unit.unit.timeline,
         }
     }
 
-    fn lead_in(&self, starts_at_idr: bool) -> UnitLeadIn {
-        match (self, starts_at_idr) {
-            (_, false) => UnitLeadIn::None,
-            (Self::Transcode(_), true) => UnitLeadIn::IdrClone,
-            (Self::Passthrough(_) | Self::Decode(_), true) => UnitLeadIn::FirstPicture,
+    fn lead_in(&self, restarts: bool) -> UnitLeadIn {
+        if restarts {
+            UnitLeadIn::FirstPicture
+        } else {
+            UnitLeadIn::None
         }
     }
 }
 
-/// How far a caller driving the session itself has got through its input.
-///
-/// The end of the input is three steps rather than one: the demuxer's last
-/// packets still go in the ordinary way, then what the group splitter and the
-/// ADTS reader are holding goes in, and only then does the final flush run.
-/// [`Session::finish`] walks those in a single call; a deferred caller can be
-/// suspended in the middle of any of them, so where it is has to be written
-/// down.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Phase {
-    /// Ordinary input; more may still arrive.
-    Feeding,
-    /// The demuxer has been flushed and its last packets are going in.
-    Draining,
-    /// Everything is in, and what is left is the final flush.
-    Finishing,
-    Done,
-}
-
-/// A unit that is going out, waiting only for its video to be converted.
+/// A unit that is going out, waiting only to be packaged.
 struct Ready {
     gop: Mpeg2Gop,
     audio: Vec<AacFrame>,
     plan: UnitPlan,
-    starts_at_idr: bool,
-    /// The display slots of its group that went out before it, which the plan
-    /// was drawn knowing and the transcoder has to be told as well.
-    consumed: u32,
+    restarts: bool,
 }
 
 /// What packaging one unit made.
@@ -237,44 +277,14 @@ struct UnitLag {
     after: Option<u64>,
 }
 
-/// How far a session got, for a caller converting the pictures itself.
-///
-/// The conversion of a unit is the one part of this that need not happen here,
-/// and in a browser it is the part worth not happening here: it is most of the
-/// work, and it divides into pictures that have nothing to say to each other.
-/// So a session driven this way stops when it reaches one, hands out the
-/// pictures, and waits to be given them back.
-pub enum Progress {
-    /// Nothing is owed. Feed more input.
-    Idle(Vec<Fragment>),
-    /// Convert these and call [`Session::complete`] with one output per job,
-    /// in the same order.
-    Pending {
-        fragments: Vec<Fragment>,
-        jobs: Vec<Vec<u8>>,
-    },
-}
-
-impl Progress {
-    /// The fragments either way, for a caller that hands them on before
-    /// looking at what is still owed.
-    pub fn fragments(&mut self) -> Vec<Fragment> {
-        match self {
-            Self::Idle(fragments) => std::mem::take(fragments),
-            Self::Pending { fragments, .. } => std::mem::take(fragments),
-        }
-    }
-}
-
 /// How the video reaches the MP4.
 enum VideoPipeline {
-    Transcode(IncrementalTranscoder),
     /// Carried through as MPEG-2, where an intra picture is already everything
     /// a recovery point has to be: nothing is flushed, nothing is coded, and
     /// the pictures around it are the source's own.
     Passthrough {
-        /// The transcoder's `awaiting_idr` under another name: no picture can
-        /// be carried until one arrives that a decoder can start on.
+        /// No picture can be carried until one arrives that a decoder can
+        /// start on.
         awaiting_intra: bool,
         /// A periodic restart point is due, and goes to the next unit that
         /// opens with an intra picture.
@@ -293,7 +303,6 @@ impl VideoPipeline {
     /// timeline has to reach the same verdict on the same pictures, so it asks.
     fn awaiting_random_access(&self) -> bool {
         match self {
-            Self::Transcode(transcoder) => transcoder.awaiting_random_access(),
             Self::Passthrough { awaiting_intra, .. } | Self::Decode { awaiting_intra } => {
                 *awaiting_intra
             }
@@ -302,7 +311,6 @@ impl VideoPipeline {
 
     fn request_recovery_point(&mut self) {
         match self {
-            Self::Transcode(transcoder) => transcoder.request_recovery_point(),
             Self::Passthrough {
                 recovery_pending, ..
             } => *recovery_pending = true,
@@ -321,34 +329,17 @@ impl VideoPipeline {
     /// Nothing before the restart is thrown away: the fragments already out
     /// keep playing, and the ones after them open a new description on the same
     /// timeline. What cannot be carried across it is prediction, so the video
-    /// waits for a picture that needs none -- an IDR on the transcoding path,
-    /// and an intra picture on the one that carries MPEG-2 through.
+    /// waits for an intra picture, which needs none.
     fn request_random_access(&mut self) {
         match self {
-            Self::Transcode(transcoder) => transcoder.request_random_access_point(),
             Self::Passthrough { awaiting_intra, .. } | Self::Decode { awaiting_intra } => {
                 *awaiting_intra = true
             }
         }
     }
 
-    /// Put the parameter sets in front of the next unit again, whether or not
-    /// what they say has changed, so the fragment it becomes carries an
-    /// initialization segment.
-    ///
-    /// Only the transcoding path has to be told. The other two are asked for
-    /// the segment directly, since every unit they carry opens with the
-    /// sequence header a video description would be built from.
-    fn describe_again(&mut self) {
-        match self {
-            Self::Transcode(transcoder) => transcoder.request_description(),
-            Self::Passthrough { .. } | Self::Decode { .. } => {}
-        }
-    }
-
     fn split_field_samples(&self) -> bool {
         match self {
-            Self::Transcode(transcoder) => transcoder.split_field_samples(),
             Self::Passthrough {
                 split_field_samples,
                 ..
@@ -357,17 +348,9 @@ impl VideoPipeline {
             Self::Decode { .. } => false,
         }
     }
-
-    fn errors(&self) -> u64 {
-        match self {
-            Self::Transcode(transcoder) => transcoder.errors(),
-            // Nothing is decoded here, so nothing malformed is found.
-            Self::Passthrough { .. } | Self::Decode { .. } => 0,
-        }
-    }
 }
 
-/// Streaming transcode of one transport stream.
+/// Streaming conversion of one transport stream to fragmented MP4.
 pub struct Session {
     demuxer: MpegTsAvDemuxer,
     gops: Mpeg2GopStream,
@@ -412,16 +395,6 @@ pub struct Session {
     pending_audio: Vec<AacFrame>,
     audio_config: Option<AacConfig>,
 
-    /// The unit whose pictures a deferred caller is converting. Nothing else
-    /// can go out until they come back, because everything after this unit is
-    /// measured from where it ends.
-    converting: Option<Ready>,
-    /// Packets a deferred caller's input has produced but that have not been
-    /// packaged yet. They go in one at a time; see [`Session::pump`].
-    pending_packets: VecDeque<ElementaryPacket>,
-    /// How far a deferred caller has got through its input.
-    phase: Phase,
-
     /// PES timestamp of the first audio packet, in 90 kHz units.
     audio_start_pts: Option<u64>,
     /// Which elementary stream the sound is being read from, so that a
@@ -453,7 +426,7 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(options: TranscodeOptions) -> Self {
+    pub fn new(options: SessionOptions) -> Self {
         Self::anchored(options, None)
     }
 
@@ -465,7 +438,7 @@ impl Session {
     /// session takes whichever program map turns up first, which is stable for
     /// a given recording but is not a choice anyone made.
     pub fn for_service(
-        options: TranscodeOptions,
+        options: SessionOptions,
         origin_ticks: Option<u64>,
         service_id: Option<u16>,
     ) -> Self {
@@ -544,9 +517,6 @@ impl Session {
     pub fn errors(&self) -> u64 {
         self.demuxer.errors()
     }
-    pub fn transcoder_errors(&self) -> u64 {
-        self.video.errors()
-    }
 
     /// Start a session whose timeline is measured from a PES timestamp of the
     /// caller's choosing, rather than from wherever this input happens to open.
@@ -555,7 +525,7 @@ impl Session {
     /// origin an earlier session reported, the fragments it produces carry the
     /// presentation times they hold in the whole file, and a player can append
     /// them where the viewer asked to be.
-    pub fn anchored(options: TranscodeOptions, origin_ticks: Option<u64>) -> Self {
+    pub fn anchored(options: SessionOptions, origin_ticks: Option<u64>) -> Self {
         Self {
             demuxer: MpegTsAvDemuxer::new(),
             // A player decoding the pictures itself takes each as soon as it
@@ -565,9 +535,6 @@ impl Session {
             ),
             adts: AdtsStream::new(),
             video: match options.video {
-                VideoMode::Transcode => {
-                    VideoPipeline::Transcode(IncrementalTranscoder::new(options))
-                }
                 VideoMode::Passthrough => VideoPipeline::Passthrough {
                     awaiting_intra: true,
                     recovery_pending: false,
@@ -593,9 +560,6 @@ impl Session {
             pending_gops: Vec::new(),
             pending_audio: Vec::new(),
             audio_config: None,
-            converting: None,
-            pending_packets: VecDeque::new(),
-            phase: Phase::Feeding,
             audio_start_pts: None,
             audio_pid: None,
             audio_clock_start_pts: None,
@@ -642,126 +606,6 @@ impl Session {
         self.pending_audio.extend(final_audio);
         self.flush_pending(true, &mut out)?;
         Ok(out)
-    }
-
-    /// [`Self::push`], for a caller that will convert the pictures itself.
-    ///
-    /// Returns [`Progress::Pending`] as soon as a unit needs its video coded,
-    /// and nothing more comes out of the session until those pictures are
-    /// handed back to [`Self::complete`].
-    pub fn push_deferred(&mut self, chunk: &[u8]) -> Result<Progress> {
-        self.expect_nothing_in_flight()?;
-        if self.phase != Phase::Feeding {
-            bail!("the session has already been told the input has ended");
-        }
-        let packets = self.demuxer.push(chunk)?;
-        self.pending_packets.extend(packets);
-        self.pump(Vec::new())
-    }
-
-    /// [`Self::finish`], for the same caller. Call it until it returns
-    /// [`Progress::Idle`].
-    pub fn finish_deferred(&mut self) -> Result<Progress> {
-        self.expect_nothing_in_flight()?;
-        if self.phase == Phase::Feeding {
-            self.pending_packets.extend(self.demuxer.finish()?);
-            self.phase = Phase::Draining;
-        }
-        self.pump(Vec::new())
-    }
-
-    /// Hand back one converted picture per job, in the order they were given
-    /// out, and carry on.
-    pub fn complete(&mut self, outputs: &[PictureOutput]) -> Result<Progress> {
-        let Some(converting) = self.converting.take() else {
-            bail!("no pictures were asked for");
-        };
-        let VideoPipeline::Transcode(transcoder) = &mut self.video else {
-            bail!("only the transcoding pipeline converts pictures");
-        };
-        match transcoder.complete(&converting.gop.data, outputs)? {
-            Step::Again(jobs) => {
-                self.converting = Some(converting);
-                Ok(Progress::Pending {
-                    fragments: Vec::new(),
-                    jobs,
-                })
-            }
-            Step::Done(h264) => {
-                let mut out = Vec::new();
-                self.finish_gop(converting, Some(*h264), &mut out)?;
-                self.pump(out)
-            }
-        }
-    }
-
-    /// Take the demuxed packets in one at a time, packaging whatever each of
-    /// them completes, and stop at the first unit whose pictures have to be
-    /// converted.
-    ///
-    /// One packet at a time because that is what [`Self::push`] does, and the
-    /// two have to reach the same fragments: how much audio a fragment carries
-    /// is worked out from what has arrived when its group of pictures goes out,
-    /// so taking a whole chunk in before packaging any of it would put audio in
-    /// a fragment that ran ahead of it.
-    fn pump(&mut self, mut out: Vec<Fragment>) -> Result<Progress> {
-        loop {
-            match self.advance(self.phase == Phase::Finishing, out)? {
-                pending @ Progress::Pending { .. } => return Ok(pending),
-                Progress::Idle(fragments) => out = fragments,
-            }
-            if let Some(packet) = self.pending_packets.pop_front() {
-                self.ingest_packet(packet, &mut out)?;
-                continue;
-            }
-            match self.phase {
-                // More input may still arrive, so what is held back stays back.
-                Phase::Feeding => return Ok(Progress::Idle(out)),
-                Phase::Draining => {
-                    // Everything the demuxer had is in. What the group splitter
-                    // and the ADTS reader are still holding goes in now, and
-                    // the last fragments take whatever is left over.
-                    self.pending_gops.extend(self.gops.finish());
-                    let final_audio = self.adts.finish()?;
-                    if self.audio_config.is_none() {
-                        self.audio_config = final_audio.first().map(|frame| frame.config.clone());
-                    }
-                    self.pending_audio.extend(final_audio);
-                    self.phase = Phase::Finishing;
-                }
-                Phase::Finishing | Phase::Done => {
-                    self.phase = Phase::Done;
-                    return Ok(Progress::Idle(out));
-                }
-            }
-        }
-    }
-
-    /// Package whatever is ready, stopping at the first unit whose pictures
-    /// have to be converted.
-    fn advance(&mut self, final_flush: bool, mut out: Vec<Fragment>) -> Result<Progress> {
-        while let Some(ready) = self.take_ready(final_flush)? {
-            let VideoPipeline::Transcode(transcoder) = &mut self.video else {
-                // Nothing else codes pictures, so there is never anything to
-                // wait for and the unit goes out as it stands.
-                self.finish_gop(ready, None, &mut out)?;
-                continue;
-            };
-            let jobs = transcoder.begin_continuing(&ready.gop.data, ready.consumed)?;
-            self.converting = Some(ready);
-            return Ok(Progress::Pending {
-                fragments: out,
-                jobs,
-            });
-        }
-        Ok(Progress::Idle(out))
-    }
-
-    fn expect_nothing_in_flight(&self) -> Result<()> {
-        if self.converting.is_some() {
-            bail!("pictures from the previous unit have not been handed back");
-        }
-        Ok(())
     }
 
     fn consume_elementary(
@@ -924,10 +768,11 @@ impl Session {
         self.audio_clock_frames += frames.len() as u64;
     }
 
-    /// Whether the fragment about to be emitted opens at an IDR. This includes
-    /// periodic recovery in discard mode so the timeline and transcoder omit
-    /// the same leading pictures.
-    fn starts_at_idr(&self, gop: &Mpeg2Gop) -> bool {
+    /// Whether the fragment about to be emitted is a restart: it opens where a
+    /// decoder begins afresh, with no reference from before it. This includes
+    /// periodic recovery in discard mode, so that the timeline and the unit
+    /// handed out omit the same leading pictures.
+    fn restarts(&self, gop: &Mpeg2Gop) -> bool {
         self.video.awaiting_random_access()
             || (self.open_gop_recovery == OpenGopRecovery::Discard && self.recovery_due(gop))
     }
@@ -952,33 +797,25 @@ impl Session {
     /// Whether the unit follows the one before it on the decode clock and in
     /// the source's timestamps, with nothing to settle against either: it
     /// continues a group that is being laid down, and starts nothing new.
-    fn follows_on(gop: &Mpeg2Gop, starts_at_idr: bool) -> bool {
-        gop.continues_group && !starts_at_idr
+    fn follows_on(gop: &Mpeg2Gop, restarts: bool) -> bool {
+        gop.continues_group && !restarts
     }
 
     /// Work out what one unit turns into, on whichever path this session is on.
     ///
-    /// Nothing is decoded to get here, so this assumes every picture with a
-    /// slice in it will convert. That is what the audio pairing below is
-    /// measured against; a unit that turns out to hold a damaged picture is
-    /// drawn again by [`Self::package`] once the transcoder has said so.
-    fn plan_unit(&self, gop: &Mpeg2Gop, starts_at_idr: bool) -> Result<UnitPlan> {
-        let mut timed = timed_mpeg2_unit(
-            &gop.data,
-            !starts_at_idr,
-            &[],
-            self.rff,
-            self.consumed_before(gop),
-        )?;
+    /// Nothing is decoded to get here, so every picture with a slice in it
+    /// counts as one: a damaged slice is the decoder's business rather than
+    /// this crate's.
+    fn plan_unit(&self, gop: &Mpeg2Gop, restarts: bool) -> Result<UnitPlan> {
+        let mut timed =
+            timed_mpeg2_unit(&gop.data, !restarts, self.rff, self.consumed_before(gop))?;
         // A seek, missing GOP, or timestamp jump resets the timing phase.
         // The ordinary hole handling accounts for any outstanding half field.
         // A unit in the middle of a group is timed against the ones before it
         // in the group, whose own timestamps it does not carry.
-        if let (Some(pts), Some(expected), false) = (
-            gop.pts,
-            self.expected_pts,
-            Self::follows_on(gop, starts_at_idr),
-        ) {
+        if let (Some(pts), Some(expected), false) =
+            (gop.pts, self.expected_pts, Self::follows_on(gop, restarts))
+        {
             let difference = (pts as i64 - timed.source_offset - expected + PTS_MODULUS / 2)
                 .rem_euclid(PTS_MODULUS)
                 - PTS_MODULUS / 2;
@@ -994,8 +831,8 @@ impl Session {
     ///
     /// This is set when the unit is planned, since what the fragment spans
     /// decides how much sound goes in it.
-    fn place_in_group(&self, gop: &Mpeg2Gop, starts_at_idr: bool, plan: &mut UnitPlan) {
-        let lag = Self::unit_lag(self.group_lag, gop, starts_at_idr, plan.timed());
+    fn place_in_group(&self, gop: &Mpeg2Gop, restarts: bool, plan: &mut UnitPlan) {
+        let lag = Self::unit_lag(self.group_lag, gop, restarts, plan.timed());
         plan.timeline_mut().lag_ticks = lag.ticks;
     }
 
@@ -1013,7 +850,7 @@ impl Session {
     fn unit_lag(
         group_lag: Option<u64>,
         gop: &Mpeg2Gop,
-        starts_at_idr: bool,
+        restarts: bool,
         timed: &TimedUnit,
     ) -> UnitLag {
         let timeline = &timed.unit.timeline;
@@ -1023,7 +860,7 @@ impl Session {
             .iter()
             .map(|&duration| u64::from(duration))
             .sum();
-        match group_lag.filter(|_| Self::follows_on(gop, starts_at_idr)) {
+        match group_lag.filter(|_| Self::follows_on(gop, restarts)) {
             Some(lag) => UnitLag {
                 ticks: (lag + first) as u32,
                 after: Some((lag + timed.span_ticks).saturating_sub(laid_down)),
@@ -1039,7 +876,6 @@ impl Session {
     fn plan_from_timed(&self, mut timed: TimedUnit) -> UnitPlan {
         timed.unit.timeline.split_field_samples = self.video.split_field_samples();
         match self.video {
-            VideoPipeline::Transcode(_) => UnitPlan::Transcode(timed),
             VideoPipeline::Passthrough { .. } => UnitPlan::Passthrough(timed),
             VideoPipeline::Decode { .. } => UnitPlan::Decode(timed),
         }
@@ -1053,8 +889,9 @@ impl Session {
     /// initialization segment for exactly this: the fragments before it keep
     /// playing, and the ones after it are read against the new description. So
     /// the change costs a restart point and nothing else -- but the restart is
-    /// not optional, because H.264 activates a sequence parameter set only at
-    /// an IDR, and the MP4 sample entry is only reread at a segment boundary.
+    /// not optional, because pictures coded under the new description cannot
+    /// be predicted from ones coded under the old, and the sample entry is only
+    /// reread at a segment boundary.
     ///
     /// This runs on the unit's bytes rather than on its plan because the plan
     /// is drawn for a unit that either does or does not open a random access
@@ -1082,11 +919,11 @@ impl Session {
     ///
     /// A broadcast switches between 5.1 and stereo at a programme boundary, and
     /// the segment carries the audio configuration in its `esds` just as it
-    /// carries the picture in its `avcC`. The video's own description has not
-    /// changed, so the parameter sets have to be asked for again rather than
-    /// coming out of a change in them -- and the fragment they open is made a
-    /// restart point, since that is where a decoder can be handed a new
-    /// description with nothing of the old one still in flight.
+    /// carries the picture's. The video's own description has not changed, so
+    /// the segment has to be asked for rather than following from a change in
+    /// it -- and the fragment it opens is made a restart point, since that is
+    /// where a decoder can be handed a new description with nothing of the old
+    /// one still in flight.
     fn note_audio_description(&mut self) {
         let Some(config) = self.pending_audio.first().map(|frame| frame.config.clone()) else {
             return;
@@ -1097,7 +934,6 @@ impl Session {
         // Nothing has been described yet: the first fragment does that anyway.
         if self.described_audio.is_some() {
             self.video.request_random_access();
-            self.video.describe_again();
         }
         self.describe_pending = true;
     }
@@ -1122,17 +958,17 @@ impl Session {
     /// where the source had it.
     ///
     /// Only a unit that opens a random access point has a sample to hold with:
-    /// the extra copy of its IDR, or its first picture on the passthrough path.
-    /// So a hole asks for one, and a unit that cannot provide it -- one with no
-    /// intra picture in it -- leaves the hole to the next, which measures it
-    /// from the same place and finds it that much wider.
+    /// its first picture. So a hole asks for one, and a unit that cannot
+    /// provide it -- one with no intra picture in it -- leaves the hole to the
+    /// next, which measures it from the same place and finds it that much
+    /// wider.
     ///
     /// A jump too long to sit through is left as a gap instead; see
     /// [`Session::open_a_gap`].
     fn hold_over_hole(&mut self, gop: &Mpeg2Gop, plan: &mut UnitPlan) -> Result<()> {
         // A unit in the middle of a group has no sample to hold with, and its
         // place against the ones before it is kept by the group's lag instead.
-        if Self::follows_on(gop, self.starts_at_idr(gop)) {
+        if Self::follows_on(gop, self.restarts(gop)) {
             return Ok(());
         }
         let (Some(expected), Some(start)) = (self.expected_pts, Self::unit_start_pts(gop, plan))
@@ -1157,11 +993,11 @@ impl Session {
             self.open_a_gap(ahead as u64, start);
             return Ok(());
         }
-        if !self.starts_at_idr(gop) {
+        if !self.restarts(gop) {
             self.video.request_random_access();
             // The plan was drawn for a unit that continues the one before it,
             // and this one no longer does.
-            let timed = timed_mpeg2_unit(&gop.data, false, &[], plan.timed().before, 0)?;
+            let timed = timed_mpeg2_unit(&gop.data, false, plan.timed().before, 0)?;
             *plan = self.plan_from_timed(timed);
         }
         plan.timeline_mut().hold_ticks = ahead as u32;
@@ -1215,7 +1051,7 @@ impl Session {
 
     fn flush_pending(&mut self, final_flush: bool, out: &mut Vec<Fragment>) -> Result<()> {
         while let Some(ready) = self.take_ready(final_flush)? {
-            self.finish_gop(ready, None, out)?;
+            self.finish_gop(ready, out);
         }
         Ok(())
     }
@@ -1225,7 +1061,7 @@ impl Session {
     ///
     /// Everything that decides whether a unit goes happens here, and nothing
     /// that decides it happens after: what comes back is committed to, and the
-    /// only thing left is to convert its video and package it.
+    /// only thing left is to package it.
     fn take_ready(&mut self, final_flush: bool) -> Result<Option<Ready>> {
         if !self.demuxer.has_aac_audio() {
             if self.pending_gops.is_empty() {
@@ -1237,9 +1073,9 @@ impl Session {
             }
             let gop = self.pending_gops.remove(0);
             self.note_description(&gop);
-            let mut plan = self.plan_unit(&gop, self.starts_at_idr(&gop))?;
+            let mut plan = self.plan_unit(&gop, self.restarts(&gop))?;
             self.hold_over_hole(&gop, &mut plan)?;
-            self.place_in_group(&gop, self.starts_at_idr(&gop), &mut plan);
+            self.place_in_group(&gop, self.restarts(&gop), &mut plan);
             return Ok(Some(self.commit(gop, Vec::new(), plan)));
         }
         // A unit goes out as soon as the sound that belongs beside it has
@@ -1263,14 +1099,14 @@ impl Session {
         // changing calls for a new one.
         self.note_description(&gop);
         self.note_audio_description();
-        let mut plan = self.plan_unit(&gop, self.starts_at_idr(&gop))?;
+        let mut plan = self.plan_unit(&gop, self.restarts(&gop))?;
         // Before the audio is measured against the video, since a hole held
         // over is part of what the fragment spans and so of what it carries.
         self.hold_over_hole(&gop, &mut plan)?;
-        let starts_at_idr = self.starts_at_idr(&gop);
-        self.place_in_group(&gop, starts_at_idr, &mut plan);
+        let restarts = self.restarts(&gop);
+        self.place_in_group(&gop, restarts, &mut plan);
         self.align_timelines(&gop, &plan);
-        let video_duration = mpeg2_fragment_duration(plan.timeline(), plan.lead_in(starts_at_idr));
+        let video_duration = mpeg2_fragment_duration(plan.timeline(), plan.lead_in(restarts));
         // Audio is measured from where the audio track itself starts, not
         // from where the video does.
         let through = (self.video_presentation_start + video_duration) as i64
@@ -1302,19 +1138,16 @@ impl Session {
     fn commit(&mut self, gop: Mpeg2Gop, audio: Vec<AacFrame>, plan: UnitPlan) -> Ready {
         if self.recovery_due(&gop) {
             match self.open_gop_recovery {
-                OpenGopRecovery::Idr | OpenGopRecovery::RecoveryPoint => {
-                    self.video.request_recovery_point();
-                }
+                OpenGopRecovery::RecoveryPoint => self.video.request_recovery_point(),
                 OpenGopRecovery::Discard => self.video.request_random_access(),
             }
         }
-        let starts_at_idr = self.video.awaiting_random_access();
+        let restarts = self.video.awaiting_random_access();
         Ready {
-            consumed: self.consumed_before(&gop),
             gop,
             audio,
             plan,
-            starts_at_idr,
+            restarts,
         }
     }
 
@@ -1345,8 +1178,8 @@ impl Session {
         // A GOP's timestamp belongs to its I picture, which is coded first but
         // displayed after the B pictures that lead the group. This only ever
         // runs on the opening fragment, where those pictures are missing and
-        // the IDR covers their display slots, so the presentation still starts
-        // where they would.
+        // the first picture covers their display slots, so the presentation
+        // still starts where they would.
         let video_start = video_pts as i64 - plan.timed().source_offset;
         let origin = match self.timeline_origin {
             Some(origin) => origin,
@@ -1386,21 +1219,12 @@ impl Session {
     }
 
     /// Package a committed unit and hand its fragment out.
-    ///
-    /// `h264` is the video already converted, for a caller that converted it
-    /// somewhere else; `None` converts it here.
-    fn finish_gop(
-        &mut self,
-        ready: Ready,
-        h264: Option<TranscodeResult>,
-        out: &mut Vec<Fragment>,
-    ) -> Result<()> {
+    fn finish_gop(&mut self, ready: Ready, out: &mut Vec<Fragment>) {
         let Ready {
             gop: unit,
             audio: audio_frames,
             plan,
-            starts_at_idr,
-            consumed,
+            restarts,
         } = ready;
         let gop = &unit;
         self.align_timelines(gop, &plan);
@@ -1422,15 +1246,7 @@ impl Session {
             recovery_point,
             lag,
             pictures,
-        } = self.package(
-            gop,
-            &plan,
-            starts_at_idr,
-            consumed,
-            config.as_ref(),
-            audio_track.as_ref(),
-            h264,
-        )?;
+        } = self.package(gop, &plan, restarts, config.as_ref(), audio_track.as_ref());
         // What the group has used up and laid down counts for the units after
         // it whether or not this one made a fragment. So does the field clock,
         // for a unit in the middle of a group: the next one has nothing else to
@@ -1443,10 +1259,9 @@ impl Session {
         // A unit that yielded no picture, with no audio to carry alongside it,
         // makes a moof describing no samples of anything. A recording cut mid
         // group ends with one, and there is nothing in it for a SourceBuffer to
-        // play. The transcoder has already seen it, which is what the unit was
-        // worth.
+        // play. What the unit was worth is already taken account of above.
         if fragment.sample_count == 0 && audio_frames.is_empty() && pictures.is_empty() {
-            return Ok(());
+            return;
         }
         // Aligning can still move the origin, so read the start after it.
         let start =
@@ -1478,7 +1293,7 @@ impl Session {
         // down.
         let hold = plan.timeline().hold_ticks as u64;
         let span = fragment.duration.saturating_sub(hold) as i64;
-        if Self::follows_on(gop, starts_at_idr) {
+        if Self::follows_on(gop, restarts) {
             if let Some(expected) = self.expected_pts.as_mut() {
                 *expected += span;
             }
@@ -1509,7 +1324,7 @@ impl Session {
         }
         let decode = matches!(plan, UnitPlan::Decode(_));
         // Sound alone: every fragment is somewhere a decoder can begin.
-        let random_access = starts_at_idr || recovery_point || decode;
+        let random_access = restarts || recovery_point || decode;
         if random_access {
             self.media_bytes_since_random_access = fragment.media_segment.len();
         } else {
@@ -1544,7 +1359,7 @@ impl Session {
             out.push(Fragment::Video {
                 data: unit.data,
                 start,
-                restart: starts_at_idr,
+                restart: restarts,
                 intra,
                 pictures: pictures
                     .iter()
@@ -1557,70 +1372,20 @@ impl Session {
                     .collect(),
             });
         }
-        Ok(())
     }
 
     /// Turn one unit into a fragment, by whichever path this session is on,
     /// say whether a decoder can be started on it, and where it sits against
     /// the group's display clock.
-    #[allow(clippy::too_many_arguments)]
     fn package(
         &mut self,
         gop: &Mpeg2Gop,
         plan: &UnitPlan,
-        starts_at_idr: bool,
-        consumed: u32,
+        restarts: bool,
         audio: Option<&AacConfig>,
         audio_track: Option<&Fmp4AudioSamples>,
-        converted: Option<TranscodeResult>,
-    ) -> Result<Packaged> {
+    ) -> Packaged {
         match (&mut self.video, plan) {
-            (VideoPipeline::Transcode(transcoder), UnitPlan::Transcode(timed)) => {
-                let timeline = &timed.unit.timeline;
-                let h264 = match converted {
-                    Some(h264) => h264,
-                    None => transcoder.push_continuing(&gop.data, consumed)?,
-                };
-                // The plan reached this unit without decoding a slice, so it
-                // reserved a sample for every picture that had one. A picture
-                // that then would not decode leaves a sample with no access
-                // unit behind it, and only the transcoder can say which. Draw
-                // the unit again knowing that, which is the one case where the
-                // timeline is worth walking twice.
-                let redrawn = if h264.undecodable.iter().any(|&damaged| damaged) {
-                    let mut redrawn = timed_mpeg2_unit(
-                        &gop.data,
-                        !starts_at_idr,
-                        &h264.undecodable,
-                        timed.before,
-                        consumed,
-                    )?;
-                    redrawn.unit.timeline.split_field_samples = timeline.split_field_samples;
-                    redrawn.unit.timeline.hold_ticks = timeline.hold_ticks;
-                    redrawn.unit.timeline.lag_ticks =
-                        Self::unit_lag(self.group_lag, gop, starts_at_idr, &redrawn).ticks;
-                    Some(redrawn)
-                } else {
-                    None
-                };
-                let timed = redrawn.as_ref().unwrap_or(timed);
-                let lag = Self::unit_lag(self.group_lag, gop, starts_at_idr, timed);
-                let timeline = &timed.unit.timeline;
-                let fragment = h264_gop_to_fmp4(
-                    &h264.bitstream,
-                    timeline,
-                    self.sequence_number,
-                    self.video_presentation_start,
-                    audio,
-                    audio_track,
-                )?;
-                Ok(Packaged {
-                    fragment,
-                    recovery_point: h264.recovery_point,
-                    lag,
-                    pictures: Vec::new(),
-                })
-            }
             (
                 VideoPipeline::Passthrough {
                     awaiting_intra,
@@ -1630,7 +1395,7 @@ impl Session {
                 UnitPlan::Passthrough(timed),
             ) => {
                 let unit = &timed.unit;
-                let lag = Self::unit_lag(self.group_lag, gop, starts_at_idr, timed);
+                let lag = Self::unit_lag(self.group_lag, gop, restarts, timed);
                 // A unit yields samples only once a picture a decoder can
                 // begin at has arrived, which is what this was waiting for.
                 *awaiting_intra &= unit.samples.is_empty();
@@ -1645,51 +1410,45 @@ impl Session {
                     unit,
                     self.sequence_number,
                     self.video_presentation_start,
-                    plan.lead_in(starts_at_idr),
-                    starts_at_idr || recovery_point,
-                    // Every unit opens with a sequence header, so unlike the
-                    // transcoded path nothing in the unit itself says which one
-                    // the initialization segment should be built from.
+                    plan.lead_in(restarts),
+                    restarts || recovery_point,
+                    // Every unit opens with a sequence header, so nothing in the
+                    // unit itself says whether it is the one the initialization
+                    // segment should be built from.
                     self.describe_pending,
                     audio,
                     audio_track,
-                )?;
-                Ok(Packaged {
+                );
+                Packaged {
                     fragment,
                     recovery_point,
                     lag,
                     pictures: Vec::new(),
-                })
+                }
             }
             (VideoPipeline::Decode { awaiting_intra }, UnitPlan::Decode(timed)) => {
                 let unit = &timed.unit;
-                let lag = Self::unit_lag(self.group_lag, gop, starts_at_idr, timed);
+                let lag = Self::unit_lag(self.group_lag, gop, restarts, timed);
                 *awaiting_intra &= unit.samples.is_empty();
                 let (fragment, pictures) = mpeg2_decode_unit_to_fmp4(
                     unit,
                     self.sequence_number,
                     self.video_presentation_start,
-                    plan.lead_in(starts_at_idr),
+                    plan.lead_in(restarts),
                     self.describe_pending,
                     audio_track,
                 );
-                Ok(Packaged {
+                Packaged {
                     fragment,
                     recovery_point: false,
                     lag,
                     pictures,
-                })
+                }
             }
             // The pipeline is chosen once, at construction, and the plan is
             // made by it.
             _ => unreachable!("the unit plan matches the pipeline that made it"),
         }
-    }
-}
-
-impl Default for Session {
-    fn default() -> Self {
-        Self::new(TranscodeOptions::default())
     }
 }
 
@@ -1699,7 +1458,7 @@ mod tests {
 
     #[test]
     fn recovery_is_due_at_the_gop_or_media_byte_limit() {
-        let mut session = Session::default();
+        let mut session = Session::new(SessionOptions::new(VideoMode::Passthrough));
         session.gops_emitted = 1;
         session.media_bytes_since_random_access = MAX_RECOVERY_BYTES - 1;
         assert!(!session.is_random_access_point());

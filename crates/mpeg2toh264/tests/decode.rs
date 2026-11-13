@@ -11,10 +11,9 @@ use mpeg2toh264::mpeg2::decode::{
 };
 use mpeg2toh264::mpeg2::headers::parse_elementary_stream;
 use mpeg2toh264::{
-    mpeg2_video_timeline, picture_display_size, picture_matrix, Fragment, Session,
-    TranscodeOptions, YcbcrMatrix,
+    mpeg2_video_timeline, picture_display_size, picture_matrix, Fragment, Session, YcbcrMatrix,
 };
-use support::{decoding, fnv1a, mux_with_sound, read_fixture, FIXTURES};
+use support::{decode, fnv1a, mux_with_sound, read_fixture, FIXTURES};
 
 /// Frames output and FNV-1a of their visible Y, Cb and Cr samples, in
 /// display order. The values were taken from a decode that matched ffmpeg
@@ -225,14 +224,14 @@ fn frames_are_reused_once_released() {
 /// The `video` fragments a decode-mode session makes of copies of a fixture.
 fn decode_mode_units(name: &str, copies: u64) -> (Vec<u8>, Vec<Fragment>) {
     let one = read_fixture(name);
-    let timeline = mpeg2_video_timeline(&one, false, &[]).expect("a timeline");
+    let timeline = mpeg2_video_timeline(&one, false).expect("a timeline");
     let group = parse_elementary_stream(&one).expect("parses").len() as u64
         * u64::from(timeline.sample_duration);
     let groups: Vec<(&[u8], u64, u64)> = (0..copies)
         .map(|copy| (one.as_slice(), 900_000 + copy * group, group))
         .collect();
     let stream = mux_with_sound(&groups);
-    let mut session = Session::new(decoding(TranscodeOptions::default()));
+    let mut session = Session::new(decode());
     let mut fragments = session.push(&stream).expect("push");
     fragments.extend(session.finish().expect("finish"));
     let units = fragments

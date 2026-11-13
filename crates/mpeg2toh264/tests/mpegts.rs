@@ -4,10 +4,7 @@ mod support;
 
 use std::collections::HashMap;
 
-use mpeg2toh264::{
-    extract_mpeg2_video_es, first_pts, is_mpeg_transport_stream, last_pts, transcode,
-    TranscodeOptions,
-};
+use mpeg2toh264::{extract_mpeg2_video_es, first_pts, is_mpeg_transport_stream, last_pts};
 use support::{mux_programs, read_fixture, wrap_mpeg2_es_in_ts, FIXTURES};
 
 #[test]
@@ -129,16 +126,6 @@ fn survives_a_pes_header_carrying_a_timestamp() {
     let es = read_fixture("ibbp.m2v");
     let ts = wrap_mpeg2_es_in_ts(&es, Some(900_000), &mut HashMap::new());
     assert_eq!(extract_mpeg2_video_es(&ts).expect("demux succeeds"), es);
-}
-
-#[test]
-fn transcoding_through_a_transport_stream_matches_the_bare_stream() {
-    let es = read_fixture("ibbp.m2v");
-    let ts = wrap_mpeg2_es_in_ts(&es, None, &mut HashMap::new());
-    let direct = transcode(&es, TranscodeOptions::default()).expect("transcode succeeds");
-    let demuxed = extract_mpeg2_video_es(&ts).expect("demux succeeds");
-    let through = transcode(&demuxed, TranscodeOptions::default()).expect("transcode succeeds");
-    assert_eq!(through.bitstream, direct.bitstream);
 }
 
 #[test]

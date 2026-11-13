@@ -37,7 +37,6 @@ import {
   shows,
   type DecodeStep,
 } from "./pictures.js";
-import { defaultPoolSize, PicturePool } from "./pool.js";
 import {
   isRangeExhaustion,
   openSource,
@@ -51,11 +50,11 @@ import {
   firstTimestamp,
   lastTimestamp,
   loadWasm,
+  Packager,
   PictureDecoder,
-  Transcoder,
   type Fragment,
   type VideoFragment,
-} from "./transcoder.js";
+} from "./packager.js";
 
 /** The presentation clock the timestamps in a transport stream are counted in. */
 const TICKS_PER_SECOND = 90_000;
@@ -78,7 +77,7 @@ const MINIMUM_SEEK_TAIL_BYTES = 1 << 20;
  * large read. `Session.push` is synchronous, so splitting here keeps one read
  * from occupying the worker (and copying into WASM) all at once.
  */
-const MAX_TRANSCODE_CHUNK_BYTES = 1 << 20;
+const MAX_PACKAGE_CHUNK_BYTES = 1 << 20;
 
 /** Stop one response once this much unconverted transport stream is queued. */
 const INPUT_QUEUE_HIGH_WATER_BYTES = 32 << 20;
@@ -257,14 +256,7 @@ class Playback {
   #leg: AbortController | null = null;
   /** Which leg is current. Anything from an older one is dropped. */
   #legNumber = 0;
-  #transcoder: Transcoder | null = null;
-  /**
-   * The workers converting pictures, or null where this browser will not have
-   * them. It outlives a leg -- a seek reopens the input, not the pool -- and
-   * is shut down with the load.
-   */
-  #pool: PicturePool | null = null;
-  #openedPool = false;
+  #packager: Packager | null = null;
   /** Private PES packets waiting for the media timeline origin to be known. */
   #private: Array<Extract<Fragment, { kind: "private-stream" }>> = [];
   /** Wall time the read loop spent on each of the two things it waits for. */
@@ -332,7 +324,7 @@ class Playback {
    * searched for. The search reads: a slice of a hundred kilobytes says what
    * time it is where it was taken from, which places the estimate and aims the
    * next one, and two or three of those land within a group of pictures of the
-   * mark. Transcoding to find out instead -- converting from the estimate and
+   * mark. Packaging to find out instead -- starting from the estimate and
    * seeing where it came out -- costs seconds of video for the same answer,
    * and throws them away when the answer is wrong.
    *
@@ -356,8 +348,6 @@ class Playback {
       // A sink on the page says so itself when it is reset.
       if (this.#mseSink) post({ type: "reset", id: this.#command.id });
     }
-    if (this.#command.encodedVideo && this.#command.sink === "worker")
-      post({ type: "video-data", id: this.#command.id, data: null });
     const restart = this.#restartBefore(time);
     const offset =
       restart && time - restart.seconds <= SEEK_LEAD_SECONDS
@@ -578,7 +568,7 @@ class Playback {
       this.#pictures!.failed();
       failures++;
     }
-    const converter = this.#transcoder;
+    const converter = this.#packager;
     if (!converter) return;
     converter.countDecoded(pictures, performance.now() - started, failures);
     this.#report(converter);
@@ -590,36 +580,13 @@ class Playback {
     this.#leg?.abort();
     this.#leg = null;
     this.#legNumber++;
-    this.#transcoder?.free();
-    this.#transcoder = null;
-    this.#pool?.terminate();
-    this.#pool = null;
+    this.#packager?.free();
+    this.#packager = null;
     this.#private = [];
     this.#pictures?.clear();
     this.#decoder?.free();
     this.#decoder = null;
     this.#sink.close();
-  }
-
-  /**
-   * Bring the picture workers up, once per load.
-   *
-   * A pool is an optimisation and never a requirement: where a worker cannot
-   * spawn workers the session converts the pictures itself, exactly as it did
-   * before there was a pool, and the output is the same either way. So this
-   * says what it settled on and carries on regardless.
-   */
-  async #openPool(module: WebAssembly.Module): Promise<void> {
-    if (this.#openedPool) return;
-    this.#openedPool = true;
-    const wanted = this.#command.pictureWorkers ?? defaultPoolSize();
-    if (wanted <= 1) return;
-    this.#pool = await PicturePool.create(module, wanted);
-    post({
-      type: "workers",
-      id: this.#command.id,
-      pictureWorkers: this.#pool?.size ?? 0,
-    });
   }
 
   /**
@@ -676,12 +643,8 @@ class Playback {
   #nextLeg(): number {
     this.#leg?.abort();
     this.#leg = new AbortController();
-    // The leg may be inside a group of pictures, waiting on the pool. Nothing
-    // it produces belongs anywhere now, and leaving the pool to finish it would
-    // meet the next leg's first group with a pool that is still busy.
-    this.#pool?.cancel();
-    this.#transcoder?.free();
-    this.#transcoder = null;
+    this.#packager?.free();
+    this.#packager = null;
     this.#private = [];
     return ++this.#legNumber;
   }
@@ -696,19 +659,16 @@ class Playback {
     const signal = this.#leg!.signal;
     const id = this.#command.id;
     try {
-      const module = await loadWasm(this.#command.wasmUrl);
+      await loadWasm(this.#command.wasmUrl);
       if (!this.#running(leg)) return;
       mark(id, "wasm");
-      // Nothing is converted in decode mode, so there is no pool.
       if (this.#pictures) this.#decoder ??= new PictureDecoder();
-      else await this.#openPool(module);
-      if (!this.#running(leg)) return;
       let source: Source;
       try {
         source = await openSource(this.#command.url, signal, offset);
       } catch (error) {
         // The range open owns this failure, so it carries where reading
-        // stood. Everything below -- WASM, pool, transcoder, and sink --
+        // stood. Everything below -- WASM, packager, and sink --
         // reaches the leg catch unmodified.
         throw withRangeContext(error, offset, this.#totalBytes);
       }
@@ -727,8 +687,7 @@ class Playback {
         bytesRead: offset,
         totalBytes: this.#totalBytes,
       });
-      const converter = new Transcoder(
-        this.#command.oversample,
+      const converter = new Packager(
         this.#command.recoveryInterval,
         this.#origin,
         this.#command.serviceId,
@@ -740,7 +699,6 @@ class Playback {
         this.#totalBytes === null,
       );
       if (this.#totalBytes === null) this.#sink.holdStart(LIVE_START_SECONDS);
-      converter.usePool(this.#pool);
       // A PID the program map has yet to name is remembered until it does, so
       // this can go in before a byte has been read.
       if (this.#audioPid !== null) converter.selectAudio(this.#audioPid);
@@ -749,7 +707,7 @@ class Playback {
         this.#command.audioGainSteps,
         this.#command.surroundAudioGainSteps,
       );
-      this.#transcoder = converter;
+      this.#packager = converter;
       await this.#convert(leg, source, converter);
     } catch (error) {
       if (!this.#running(leg) || signal.aborted) return;
@@ -764,7 +722,7 @@ class Playback {
   async #convert(
     leg: number,
     source: Source,
-    converter: Transcoder,
+    converter: Packager,
   ): Promise<void> {
     const id = this.#command.id;
     const chunks: Uint8Array[] = [];
@@ -836,13 +794,13 @@ class Playback {
             for (
               let at = 0;
               at < result.value.byteLength;
-              at += MAX_TRANSCODE_CHUNK_BYTES
+              at += MAX_PACKAGE_CHUNK_BYTES
             ) {
               chunks.push(
                 result.value.subarray(
                   at,
                   Math.min(
-                    at + MAX_TRANSCODE_CHUNK_BYTES,
+                    at + MAX_PACKAGE_CHUNK_BYTES,
                     result.value.byteLength,
                   ),
                 ),
@@ -934,7 +892,7 @@ class Playback {
     // Decoding goes on after the input ends, and counts itself here.
     if (this.#pictures) return;
     converter.free();
-    this.#transcoder = null;
+    this.#packager = null;
   }
 
   /**
@@ -945,15 +903,6 @@ class Playback {
   async #deliver(leg: number, fragments: Fragment[]): Promise<boolean> {
     for (const [index, fragment] of fragments.entries()) {
       if (!this.#running(leg)) return false;
-      // Forward transmuxed video to the filter even when the Worker owns MSE.
-      if (
-        this.#command.encodedVideo &&
-        this.#command.sink === "worker" &&
-        (fragment.kind === "init" || fragment.kind === "media")
-      ) {
-        const data = fragment.data.slice().buffer;
-        post({ type: "video-data", id: this.#command.id, data }, [data]);
-      }
       if (fragment.kind === "init") {
         const media = fragments
           .slice(index + 1)
@@ -995,7 +944,7 @@ class Playback {
    * Take the origin the first session settled on, which every later one is
    * anchored to and the duration is measured from.
    */
-  #place(converter: Transcoder): void {
+  #place(converter: Packager): void {
     if (this.#origin !== null) return;
     const origin = converter.originTicks;
     if (origin === null) return;
@@ -1025,7 +974,7 @@ class Playback {
    * announces one service and nothing here has to be decided; one that carries
    * a sub-channel as well leaves a choice that only the page can make.
    */
-  #announceServices(id: number, converter: Transcoder): void {
+  #announceServices(id: number, converter: Packager): void {
     const available = converter.serviceIds;
     const current = converter.serviceId;
     if (available.length === 0) return;
@@ -1053,7 +1002,7 @@ class Playback {
    * arrives the list is empty because nothing is known yet, and that is not
    * something to report.
    */
-  #announceAudio(id: number, converter: Transcoder): void {
+  #announceAudio(id: number, converter: Packager): void {
     const audio: AudioTracks = {
       available: converter.audioStreams,
       current: converter.audioPid,
@@ -1084,17 +1033,16 @@ class Playback {
   selectAudio(pid: number | null, dualMonoSub: boolean | null): void {
     if (pid !== null) {
       this.#audioPid = pid;
-      this.#transcoder?.selectAudio(pid);
+      this.#packager?.selectAudio(pid);
     }
     if (dualMonoSub !== null) {
       this.#dualMonoSub = dualMonoSub;
-      this.#transcoder?.selectDualMono(dualMonoSub);
+      this.#packager?.selectDualMono(dualMonoSub);
     }
-    if (this.#transcoder)
-      this.#announceAudio(this.#command.id, this.#transcoder);
+    if (this.#packager) this.#announceAudio(this.#command.id, this.#packager);
   }
 
-  #report(converter: Transcoder): void {
+  #report(converter: Packager): void {
     const stats = converter.takeStats({
       readingMs: this.#readingMs,
       waitingMs: this.#waitingMs,

@@ -1,7 +1,7 @@
 {
   "name": "@mpeg2toh264/player",
   "version": "0.0.1",
-  "description": "Browser MSE player for the mpeg2toh264 transcoder",
+  "description": "Browser MSE player for MPEG-2 transport streams",
   "type": "module",
   "license": "MIT",
   "files": [

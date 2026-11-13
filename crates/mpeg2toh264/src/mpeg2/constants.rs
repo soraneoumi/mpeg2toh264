@@ -49,7 +49,7 @@ impl PictureType {
         }
     }
 
-    /// True for the picture types this transcoder converts.
+    /// True for the picture types that carry a frame to decode: I, P and B.
     pub fn is_ipb(self) -> bool {
         matches!(self, Self::I | Self::P | Self::B)
     }
@@ -120,10 +120,6 @@ pub static DEFAULT_NON_INTRA_QUANT: [i32; 64] = [16; 64];
 /// `quantiser_scale` as a function of `quantiser_scale_code` (Table 7-6).
 /// Index 0 is q_scale_type = 0 (linear, qs = 2 * code), index 1 is the
 /// non-linear table. Entry `[t][0]` is unused: code 0 is forbidden.
-///
-/// The linear table is what makes the H.264 mapping clean: doubling
-/// quantiser_scale is exactly +6 in H.264 QP, so codes that are powers of two
-/// map to a level rescale ratio of exactly 1.0.
 pub static QUANTISER_SCALE: [[i32; 32]; 2] = [
     // q_scale_type = 0
     [

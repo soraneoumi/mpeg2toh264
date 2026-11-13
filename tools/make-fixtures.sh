@@ -23,7 +23,7 @@ ffmpeg -y -v error -f lavfi -i testsrc2=size=352x288:rate=25 -frames:v 15 \
 
 # Three genuine open-GOP boundaries. In display order the stream is
 # IBBPBBPBBPBBPBBI..., and the two B pictures immediately ahead of every I are
-# solid red then solid blue. A transcoder that drops or repeats those leading
+# solid red then solid blue. A session that drops or repeats those leading
 # pictures is therefore conspicuous both visually and in decoded-frame tests.
 ffmpeg -y -v error -f lavfi -i testsrc2=size=352x288:rate=25 -frames:v 46 \
   -vf "drawbox=x=0:y=0:w=iw:h=ih:color=red:t=fill:enable='eq(mod(n,15),13)',drawbox=x=0:y=0:w=iw:h=ih:color=blue:t=fill:enable='eq(mod(n,15),14)'" \

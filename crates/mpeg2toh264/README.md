@@ -1,42 +1,24 @@
 # mpeg2toh264 core
 
-MPEG-2 VideoからH.264/AVCへの変換、MPEG-TSの分離、AAC-LCの処理、fragmented MP4の生成を行うコアクレートです。
-
-## 一括変換
-
-`transcode`はMPEG-2 VideoエレメンタリーストリームをAnnex B H.264へ変換します。
-
-```rust
-use mpeg2toh264::{transcode, TranscodeOptions};
-
-let result = transcode(&mpeg2_es, TranscodeOptions::default())?;
-std::fs::write("output.h264", result.bitstream)?;
-
-println!(
-    "converted: {}, skipped: {}",
-    result.pictures_converted,
-    result.pictures_skipped,
-);
-```
-
-GOP単位で状態を維持して変換する場合は`IncrementalTranscoder`を使います。`request_random_access_point()`を呼ぶと、次に変換可能なIピクチャから新しいIDR区間を開始します。
-
-`Session`は`recovery_interval`ごとにリカバリーポイントを生成します。`OpenGopRecovery::Idr`はOpen GOPの先頭Bピクチャを保持した後にIDRと参照用のクローンを追加し、`OpenGopRecovery::RecoveryPoint`は先頭Bピクチャを保持してnon-IDRリカバリーポイントを使い、`OpenGopRecovery::Discard`は先頭Bピクチャを捨ててIDRから開始します。既定値は`OpenGopRecovery::Idr`です。
+MPEG-TSの分離、MPEG-2 Videoのパース、AAC-LCの処理、fragmented MP4の生成、MPEG-2 Videoのソフトウェアデコードを行うコアクレートです。
 
 ## ストリーミング
 
-`Session`はMPEG-TSのチャンクを受け取り、MSEへ追加できるfragmented MP4を返します。分離、GOP分割、映像変換、AAC処理、多重化、音声と映像のタイムライン調整を内部で行います。
+`Session`はMPEG-TSのチャンクを受け取り、MSEへ追加できるfragmented MP4を返します。分離、GOP分割、AAC処理、多重化、音声と映像のタイムライン調整を内部で行います。映像の扱いは`SessionOptions::video`で必ず指定します。既定のモードはありません。
 
 ```rust
-use mpeg2toh264::{Fragment, Session};
+use mpeg2toh264::{Fragment, Session, SessionOptions, VideoMode};
 
-let mut session = Session::default();
+let mut session = Session::new(SessionOptions::new(VideoMode::Passthrough));
 for chunk in input.chunks(1 << 20) {
     for fragment in session.push(chunk)? {
         match fragment {
-            Fragment::Init { data, mime_codec } => open(&mime_codec, data),
-            Fragment::Media { data, start, random_access, interlacing, .. } =>
-                append(data, start, random_access, interlacing),
+            Fragment::Init { data, mime_codec, width, height } =>
+                open(&mime_codec, data, width, height),
+            Fragment::Media { data, start, random_access, scans, .. } =>
+                append(data, start, random_access, scans),
+            Fragment::Video { data, start, restart, intra, pictures } =>
+                decode(data, start, restart, intra, pictures),
             Fragment::PrivateStream { stream_id, pid, data, pts } =>
                 dispatch(stream_id, pid, data, pts),
         }
@@ -51,29 +33,31 @@ for fragment in session.finish()? {
 
 複数サービスを含むTSからサービスを指定する場合は`Session::for_service`を使います。
 
+## オプション
+
+`SessionOptions::new(video)`は指定した`video`に、以下の既定値を組み合わせたオプションを返します。各フィールドは公開されているので、構造体更新構文で変更できます。
+
+- `video`: `VideoMode::Passthrough`か`VideoMode::Decode`
+- `recovery_interval`: リカバリー境界を置くGOPの間隔（既定24）。32 MiBのメディアが出るまでランダムアクセスポイントがなければ、間隔に関わらず境界が来ます。0にするとこの上限だけが残ります
+- `open_gop_recovery`: リカバリー境界でOpen GOPの先頭Bピクチャをどうするか。`OpenGopRecovery::RecoveryPoint`（既定）は先頭Bピクチャを保持します。パススルーでは、境界で始まるフラグメントがイントラピクチャで始まる場合にランダムアクセスポイントとして印を付けます。デコードモードには印を付ける映像トラックがないため、何も変わりません。`OpenGopRecovery::Discard`は先頭Bピクチャを捨て、境界のイントラピクチャからストリームの先頭と同じように始めます。パススルーではそのフラグメントがランダムアクセスポイントになり、デコードモードでは`Fragment::Video`の`restart`が立ちます
+- `split_field_samples`: 相補フィールドペアの各フィールドを別々のMP4サンプルにするか（既定`true`）。パススルーだけが参照します。デコードモードにはMP4の映像トラックがなく、ペアはデコードする側から見て1枚のピクチャだからです
+- `split_groups`: GOPをアンカーピクチャ1枚とその後に符号化されたBピクチャの単位に分け、それぞれを別のフラグメントにするか（既定`false`）。ピクチャとタイミングは変わらず、フラグメントの境界だけが動きます。デコードモードは常に分けます
+
 ## パススルー
 
-`TranscodeOptions::video`に`VideoMode::Passthrough`を指定すると、`Session`はMPEG-2映像を変換せずそのままMP4へ格納します。デコードも符号化も行わないため映像は放送のビットそのままで、MPEG-2デコーダーを持つプレイヤーでしか再生できません。`Fragment::Init`の`mime_codec`は`video/mp4; codecs="mp4v.61"`になります。
+`VideoMode::Passthrough`では、`Session`はMPEG-2映像を変換せずそのままMP4へ格納します。映像は放送のビットそのままで、MPEG-2デコーダーを持つプレイヤーでしか再生できません。`Fragment::Init`の`mime_codec`は`video/mp4; codecs="mp4v.61"`になります。
 
-音声の扱い、フラグメントの区切り、タイムラインは変換経路と同じです。
+## デコード
 
-```rust
-use mpeg2toh264::{Session, TranscodeOptions, VideoMode};
-
-let mut session = Session::new(TranscodeOptions {
-    video: VideoMode::Passthrough,
-    ..TranscodeOptions::default()
-});
-```
+`VideoMode::Decode`では、MP4には音声だけを入れ、MPEG-2映像は`Fragment::Video`として単位ごとに渡します。音声がメディア要素の時計になるため、AAC音声のないストリームは`Error::is_no_aac_audio()`が真のエラーになります。`mpeg2::decode`の`UnitDecoder`が`Fragment::Video`をデコードし、`StreamDecoder`はエレメンタリーストリームをそのままデコードします。
 
 ## コンテナー関数
 
 - `extract_mpeg2_video_es`: MPEG-TSからMPEG-2 Videoを取り出す
 - `mpeg2_video_timeline`: MPEG-2の表示順と各サンプルの時刻を復元する
 - `mpeg2_passthrough_unit`: 同じ表示順に加えて、各サンプルのバイト範囲を返す
-- `h264_to_fmp4`: 一括変換したAnnex B H.264をfragmented MP4に格納する
-- `h264_gop_to_fmp4`: GOP単位のH.264とAACをMSE向けフラグメントにする
-- `mpeg2_to_fmp4` / `mpeg2_gop_to_fmp4`: 同じものをMPEG-2のまま格納する
+- `mpeg2_to_fmp4` / `mpeg2_gop_to_fmp4`: MPEG-2をそのままfragmented MP4に格納する。`mpeg2_gop_to_fmp4`はGOP単位でAACと一緒にMSE向けフラグメントにする
+- `mpeg2_decode_unit_to_fmp4`: 音声だけのフラグメントと、各ピクチャの表示時刻を返す
 - `first_pts` / `last_pts`: TS断片の先頭・末尾のPESタイムスタンプを読む
 
 詳細な型とエラー条件は公開項目のrustdocを参照してください。

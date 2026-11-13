@@ -127,7 +127,6 @@ const STILL_REFRESH_MS = 200;
  */
 export class VideoFrames {
   readonly #video: HTMLVideoElement;
-  readonly #takeFrame: (() => VideoFrame | null | undefined) | undefined;
   readonly #moz: MozVideo | null;
   readonly #pictures: (() => Pictures | null) | undefined;
   /** The watch that owns the takes in #taken. */
@@ -174,7 +173,6 @@ export class VideoFrames {
 
   constructor(
     video: HTMLVideoElement,
-    takeFrame?: () => VideoFrame | null | undefined,
     /**
      * Returns the PictureWatch used to find Firefox's new pictures, or null
      * when there is none. Called on every poll because the renderer that owns
@@ -183,7 +181,6 @@ export class VideoFrames {
     pictures?: () => Pictures | null,
   ) {
     this.#video = video;
-    this.#takeFrame = takeFrame;
     this.#pictures = pictures;
     this.#moz = hasMozFrames(video) ? video : null;
     // Firefox 156 reports VideoFrame(video).timestamp in integer seconds, so
@@ -373,15 +370,8 @@ export class VideoFrames {
       return;
     }
     let frame: VideoFrame;
-    let decoded = false;
     try {
-      const captured = this.#takeFrame?.();
-      if (captured === null) {
-        this.#armCapture();
-        return;
-      }
-      decoded = captured !== undefined;
-      frame = captured ?? new VideoFrame(video);
+      frame = new VideoFrame(video);
     } catch (error) {
       // Immediately after loading, a frame may become available later than readyState indicates.
       if (
@@ -413,14 +403,11 @@ export class VideoFrames {
       }
       this.#capturedTimestamp = frame.timestamp;
       this.#captureCount += steps;
-      // Schedule decoded frames by media time to keep acquisition timer jitter out of presentation.
-      const at =
-        performance.now() +
-        (decoded
-          ? ((frame.timestamp / 1e6 - video.currentTime) * 1000) /
-            video.playbackRate
-          : 0);
-      this.#pending.push({ frame, at, count: this.#captureCount });
+      this.#pending.push({
+        frame,
+        at: performance.now(),
+        count: this.#captureCount,
+      });
       // After a long rendering stall, retain the newest frames and signal losses through the counter gap.
       while (this.#pending.length > 4) this.#pending.shift()!.frame.close();
     }

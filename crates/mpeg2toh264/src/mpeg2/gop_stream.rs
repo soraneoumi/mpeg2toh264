@@ -1,5 +1,5 @@
 //! Splitting an MPEG-2 elementary stream into bounded, independently
-//! transcodable units.
+//! decodable units.
 
 use std::collections::VecDeque;
 use std::ops::ControlFlow;
@@ -79,7 +79,7 @@ struct Mark {
 }
 
 /// Split an MPEG-2 ES into bounded GOP units while carrying sequence headers
-/// forward, so each unit can be transcoded on its own.
+/// forward, so each unit can be decoded on its own.
 #[derive(Default)]
 pub struct Mpeg2GopStream {
     /// Cut each group into units of one anchor picture and the B pictures
@@ -171,8 +171,8 @@ impl Mpeg2GopStream {
     /// gap. The last picture start in the buffer then has no following start
     /// code to prove that picture ended before the gap. Every earlier picture
     /// does, so the prefix ending at that last start is byte-complete input for
-    /// the transcoder. Reference resolution, leading B pictures, and field-pair
-    /// validity remain the transcoder's responsibility, as for ordinary units.
+    /// the decoder. Reference resolution, leading B pictures, and field-pair
+    /// validity remain the decoder's responsibility, as for ordinary units.
     ///
     /// What follows the gap is dropped until the next group header, so no
     /// anchor unit can start in the middle of the damaged group.
@@ -310,12 +310,12 @@ impl Mpeg2GopStream {
     /// be cut short because a sequence header inside it describes something
     /// else.
     ///
-    /// A unit carries one description: the H.264 parameter sets and the MP4
-    /// sample entry are built from the header it opens with, and every picture
-    /// in it is coded under that. A stream that changes format restarts its
-    /// groups as well, so the cut above normally lands on the change anyway --
-    /// this is for the stream that puts the new header somewhere else, and it
-    /// costs a look only when a unit holds a second header at all.
+    /// A unit carries one description: the MP4 sample entry is built from the
+    /// header it opens with, and every picture in it is coded under that. A
+    /// stream that changes format restarts its groups as well, so the cut above
+    /// normally lands on the change anyway -- this is for the stream that puts
+    /// the new header somewhere else, and it costs a look only when a unit
+    /// holds a second header at all.
     fn description_boundary(&self, first_gop: usize, boundary: usize) -> usize {
         let inner = self
             .sequences
@@ -476,7 +476,7 @@ impl Mpeg2GopStream {
             } else {
                 let Some(&first_gop) = self.gops.front() else {
                     // Nothing to cut on yet. Anything before the first sequence
-                    // header cannot be transcoded, so it is dropped rather than
+                    // header cannot be decoded, so it is dropped rather than
                     // held.
                     if let Some(&first_sequence) = self.sequences.front() {
                         if first_sequence > 0 {

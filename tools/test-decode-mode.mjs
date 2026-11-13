@@ -14,7 +14,7 @@
  *   next begins;
  * - the audio initialization and media fragments concatenated make a file
  *   ffmpeg decodes without a message, holding packet for packet the sound
- *   of the MP4 `mpeg2toh264 -p --split-groups` makes. How far the sound and
+ *   of the MP4 `mpeg2toh264 --split-groups` makes. How far the sound and
  *   the pictures each reach is printed beside what the input says of its
  *   own streams, which need not cover the same span.
  *
@@ -107,7 +107,6 @@ async function check(input, workDir) {
   let copyMs = 0;
 
   const session = new Session(
-    undefined,
     undefined,
     undefined,
     undefined,
@@ -238,7 +237,7 @@ async function check(input, workDir) {
   assert.equal(messages, "", `${input}: ffmpeg reported ${messages}`);
   // Packet for packet the sound of the MP4 passthrough makes of the input.
   const passthroughFile = join(workDir, "passthrough.mp4");
-  execFileSync(CLI, ["-q", "-p", "--split-groups", input, passthroughFile]);
+  execFileSync(CLI, ["-q", "--split-groups", input, passthroughFile]);
   const packets = soundPackets(soundFile);
   const muxed = soundPackets(passthroughFile);
   // ffmpeg gives the first packet of a fragmented file with no video track

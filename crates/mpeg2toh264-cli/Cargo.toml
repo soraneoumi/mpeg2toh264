@@ -1,6 +1,6 @@
 [package]
 name = "mpeg2toh264-cli"
-description = "Command line interface for the mpeg2toh264 transcoder"
+description = "Command line interface for the mpeg2toh264 packager and decoder"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

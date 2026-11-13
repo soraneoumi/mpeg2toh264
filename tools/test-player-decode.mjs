@@ -1,7 +1,8 @@
 /**
- * The page side of decode mode, without a browser: when the player decodes
- * the pictures itself, how it asks for them and runs their epochs, and how a
- * stream without AAC sound is loaded again converted.
+ * The page side of the two video modes, without a browser: when the player
+ * decodes the pictures itself or passes the video through, when a load fails
+ * instead, how it asks for pictures and runs their epochs, and what becomes of
+ * a stream without AAC sound.
  */
 import assert from "node:assert/strict";
 import { unlink } from "node:fs/promises";
@@ -15,12 +16,14 @@ const output = join(tmpdir(), `mpeg2toh264-player-test-${process.pid}.mjs`);
 
 class FakeWorker {
   static last = null;
+  static created = 0;
   posted = [];
   onmessage = null;
   onerror = null;
 
   constructor() {
     FakeWorker.last = this;
+    FakeWorker.created++;
   }
 
   postMessage(message, transfer = []) {
@@ -73,11 +76,6 @@ function fakeDeinterlacer(withDecodedVideo) {
     scan: null,
     enabled: false,
     videoTimeline: [],
-    encodedVideo: {
-      append: () => calls.push("append"),
-      reset: () => calls.push("encoded-reset"),
-      finish: () => calls.push("encoded-finish"),
-    },
     decodedVideo: withDecodedVideo
       ? {
           onrelease: null,
@@ -141,15 +139,19 @@ try {
   });
   const { Mpeg2TsPlayer } = await import(pathToFileURL(output));
 
-  // Which load decodes: a deinterlacer with a `decodedVideo`, unless the
-  // option says otherwise.
+  // Which load decodes, which passes the video through and which fails: a
+  // deinterlacer with a `decodedVideo` decodes unless the option says
+  // otherwise, passthrough is only what is left when it cannot, and with that
+  // off as well the load fails before the worker is asked for anything.
+  const DEINTERLACER_MISSING = /no deinterlacer with a decodedVideo input/;
   for (const [withDecodedVideo, softwareDecode, passthrough, expected] of [
     [true, undefined, false, "decode"],
     [true, true, true, "decode"],
-    [true, false, false, "transcode"],
+    [true, false, false, /softwareDecode is false, and passthrough is off/],
     [true, false, true, "passthrough"],
-    [false, undefined, false, "transcode"],
+    [false, undefined, false, DEINTERLACER_MISSING],
     [false, true, true, "passthrough"],
+    [false, undefined, undefined, DEINTERLACER_MISSING],
   ]) {
     const video = new FakeVideo();
     const player = new Mpeg2TsPlayer(video, {
@@ -158,20 +160,74 @@ try {
       passthrough,
       deinterlacer: () => fakeDeinterlacer(withDecodedVideo),
     });
-    void player.load("https://example.invalid/a.ts").catch(() => {});
-    const [load] = FakeWorker.last.take("load");
-    assert.equal(load.video, expected, `${withDecodedVideo} ${softwareDecode}`);
-    assert.equal(load.encodedVideo, expected !== "decode");
-    assert.equal(player.softwareDecoding, expected === "decode");
+    const errors = [];
+    player.addEventListener("error", (event) =>
+      errors.push(event.detail.error),
+    );
+    const name = `${withDecodedVideo} ${softwareDecode} ${passthrough}`;
+    const created = FakeWorker.created;
+    const loading = player.load("https://example.invalid/a.ts");
+    loading.catch(() => {});
+    const worker = FakeWorker.last;
+    if (typeof expected === "string") {
+      const [load] = worker.take("load");
+      assert.equal(load.video, expected, name);
+      assert.equal(player.softwareDecoding, expected === "decode", name);
+      assert.equal(errors.length, 0, name);
+    } else {
+      // Raised after `load` has returned, as a failure in the worker is.
+      assert.equal(errors.length, 0, name);
+      await assert.rejects(loading, { message: expected }, name);
+      assert.equal(errors.length, 1, name);
+      assert.match(errors[0].message, expected, name);
+      assert.equal(player.state, "error", name);
+      assert.equal(player.softwareDecoding, false, name);
+      assert.equal(FakeWorker.created, created, `${name}: no worker started`);
+      // The player takes the next load, which fails on its own account.
+      await assert.rejects(player.load("https://example.invalid/b.ts"));
+      assert.equal(errors.length, 2, name);
+      assert.equal(player.state, "error", name);
+    }
     player.destroy();
   }
   // No deinterlacer at all.
+  for (const [passthrough, expected] of [
+    [true, "passthrough"],
+    [false, null],
+  ]) {
+    const player = new Mpeg2TsPlayer(new FakeVideo(), {
+      mediaSource: "worker",
+      passthrough,
+    });
+    const loading = player.load("https://example.invalid/a.ts");
+    loading.catch(() => {});
+    if (expected === null) {
+      await assert.rejects(loading, /passthrough is off/);
+    } else {
+      assert.equal(FakeWorker.last.take("load")[0].video, expected);
+    }
+    player.destroy();
+  }
+
+  // The options go to the worker as they are, whatever the mode.
   {
     const player = new Mpeg2TsPlayer(new FakeVideo(), {
       mediaSource: "worker",
+      passthrough: true,
+      recoveryInterval: 12,
+      openGopRecovery: "discard",
+      splitFieldSamples: false,
+      audioGainSteps: 3,
+      serviceId: 0x400,
     });
     void player.load("https://example.invalid/a.ts").catch(() => {});
-    assert.equal(FakeWorker.last.take("load")[0].video, "transcode");
+    const [load] = FakeWorker.last.take("load");
+    assert.equal(load.recoveryInterval, 12);
+    assert.equal(load.openGopRecovery, "discard");
+    assert.equal(load.splitFieldSamples, false);
+    assert.equal(load.audioGainSteps, 3);
+    assert.equal(load.surroundAudioGainSteps, 3, "follows audioGainSteps");
+    assert.equal(load.serviceId, 0x400);
     player.destroy();
   }
 
@@ -273,14 +329,6 @@ try {
     worker.send({ type: "pictures-end", id, epoch: epoch + 2 });
     assert.equal(deinterlacer.calls.at(-1), "finish");
 
-    // Nothing goes to the compressed-video input in this mode.
-    worker.send({
-      type: "video-data",
-      id,
-      data: null,
-    });
-    assert.ok(!deinterlacer.calls.includes("append"));
-
     worker.send({ type: "opened", id });
     await loaded;
 
@@ -294,13 +342,14 @@ try {
     player.destroy();
   }
 
-  // A stream without AAC sound is loaded again converted, once, and the
-  // load's promise follows the new one.
+  // A stream without AAC sound is loaded again with the video passed through,
+  // once, and the load's promise follows the new one.
   {
     const video = new FakeVideo();
     let deinterlacer = null;
     const player = new Mpeg2TsPlayer(video, {
       mediaSource: "worker",
+      passthrough: true,
       deinterlacer: () => (deinterlacer = fakeDeinterlacer(true)),
     });
     const states = [];
@@ -325,34 +374,75 @@ try {
       [first.id],
     );
     const [second] = worker.take("load");
-    assert.equal(second.video, "transcode");
+    assert.equal(second.video, "passthrough");
     assert.equal(second.url, first.url);
-    assert.equal(second.encodedVideo, true, "the deinterlacer's own input");
     assert.ok(second.id > first.id);
     assert.equal(player.softwareDecoding, false);
     worker.take("need");
     await wait(60);
-    assert.equal(worker.take("need").length, 0, "no requests when converting");
+    assert.equal(worker.take("need").length, 0, "no requests when passing");
     assert.equal(settled, false);
     worker.send({ type: "opened", id: second.id });
     await loaded;
     assert.equal(settled, true);
     assert.equal(errors.length, 0);
     assert.equal(states.at(-1), "converting");
-    // A converting load is not told about decoding.
+    // A passing load is not told about decoding.
     worker.send({ type: "no-aac-audio", id: second.id });
     assert.equal(errors.length, 1);
     assert.equal(player.state, "error");
     player.destroy();
   }
 
+  // Without passthrough the same stream fails the load, and the player is
+  // left able to load another one that decodes.
+  {
+    const player = new Mpeg2TsPlayer(new FakeVideo(), {
+      mediaSource: "worker",
+      deinterlacer: () => fakeDeinterlacer(true),
+    });
+    const errors = [];
+    player.addEventListener("error", (event) =>
+      errors.push(event.detail.error),
+    );
+    const loaded = player.load("https://example.invalid/c.ts");
+    const rejection = assert.rejects(
+      loaded,
+      /no AAC sound.*passthrough is off/,
+    );
+    const worker = FakeWorker.last;
+    const [first] = worker.take("load");
+    worker.send({ type: "no-aac-audio", id: first.id });
+    await rejection;
+    assert.equal(errors.length, 1);
+    assert.match(errors[0].message, /no AAC sound.*passthrough is off/);
+    assert.equal(player.state, "error");
+    assert.equal(player.softwareDecoding, false);
+    assert.equal(worker.take("load").length, 0, "no second load");
+    worker.take("need");
+    await wait(60);
+    assert.equal(worker.take("need").length, 0, "no requests once failed");
+
+    const again = player.load("https://example.invalid/d.ts");
+    const [second] = worker.take("load");
+    assert.equal(second.video, "decode");
+    assert.equal(player.softwareDecoding, true);
+    assert.equal(worker.take("need").length, 1);
+    worker.send({ type: "opened", id: second.id });
+    await again;
+    assert.equal(player.state, "converting");
+    assert.equal(errors.length, 1);
+    player.destroy();
+  }
+
   // A deinterlacer that has been handed pictures shows nothing else, so a
-  // later load that converts the video gets a new one; one that decodes
-  // keeps it.
+  // later load that passes the video through gets a new one; one that
+  // decodes keeps it.
   {
     const made = [];
     const player = new Mpeg2TsPlayer(new FakeVideo(), {
       mediaSource: "worker",
+      passthrough: true,
       deinterlacer: () => {
         made.push(fakeDeinterlacer(true));
         return made.at(-1);
@@ -374,11 +464,10 @@ try {
     assert.equal(made.length, 1, "a decoding load keeps the deinterlacer");
     worker.send({ type: "no-aac-audio", id: second.id });
     const [third] = worker.take("load");
-    assert.equal(third.video, "transcode");
-    assert.equal(made.length, 2, "a converting load gets a new one");
+    assert.equal(third.video, "passthrough");
+    assert.equal(made.length, 2, "a passing load gets a new one");
     assert.ok(made[0].calls.includes("destroy"));
     assert.ok(!made[1].calls.includes("destroy"));
-    assert.equal(third.encodedVideo, true);
     // Nothing was handed to the new one, so it stays for the load after.
     void player.load("https://example.invalid/f.ts").catch(() => {});
     assert.equal(made.length, 2);

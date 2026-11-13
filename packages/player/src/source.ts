@@ -87,8 +87,8 @@ function describeRangeError(
 
 /**
  * Annotate a range-request failure with where reading stood, for the error
- * surface. Applied at leg open and read-loop failures; failures from WASM, the pool, the
- * transcoder, or the sink reach the leg catch unmodified. Carries no
+ * surface. Applied at leg open and read-loop failures; failures from WASM, the
+ * packager, or the sink reach the leg catch unmodified. Carries no
  * headers, URLs, or credentials.
  */
 export function withRangeContext(

@@ -1,9 +1,9 @@
 /**
  * Deinterlacing what the media element shows, on the GPU.
  *
- * A transport stream off the air is interlaced, and the converted H.264 keeps
- * it that way: the browser decodes each pair of fields into one frame, so what
- * a `<video>` puts on screen is combed wherever anything moved. Nothing in the
+ * A transport stream off the air is interlaced, and the video keeps it that
+ * way: the browser decodes each pair of fields into one frame, so what a
+ * `<video>` puts on screen is combed wherever anything moved. Nothing in the
  * platform will undo that, and doing it on the CPU at 1080i is out of the
  * question, so this takes the frames the element presents and filters them in
  * WebGL, on a canvas laid over the element.
@@ -38,7 +38,6 @@ import {
 } from "./debug.js";
 import { YADIF_FRAGMENT_SHADER, YADIF_UNIFORMS } from "./shader.js";
 import { FilmDetector, NO_PHASE, type Phase } from "./film-detect.js";
-import { EncodedVideoFrames } from "./encoded-video.js";
 import {
   checkPicture,
   PictureConverter,
@@ -583,8 +582,6 @@ interface PendingWorkerFrame {
  * the same snapshot for callers that prefer a constructor option.
  */
 export class Deinterlacer extends EventTarget {
-  /** Receive fMP4 from the player and decode supplemental input only above 1.25x playback speed. */
-  readonly encodedVideo: EncodedVideoFrames | null;
   /**
    * Receive decoded pictures with their presentation times. From the first
    * push on they are the only pictures shown, and the element is only the
@@ -918,10 +915,6 @@ export class Deinterlacer extends EventTarget {
           if (this.#displayCanvas.ownerDocument !== this.#ownerDocument)
             this.#layout();
         });
-    this.encodedVideo =
-      !externalHost && typeof VideoDecoder !== "undefined"
-        ? new EncodedVideoFrames(video)
-        : null;
     this.decodedVideo = {
       push: (picture) => this.#pushPicture(picture),
       reset: () => this.#resetPictures(),
@@ -937,10 +930,8 @@ export class Deinterlacer extends EventTarget {
     // The watch shares this GL context, so it works only while pictures are
     // drawn here. A Worker renderer is sent frames, not textures.
     this.#pictures = externalHost ? null : new PictureWatch(gl, video);
-    this.#videoFrames = new VideoFrames(
-      video,
-      () => this.encodedVideo?.take(),
-      () => (this.#workerState === "main" ? this.#pictures : null),
+    this.#videoFrames = new VideoFrames(video, () =>
+      this.#workerState === "main" ? this.#pictures : null,
     );
     // A frame the filter has not seen the neighbours of is not worth holding:
     // whatever is next will have been somewhere else entirely.
@@ -1546,7 +1537,6 @@ export class Deinterlacer extends EventTarget {
     this.#running = false;
     if (this.#decoded) this.#resetPictures();
     this.#videoFrames.cancel();
-    this.encodedVideo?.suspend();
     this.#stopCaptureLoop();
     this.#stopLoop();
     this.#frames = 0;
@@ -1587,7 +1577,6 @@ export class Deinterlacer extends EventTarget {
     );
     this.#videoFrames.destroy();
     this.#pictures?.destroy();
-    this.encodedVideo?.destroy();
     this.#video.removeEventListener("emptied", this.#onEmptied);
     this.#video.removeEventListener("resize", this.#onResize);
     this.#video.removeEventListener("pause", this.#onFlush);
@@ -2232,7 +2221,6 @@ export class Deinterlacer extends EventTarget {
     this.#decoded = true;
     this.#closePendingWorkerFrame();
     this.#videoFrames.cancel();
-    this.encodedVideo?.suspend();
     this.#stopCaptureLoop();
     this.#frames = 0;
     this.#dropQueue();
