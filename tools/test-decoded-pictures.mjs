@@ -1098,6 +1098,210 @@ for (const behindMs of [0, 12]) {
   );
 }
 
+// Pictures a jump leaves behind were never due, so none of them counts as
+// missed or late: neither those queued ahead of the old position, which the
+// element has already left one refresh before it says it is seeking (a click
+// is handled at the start of a frame, its events after the frame), nor the
+// pictures a seek's target is given as the filter's neighbours.
+for (const paused of [false, true]) {
+  const pictures = stream({ count: 900 });
+  const media = playing();
+  // Late in a picture that has two pictures between its anchor and itself.
+  const target = pictures[599];
+  const seekTo = target.timestamp + FRAME * 0.6;
+  const marks = {};
+  let supplying = true;
+  const announce = (control, context) => {
+    event(control, "seeking");
+    context.deinterlacer.decodedVideo.reset();
+    context.producer.seek(seekTo);
+    supplying = true;
+    marks.reset = control.now();
+  };
+  const steps = timeline(
+    [
+      2,
+      (control) => {
+        if (!paused) return;
+        media.set(control.now(), media.truth(control.now()), 0);
+        control.video.paused = true;
+        event(control, "pause");
+      },
+    ],
+    [
+      3,
+      (control, context) => {
+        media.set(control.now(), seekTo, 0);
+        control.video.seeking = true;
+        supplying = false;
+        marks.jumped = control.now();
+      },
+    ],
+    [
+      3.2,
+      (control) => {
+        media.set(control.now(), seekTo, 1);
+        control.video.seeking = false;
+        control.video.paused = false;
+        event(control, "seeked");
+        if (paused) event(control, "play");
+        event(control, "playing");
+        marks.played = control.now();
+      },
+    ],
+  );
+  const { result, refreshMs, stats } = await play({
+    seconds: 8,
+    media,
+    pictures,
+    supply: false,
+    script: (vsync, control, context) => {
+      const jumped = marks.jumped;
+      steps(control, context);
+      // The refresh after the jump.
+      if (jumped !== undefined && marks.reset === undefined)
+        announce(control, context);
+      if (supplying) context.producer.supply(control.video.currentTime, 1);
+    },
+  });
+  const label = paused ? "paused" : "playing";
+  assert.equal(stats.missed, 0, `${label}: ${stats.missed} pictures missed`);
+  // One field is passed over where the clock starts to run: held, the
+  // canvas shows the position as it is, and running, the position at the
+  // coming refresh.
+  const before = result.stats.findLast((entry) => entry.t <= marks.jumped);
+  assert.ok(
+    stats.late - before.late <= 1,
+    `${label}: ${stats.late - before.late} outputs late over the jump`,
+  );
+  // Until a picture of the new position is there, the canvas keeps what it
+  // showed.
+  assert.equal(
+    canvasDraws(result, marks.jumped, marks.reset).length,
+    0,
+    `${label}: put up a picture the jump left behind`,
+  );
+  // The picture before the target is its neighbour in the filter, for both
+  // fields, and is not itself shown.
+  const fields = result.draws.filter(
+    (draw) =>
+      draw.filter &&
+      !draw.comb &&
+      Math.abs(draw.picture.mediaTime - target.timestamp) < 1e-6,
+  );
+  assert.deepEqual(
+    fields.map((draw) => [draw.picture.second, draw.prev]),
+    [
+      [0, pictures[598].timestamp],
+      [1, pictures[598].timestamp],
+    ],
+    label,
+  );
+  // Seeking, the field whose time it is; paused, the picture's first.
+  const still = canvasDraws(result, marks.reset, marks.played);
+  assert.ok(still.length > 0, label);
+  for (const draw of still) {
+    assert.equal(draw.picture.mediaTime, target.timestamp, label);
+    assert.equal(draw.picture.second, paused ? 0 : 1, label);
+  }
+  const shown = appearances(
+    { draws: canvasDraws(result, marks.played) },
+    outputs(pictures),
+    refreshMs,
+  );
+  checkTiming(label, shown, media, refreshMs, {
+    from: marks.played + 100,
+    toleranceMs: 2,
+  });
+  console.log(
+    `ok jump, ${label}: nothing counted, nothing of the old position shown, neighbour used`,
+  );
+}
+
+// An element that has been told to play may move its time by a few
+// milliseconds and then stand still before it really starts. The clock does
+// not run on that first move, so nothing goes up ahead of its time.
+for (const [moveAtMs, startAtMs] of [
+  [30, 170],
+  [105, 160],
+]) {
+  const pictures = stream({ count: 900 });
+  const media = playing();
+  const seekTo = pictures[599].timestamp + FRAME * 0.6;
+  const moved = seekTo + 0.004;
+  const marks = {};
+  let supplying = true;
+  const steps = timeline(
+    [
+      3,
+      (control, context) => {
+        media.set(control.now(), seekTo, 0);
+        control.video.seeking = true;
+        event(control, "seeking");
+        context.deinterlacer.decodedVideo.reset();
+        context.producer.seek(seekTo);
+      },
+    ],
+    [
+      3.2,
+      (control) => {
+        control.video.seeking = false;
+        event(control, "seeked");
+        event(control, "playing");
+        marks.played = control.now();
+      },
+    ],
+  );
+  const { result, refreshMs, stats } = await play({
+    seconds: 8,
+    media,
+    pictures,
+    supply: false,
+    script: (vsync, control, context) => {
+      steps(control, context);
+      const now = control.now();
+      if (marks.played !== undefined) {
+        if (marks.moved === undefined && now >= marks.played + moveAtMs) {
+          media.set(now, moved, 0);
+          marks.moved = now;
+        }
+        if (marks.started === undefined && now >= marks.played + startAtMs) {
+          media.set(now, moved, 1);
+          marks.started = now;
+        }
+      }
+      if (supplying) context.producer.supply(control.video.currentTime, 1);
+    },
+  });
+  const shown = appearances(
+    { draws: canvasDraws(result, marks.played) },
+    outputs(pictures),
+    refreshMs,
+  );
+  let early = 0;
+  for (const output of shown) {
+    const wall = BASE_MS + output.refresh * refreshMs;
+    const truth =
+      wall >= marks.started
+        ? moved + (wall - marks.started) / 1000
+        : wall >= marks.moved
+          ? moved
+          : seekTo;
+    early = Math.max(early, (output.time - truth) * 1000);
+  }
+  const label = `moved at ${moveAtMs} ms, started at ${startAtMs} ms`;
+  assert.ok(
+    early <= 2,
+    `${label}: an output went up ${early.toFixed(2)} ms before its time`,
+  );
+  checkTiming(label, shown, media, refreshMs, {
+    from: marks.started + 100,
+    toleranceMs: 2,
+  });
+  assert.equal(stats.missed, 0, label);
+  console.log(`ok start, ${label}: nothing ahead of its time`);
+}
+
 // Faster playback: fields are chosen by time, and those the display has no
 // refresh for are skipped.
 for (const rate of [1.5, 2])

@@ -7,6 +7,12 @@
  * the caller's wall clock at the playback rate and is pulled, slowly, towards
  * the highest reading of the last second relative to itself: the reading
  * taken nearest a step is the closest to the truth.
+ *
+ * After a hold the clock stays on the readings until two changes of the
+ * reading in a row are as far apart as playing takes. One change is not
+ * enough: an element that has been told to play may move its time by a few
+ * milliseconds and then stand still for a tenth of a second before the sound
+ * starts, and a clock started on that first change would run ahead of it.
  */
 
 /** Window over which the highest reading is kept, as buckets of this many milliseconds. */
@@ -37,6 +43,18 @@ const RESTART_MS = 100;
  */
 const STALL_MS = 250;
 
+/**
+ * The least a change of the reading must cover, as a fraction of the wall
+ * time since the change before it, for the two to count as the element
+ * playing. A stepped reading seen a refresh late still covers more than half
+ * of the time between sightings; the small moves of an element that has not
+ * started yet cover far less.
+ */
+const START_FRACTION = 0.5;
+
+/** Wall time allowed for the rounding of the times readings are taken at. */
+const START_MARGIN_MS = 2;
+
 export class MediaClock {
   /**
    * The position is #media + #rate * (wall - #wall) / 1000 seconds. It is
@@ -47,11 +65,18 @@ export class MediaClock {
   /** The playback rate while running, 0 while held. */
   #rate = 0;
   #playbackRate = 1;
-  /** Whether the clock waits for the reading to change before it runs. */
+  /** Whether the clock waits for the readings to show playing before it runs. */
   #waiting = true;
   /** The last reading, and the wall time at which it was first seen. */
   #reading = Number.NaN;
   #readingAt = 0;
+  /** While waiting: whether the last reading was a change, not where the clock was held. */
+  #stepped = false;
+  /** Wall time between the last reading that changed and the reading before it. */
+  #steppedWithin = 0;
+  /** Wall time of the last reading taken, changed or not. */
+  #observedAt = 0;
+  #origin = Number.NaN;
   /** Wall time of the last correction. */
   #correctedAt = 0;
   /** The highest error of a reading, in media seconds, per bucket; the last is the newest. */
@@ -71,9 +96,19 @@ export class MediaClock {
   }
 
   /**
-   * Stop at the next reading and wait for it to move: a seek, a pause or a
-   * stall the element has reported. Readings taken across the event say
-   * nothing about the position after it.
+   * Where the clock was last put by a reading instead of running there: at a
+   * hold, or on a reading too far from it. Playback has been continuous from
+   * here, so nothing that ended at or before it has been due since. NaN
+   * before the first reading.
+   */
+  get origin(): number {
+    return this.#origin;
+  }
+
+  /**
+   * Stop at the next reading and wait for the readings to show playing: a
+   * seek, a pause or a stall the element has reported. Readings taken across
+   * the event say nothing about the position after it.
    */
   hold(): void {
     this.#holdRequested = true;
@@ -92,6 +127,8 @@ export class MediaClock {
     playbackRate: number,
     playing: boolean,
   ): boolean {
+    const sinceObserved = wall - this.#observedAt;
+    this.#observedAt = wall;
     if (
       !playing ||
       this.#holdRequested ||
@@ -107,12 +144,34 @@ export class MediaClock {
         this.#holdAt(wall, currentTime);
       return false;
     }
+    const moved = ((currentTime - this.#reading) * 1000) / playbackRate;
+    const elapsed = wall - this.#readingAt;
+    const previousWithin = this.#steppedWithin;
     this.#reading = currentTime;
     this.#readingAt = wall;
-    // A reading that moved after a hold is a step that has just been taken,
-    // which is where the clock starts.
+    this.#steppedWithin = sinceObserved;
+    if (this.#waiting) {
+      // Each change was seen up to one reading after it happened, so the two
+      // are apart by the time between the sightings, give or take those.
+      const runs =
+        this.#stepped &&
+        moved >= elapsed * START_FRACTION &&
+        moved <= elapsed + previousWithin + START_MARGIN_MS;
+      this.#stepped = true;
+      if (!runs) {
+        // Not shown to be playing yet: the position is the reading.
+        this.#wall = wall;
+        this.#media = currentTime;
+        return false;
+      }
+      // A reading that has just changed is a step that has just been taken,
+      // which is where the clock starts.
+      this.#run(wall, currentTime);
+      return true;
+    }
     const error = currentTime - this.at(wall);
-    if (this.#waiting || Math.abs(error) > (RESTART_MS / 1000) * playbackRate) {
+    if (Math.abs(error) > (RESTART_MS / 1000) * playbackRate) {
+      this.#origin = currentTime;
       this.#run(wall, currentTime);
       return true;
     }
@@ -141,8 +200,10 @@ export class MediaClock {
     this.#media = currentTime;
     this.#rate = 0;
     this.#waiting = true;
+    this.#stepped = false;
     this.#reading = currentTime;
     this.#readingAt = wall;
+    this.#origin = currentTime;
   }
 
   #run(wall: number, currentTime: number): void {

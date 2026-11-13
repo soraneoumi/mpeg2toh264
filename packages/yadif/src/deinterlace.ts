@@ -248,6 +248,11 @@ interface DecodedOutput {
   time: number;
   /** The timestamp of the picture it is made from. */
   picture: number;
+  /**
+   * When that picture stops being the one to show: when the first output of
+   * the picture after it is due, or its own end where no successor is known.
+   */
+  end: number;
   /** Whether it is the first output of that picture, which is what a paused element shows. */
   start: boolean;
   scan: Scan;
@@ -317,7 +322,9 @@ export interface DeinterlaceStats {
    * the gaps are those in `mozPaintedFrames`.
    *
    * With decoded pictures, the pictures dropped because their time had
-   * passed before they could be taken in, none of them shown.
+   * passed before they could be taken in, none of them shown. Pictures that
+   * ended before the place playback last started from are not counted: they
+   * were never due.
    */
   missed: number;
   /**
@@ -347,7 +354,8 @@ export interface DeinterlaceStats {
   /**
    * Fields skipped because their display time passed or disagreed with the
    * presentation clock. With decoded pictures, every field or frame filtered
-   * or due and never shown, including those a rate above the refresh skips.
+   * or due and never shown, including those a rate above the refresh skips,
+   * but not those from before the place playback last started from.
    */
   late: number;
   /**
@@ -2102,7 +2110,7 @@ export class Deinterlacer extends EventTarget {
         this.#held[this.#head]!.timestamp + TIMESTAMP_TOLERANCE
     ) {
       // Older than a picture already taken in, so it cannot join the history.
-      this.#stats.missed++;
+      this.#countMissed(picture.timestamp + picture.duration);
       this.#release(picture.data);
       return;
     }
@@ -2281,9 +2289,26 @@ export class Deinterlacer extends EventTarget {
   #dropPassed(time: number): void {
     const pending = this.#pending;
     while (pending.length > 2 && pending[2]!.timestamp <= time) {
-      this.#stats.missed++;
-      this.#release(pending.shift()!.data);
+      const passed = pending.shift()!;
+      this.#countMissed(passed.timestamp + passed.duration);
+      this.#release(passed.data);
     }
+  }
+
+  /**
+   * Whether something that ended at `end` was there to be shown. What ended
+   * at or before the place playback last started from was not: the pictures
+   * a seek's target is given as the filter's neighbours, and whatever was
+   * still queued when the position jumped past it. Before the first reading
+   * of the clock nothing is known to have been skipped.
+   */
+  #wasDue(end: number): boolean {
+    return !(end <= this.#clock.origin + TIMESTAMP_TOLERANCE);
+  }
+
+  /** Count a decoded picture ending at `end` that was dropped unshown. */
+  #countMissed(end: number): void {
+    if (this.#wasDue(end)) this.#stats.missed++;
   }
 
   /** Read the element's clock, as it was at `wall` on this realm's clock. */
@@ -2554,6 +2579,7 @@ export class Deinterlacer extends EventTarget {
       slot,
       time: picture.timestamp,
       picture: picture.timestamp,
+      end: picture.timestamp + picture.duration,
       start: true,
       scan: decodedScan(picture),
     });
@@ -2579,6 +2605,7 @@ export class Deinterlacer extends EventTarget {
       ? Number.POSITIVE_INFINITY
       : this.#held[this.#head]!.timestamp;
     const scan = decodedScan(picture);
+    const end = picture.timestamp + picture.duration;
     let queued = false;
     if (this.#filmLocked && !flush) {
       const phase = this.#phase.phase;
@@ -2593,6 +2620,7 @@ export class Deinterlacer extends EventTarget {
           at + (picture.duration * PULLDOWN_FRAMES) / FILM_FRAMES,
           next,
           picture.timestamp,
+          end,
           true,
           false,
           null,
@@ -2608,6 +2636,7 @@ export class Deinterlacer extends EventTarget {
           next,
           next,
           picture.timestamp,
+          end,
           true,
           false,
           null,
@@ -2629,6 +2658,7 @@ export class Deinterlacer extends EventTarget {
           field + 1 < fields ? at + step : next,
           next,
           picture.timestamp,
+          end,
           field === 0,
           field === 1,
           field === 2 ? first : null,
@@ -2641,20 +2671,22 @@ export class Deinterlacer extends EventTarget {
         if (slot !== null) queued = true;
       }
     }
-    if (!queued && next <= time) this.#stats.missed++;
+    if (!queued && next <= time) this.#countMissed(end);
   }
 
   /**
    * Filter one output into a slot and queue it for `at`, unless it can never
    * be shown. `until` is when the output after it is due and `pictureUntil`
-   * when the next picture is. `slot` is a slot already holding the same
-   * field. Returns the slot, or null.
+   * when the next picture is; `picture` and `pictureEnd` are the picture's
+   * own time and end. `slot` is a slot already holding the same field.
+   * Returns the slot, or null.
    */
   #output(
     at: number,
     until: number,
     pictureUntil: number,
     picture: number,
+    pictureEnd: number,
     start: boolean,
     second: boolean,
     slot: number | null,
@@ -2664,7 +2696,7 @@ export class Deinterlacer extends EventTarget {
     rate: number,
   ): number | null {
     if (!this.#useful(at, until, pictureUntil, time, rate)) {
-      this.#stats.late++;
+      if (this.#wasDue(until)) this.#stats.late++;
       return null;
     }
     if (slot === null) {
@@ -2676,7 +2708,17 @@ export class Deinterlacer extends EventTarget {
       this.#outputHead = slot;
       this.#render(flush, second, this.#outputs[slot]!.framebuffer);
     }
-    this.#decodedQueue.push({ slot, time: at, picture, start, scan });
+    this.#decodedQueue.push({
+      slot,
+      time: at,
+      picture,
+      // A film frame is due past the time of the picture after it.
+      end: Number.isFinite(pictureUntil)
+        ? Math.max(until, pictureUntil)
+        : pictureEnd,
+      start,
+      scan,
+    });
     return slot;
   }
 
@@ -2716,6 +2758,11 @@ export class Deinterlacer extends EventTarget {
    */
   #showDecoded(time: number, rate: number, paused: boolean): void {
     const queue = this.#decodedQueue;
+    // Pictures a jump of the position left behind do not go up: the canvas
+    // keeps what it shows until a picture of the new position is there.
+    let behind = 0;
+    while (behind < queue.length && !this.#wasDue(queue[behind]!.end)) behind++;
+    if (behind > 0) queue.splice(0, behind);
     let index = -1;
     if (paused) {
       for (let i = 0; i < queue.length && queue[i]!.picture <= time; i++)
@@ -2761,8 +2808,10 @@ export class Deinterlacer extends EventTarget {
         queue.splice(0, replaced);
         return;
       }
-      this.#stats.late += count - 1;
       index = replaced + count - 1;
+      // Each output passed over was due until the one after it.
+      for (let i = replaced; i < index; i++)
+        if (this.#wasDue(queue[i + 1]!.time)) this.#stats.late++;
     }
     const entry = queue[index]!;
     queue.splice(0, index + 1);
