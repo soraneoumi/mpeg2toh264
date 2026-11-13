@@ -32,7 +32,7 @@ pub(crate) fn is_film_repeat(picture: &Picture) -> bool {
         && !picture.slices.is_empty()
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) struct RffState {
     fields: u64,
     rate: (u32, u32),
