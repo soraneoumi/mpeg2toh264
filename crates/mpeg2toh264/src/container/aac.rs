@@ -3,6 +3,7 @@
 use crate::bitreader::BitReader;
 use crate::container::aac_huffman::*;
 use crate::error::{bail, Result};
+use std::sync::LazyLock;
 
 /// What a walk found out about the level of the channels it stepped over.
 ///
@@ -42,15 +43,79 @@ const SWB_LONG_48: &[usize] = &[
 ];
 const SWB_SHORT_48: &[usize] = &[0, 4, 8, 12, 16, 20, 28, 36, 44, 56, 68, 80, 96, 112, 128];
 
-fn vlc(r: &mut BitReader<'_>, table: &[AacVlc]) -> Result<usize> {
-    for len in 1..=19 {
+/// How many bits of the stream the first lookup of a codebook goes by. Most
+/// of the codewords a frame is made of are no longer.
+const LOOKUP_BITS: u32 = 10;
+/// The longest codeword of any book.
+const LONGEST_CODE: u32 = 19;
+
+/// A codebook, with its shorter codewords laid out to be found in one read.
+struct Codebook {
+    /// By the next `LOOKUP_BITS` bits of the stream: the length of the
+    /// codeword they begin with in the low five bits and its index above
+    /// them, or zero where that codeword is longer or there is none.
+    short: [u16; 1 << LOOKUP_BITS],
+    /// Every codeword, in order of length and then of value.
+    codes: &'static [AacVlc],
+}
+
+impl Codebook {
+    fn new(codes: &'static [AacVlc]) -> Self {
+        let mut short = [0; 1 << LOOKUP_BITS];
+        for code in codes {
+            let len = code.len as u32;
+            if len <= LOOKUP_BITS {
+                let first = (code.bits << (LOOKUP_BITS - len)) as usize;
+                short[first..first + (1 << (LOOKUP_BITS - len))]
+                    .fill(code.index << 5 | code.len as u16);
+            }
+        }
+        Self { short, codes }
+    }
+}
+
+/// The scalefactor book, then spectral books 1 to 11 under their numbers.
+static CODEBOOKS: LazyLock<[Codebook; 12]> = LazyLock::new(|| {
+    let books: [&'static [AacVlc]; 12] = [
+        &SCALEFACTORS,
+        &SPECTRAL_1,
+        &SPECTRAL_2,
+        &SPECTRAL_3,
+        &SPECTRAL_4,
+        &SPECTRAL_5,
+        &SPECTRAL_6,
+        &SPECTRAL_7,
+        &SPECTRAL_8,
+        &SPECTRAL_9,
+        &SPECTRAL_10,
+        &SPECTRAL_11,
+    ];
+    books.map(Codebook::new)
+});
+
+fn scalefactor_book() -> &'static Codebook {
+    &CODEBOOKS[0]
+}
+
+/// Read one codeword and return its index.
+#[inline]
+fn vlc(r: &mut BitReader<'_>, book: &Codebook) -> Result<usize> {
+    let entry = book.short[r.peek(LOOKUP_BITS) as usize];
+    if entry != 0 {
+        r.skip((entry & 31) as u32);
+        return Ok((entry >> 5) as usize);
+    }
+    long_vlc(r, book.codes)
+}
+
+/// [`vlc`] for a codeword longer than the lookup covers.
+fn long_vlc(r: &mut BitReader<'_>, codes: &[AacVlc]) -> Result<usize> {
+    for len in LOOKUP_BITS + 1..=LONGEST_CODE {
         let bits = r.peek(len);
-        if let Ok(index) =
-            table.binary_search_by_key(&(len as u8, bits), |code| (code.len, code.bits))
+        if let Ok(at) = codes.binary_search_by_key(&(len as u8, bits), |code| (code.len, code.bits))
         {
-            let value = table[index].index as usize;
             r.skip(len);
-            return Ok(value);
+            return Ok(codes[at].index as usize);
         }
     }
     bail!("invalid AAC Huffman code at bit {}", r.bit_pos())
@@ -149,7 +214,7 @@ fn scale_factors(
                         first_noise = false;
                     }
                     1..=11 => {
-                        scalefactor += vlc(r, &SCALEFACTORS)? as i32 - 60;
+                        scalefactor += vlc(r, scalefactor_book())? as i32 - 60;
                         gains.max_scalefactor = Some(
                             gains
                                 .max_scalefactor
@@ -157,7 +222,7 @@ fn scale_factors(
                         );
                     }
                     13..=15 => {
-                        vlc(r, &SCALEFACTORS)?;
+                        vlc(r, scalefactor_book())?;
                     }
                     _ => bail!("unsupported AAC scalefactor codebook {}", section.cb),
                 }
@@ -184,23 +249,6 @@ fn tns(r: &mut BitReader<'_>, info: &IcsInfo) {
     }
 }
 
-fn spectral_table(cb: u8) -> &'static [AacVlc] {
-    match cb {
-        1 => &SPECTRAL_1,
-        2 => &SPECTRAL_2,
-        3 => &SPECTRAL_3,
-        4 => &SPECTRAL_4,
-        5 => &SPECTRAL_5,
-        6 => &SPECTRAL_6,
-        7 => &SPECTRAL_7,
-        8 => &SPECTRAL_8,
-        9 => &SPECTRAL_9,
-        10 => &SPECTRAL_10,
-        11 => &SPECTRAL_11,
-        _ => &[],
-    }
-}
-
 fn spectral(r: &mut BitReader<'_>, info: &IcsInfo, groups: &[Vec<Section>]) -> Result<()> {
     let offsets = if info.short {
         SWB_SHORT_48
@@ -221,9 +269,10 @@ fn spectral(r: &mut BitReader<'_>, info: &IcsInfo, groups: &[Vec<Section>]) -> R
                 11 => (true, 2, 16),
                 _ => unreachable!(),
             };
+            let book = &CODEBOOKS[section.cb as usize];
             let coefficients = (offsets[section.end] - offsets[section.start]) * info.group_len[g];
             for _ in 0..coefficients / dimension {
-                let mut index = vlc(r, spectral_table(section.cb))?;
+                let mut index = vlc(r, book)?;
                 let radix = if unsigned { lav + 1 } else { 2 * lav + 1 };
                 let mut values = [0usize; 4];
                 for value in values[..dimension].iter_mut().rev() {
@@ -355,4 +404,27 @@ pub fn cpe_end(
         bail!("AAC CPE overruns its raw_data_block");
     }
     Ok(r.bit_pos())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every codeword of every book reads back as its own index and length,
+    /// whatever follows it in the stream.
+    #[test]
+    fn every_codeword_is_found_by_the_lookup() {
+        for book in CODEBOOKS.iter() {
+            for code in book.codes {
+                for filler in [0u32, u32::MAX] {
+                    let len = code.len as u32;
+                    let word = code.bits << (32 - len) | filler >> len;
+                    let data = word.to_be_bytes();
+                    let mut r = BitReader::at_bit(&data, 0);
+                    assert_eq!(vlc(&mut r, book).unwrap(), code.index as usize);
+                    assert_eq!(r.bit_pos(), len as usize);
+                }
+            }
+        }
+    }
 }
