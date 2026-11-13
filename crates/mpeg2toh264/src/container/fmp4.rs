@@ -316,6 +316,7 @@ pub fn mpeg2_passthrough_unit(data: &[u8], has_references: bool) -> Result<Mpeg2
 }
 
 /// Source-clock information kept alongside the public, retimed MP4 unit.
+#[derive(Clone)]
 pub(crate) struct TimedUnit {
     pub unit: Mpeg2Unit,
     /// Original first coded PTS relative to the retimed unit boundary. This

@@ -7,6 +7,8 @@
 //! the part most easily got wrong and it belongs next to the code it
 //! constrains.
 
+use std::sync::Arc;
+
 use crate::container::adts::{
     aac_frame_count_through_video_time, silent_frame, AacConfig, AacFrame, AdtsStream, AudioGain,
     DualMono, AAC_FRAME_SAMPLES,
@@ -210,6 +212,35 @@ pub struct VideoPicture {
     pub duration: f64,
 }
 
+/// A unit that is complete and waiting for the sound that goes out beside it.
+///
+/// Whether it can go is asked again at every packet that arrives, so what
+/// that question costs is kept down to what changed since it was last asked:
+/// the unit is shared rather than copied for the asking, and its headers are
+/// walked once.
+struct WaitingUnit {
+    gop: Arc<Mpeg2Gop>,
+    timing: Option<KeptTiming>,
+}
+
+impl WaitingUnit {
+    fn new(gop: Mpeg2Gop) -> Self {
+        Self {
+            gop: Arc::new(gop),
+            timing: None,
+        }
+    }
+}
+
+/// The walk of a unit's headers, and what it was drawn for. The same unit
+/// asked the same thing gives the same walk.
+struct KeptTiming {
+    has_references: bool,
+    before: RffState,
+    consumed: u32,
+    timed: TimedUnit,
+}
+
 /// What the video of one unit turns into, and what the muxer needs to know
 /// about it.
 ///
@@ -391,7 +422,7 @@ pub struct Session {
     /// its sequence header says.
     describe_pending: bool,
 
-    pending_gops: Vec<Mpeg2Gop>,
+    pending_gops: Vec<WaitingUnit>,
     pending_audio: Vec<AacFrame>,
     audio_config: Option<AacConfig>,
 
@@ -598,7 +629,8 @@ impl Session {
         let mut out = Vec::new();
         self.consume_elementary(packets, &mut out)?;
 
-        self.pending_gops.extend(self.gops.finish());
+        self.pending_gops
+            .extend(self.gops.finish().into_iter().map(WaitingUnit::new));
         let final_audio = self.adts.finish()?;
         if self.audio_config.is_none() {
             self.audio_config = final_audio.first().map(|frame| frame.config.clone());
@@ -625,15 +657,20 @@ impl Session {
             match packet.kind {
                 ElementaryKind::Video => {
                     if packet.damaged_previous_pes {
-                        self.pending_gops
-                            .extend(self.gops.take_complete_prefix_before_gap());
+                        self.pending_gops.extend(
+                            self.gops
+                                .take_complete_prefix_before_gap()
+                                .into_iter()
+                                .map(WaitingUnit::new),
+                        );
                     }
                     let units = self.gops.push_with_restart(
                         &packet.data,
                         packet.pts,
                         packet.restart_offset,
                     );
-                    self.pending_gops.extend(units);
+                    self.pending_gops
+                        .extend(units.into_iter().map(WaitingUnit::new));
                 }
                 ElementaryKind::Audio => {
                     if packet.discontinuity {
@@ -806,9 +843,36 @@ impl Session {
     /// Nothing is decoded to get here, so every picture with a slice in it
     /// counts as one: a damaged slice is the decoder's business rather than
     /// this crate's.
-    fn plan_unit(&self, gop: &Mpeg2Gop, restarts: bool) -> Result<UnitPlan> {
-        let mut timed =
-            timed_mpeg2_unit(&gop.data, !restarts, self.rff, self.consumed_before(gop))?;
+    ///
+    /// `kept` is the walk of the unit's headers from the last time it was
+    /// planned, which is used again where it was asked the same thing.
+    fn plan_unit(
+        &self,
+        gop: &Mpeg2Gop,
+        restarts: bool,
+        kept: &mut Option<KeptTiming>,
+    ) -> Result<UnitPlan> {
+        let has_references = !restarts;
+        let consumed = self.consumed_before(gop);
+        let mut timed = match kept {
+            Some(kept)
+                if kept.has_references == has_references
+                    && kept.before == self.rff
+                    && kept.consumed == consumed =>
+            {
+                kept.timed.clone()
+            }
+            _ => {
+                let timed = timed_mpeg2_unit(&gop.data, has_references, self.rff, consumed)?;
+                *kept = Some(KeptTiming {
+                    has_references,
+                    before: self.rff,
+                    consumed,
+                    timed: timed.clone(),
+                });
+                timed
+            }
+        };
         // A seek, missing GOP, or timestamp jump resets the timing phase.
         // The ordinary hole handling accounts for any outstanding half field.
         // A unit in the middle of a group is timed against the ones before it
@@ -1071,9 +1135,9 @@ impl Session {
             if matches!(self.video, VideoPipeline::Decode { .. }) {
                 return Err(Error::no_aac_audio());
             }
-            let gop = self.pending_gops.remove(0);
+            let gop = Arc::unwrap_or_clone(self.pending_gops.remove(0).gop);
             self.note_description(&gop);
-            let mut plan = self.plan_unit(&gop, self.restarts(&gop))?;
+            let mut plan = self.plan_unit(&gop, self.restarts(&gop), &mut None)?;
             self.hold_over_hole(&gop, &mut plan)?;
             self.place_in_group(&gop, self.restarts(&gop), &mut plan);
             return Ok(Some(self.commit(gop, Vec::new(), plan)));
@@ -1091,7 +1155,8 @@ impl Session {
         if !final_flush && self.pending_audio.is_empty() {
             return Ok(None);
         }
-        let gop = self.pending_gops[0].clone();
+        let gop = Arc::clone(&self.pending_gops[0].gop);
+        let mut timing = self.pending_gops[0].timing.take();
         // Before the plan, because a unit the fragments so far do not describe
         // has to open at a random access point and the plan is drawn knowing
         // whether it does. The sound is asked the same question: an
@@ -1099,7 +1164,7 @@ impl Session {
         // changing calls for a new one.
         self.note_description(&gop);
         self.note_audio_description();
-        let mut plan = self.plan_unit(&gop, self.restarts(&gop))?;
+        let mut plan = self.plan_unit(&gop, self.restarts(&gop), &mut timing)?;
         // Before the audio is measured against the video, since a hole held
         // over is part of what the fragment spans and so of what it carries.
         self.hold_over_hole(&gop, &mut plan)?;
@@ -1114,9 +1179,13 @@ impl Session {
         let desired = aac_frame_count_through_video_time(through, config.sample_rate);
         let wanted = (desired - self.audio_frames_emitted as i64).max(0) as usize;
         if !final_flush && self.pending_audio.len() < wanted {
+            self.pending_gops[0].timing = timing;
             return Ok(None);
         }
+        // The queue's hold on the unit goes with its place in it, which
+        // leaves the one here the only one.
         self.pending_gops.remove(0);
+        let gop = Arc::unwrap_or_clone(gop);
         // The last fragment takes whatever audio is left, since nothing
         // follows it to carry the remainder.
         let take = if final_flush && self.pending_gops.is_empty() {
