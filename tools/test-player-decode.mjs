@@ -190,6 +190,21 @@ try {
     const decodedVideo = deinterlacer.decodedVideo;
     assert.equal(typeof decodedVideo.onrelease, "function");
 
+    // The deinterlacer shows decoded pictures whether it filters them or
+    // not, so its `running` alone does not say they are being deinterlaced.
+    {
+      const { running, enabled, scan } = deinterlacer;
+      deinterlacer.running = true;
+      deinterlacer.enabled = true;
+      deinterlacer.scan = { interlaced: false, topFieldFirst: true };
+      assert.equal(player.deinterlace, false);
+      deinterlacer.scan = { interlaced: true, topFieldFirst: true };
+      assert.equal(player.deinterlace, true);
+      deinterlacer.enabled = false;
+      assert.equal(player.deinterlace, false);
+      Object.assign(deinterlacer, { running, enabled, scan });
+    }
+
     // A request at once, then every 40 ms, from the playhead.
     let needs = worker.take("need");
     assert.equal(needs.length, 1);
