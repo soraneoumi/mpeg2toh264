@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use mpeg2toh264::mpeg2::constants::{PictureStructure, PictureType};
 use mpeg2toh264::mpeg2::headers::parse_elementary_stream;
-use mpeg2toh264::{Fragment, TranscodeOptions, VideoMode};
+use mpeg2toh264::{Fragment, SessionOptions, VideoMode};
 
 const PACKET_SIZE: usize = 188;
 
@@ -132,26 +132,6 @@ pub fn wrap_mpeg2_es_in_ts(
         out.extend_from_slice(&packet);
         *continuity = (*continuity + 1) & 15;
         at += size;
-    }
-    out
-}
-
-/// Split an Annex B stream into `(nal_unit_type, payload)` pairs.
-pub fn split_annex_b(data: &[u8]) -> Vec<(u8, &[u8])> {
-    let mut starts = Vec::new();
-    let mut i = 0;
-    while i + 3 < data.len() {
-        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1 {
-            starts.push(i + 4);
-            i += 4;
-        } else {
-            i += 1;
-        }
-    }
-    let mut out = Vec::new();
-    for (index, &start) in starts.iter().enumerate() {
-        let end = starts.get(index + 1).map_or(data.len(), |next| next - 4);
-        out.push((data[start] & 0x1f, &data[start..end]));
     }
     out
 }
@@ -348,7 +328,7 @@ fn mux_payloads(
 /// Synthesise one AAC-LC ADTS frame with a payload of `payload_len` bytes.
 ///
 /// The payload is not valid AAC, which does not matter: nothing here decodes
-/// it, and the point of the transcoder's audio path is that it never looks
+/// it, and the point of the session's audio path is that it never looks
 /// inside.
 pub fn adts_frame(sampling_frequency_index: u8, channel_count: u8, payload_len: usize) -> Vec<u8> {
     let frame_length = 7 + payload_len;
@@ -626,11 +606,21 @@ pub fn mux_with_sound(groups: &[(&[u8], u64, u64)]) -> Vec<u8> {
     )
 }
 
+/// The options of a session that carries the MPEG-2 into the MP4 as it stands.
+pub fn passthrough() -> SessionOptions {
+    SessionOptions::new(VideoMode::Passthrough)
+}
+
+/// The options of a session that hands the MPEG-2 out for the caller to decode.
+pub fn decode() -> SessionOptions {
+    SessionOptions::new(VideoMode::Decode)
+}
+
 /// The passthrough options whose MP4 decode mode has to agree with: groups
 /// cut into anchor units, and a field pair in one sample, as it is one
 /// picture to decode.
-pub fn passthrough_like_decode(options: TranscodeOptions) -> TranscodeOptions {
-    TranscodeOptions {
+pub fn passthrough_like_decode(options: SessionOptions) -> SessionOptions {
+    SessionOptions {
         video: VideoMode::Passthrough,
         split_groups: true,
         split_field_samples: false,
@@ -638,8 +628,8 @@ pub fn passthrough_like_decode(options: TranscodeOptions) -> TranscodeOptions {
     }
 }
 
-pub fn decoding(options: TranscodeOptions) -> TranscodeOptions {
-    TranscodeOptions {
+pub fn decoding(options: SessionOptions) -> SessionOptions {
+    SessionOptions {
         video: VideoMode::Decode,
         ..options
     }

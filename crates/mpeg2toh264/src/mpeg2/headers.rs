@@ -1,14 +1,13 @@
 //! MPEG-2 (H.262) header layer parsing: everything above the macroblock.
 //!
-//! The output of this pass is what the H.264 side needs to build its SPS/PPS and
-//! slice headers, plus the byte ranges of the slices whose macroblock layer will
-//! be re-entropy-coded.
+//! The output of this pass is the sequence, picture and slice headers, plus the
+//! byte ranges of the slices whose macroblock layer the decoder reads.
 
 use crate::bitreader::{find_start_codes, BitReader};
 use crate::error::Result;
 use crate::mpeg2::constants::{
-    chroma_format, extension, start_code, PictureStructure, PictureType, ALTERNATE_SCAN,
-    DEFAULT_INTRA_QUANT, DEFAULT_NON_INTRA_QUANT, ZIGZAG_SCAN,
+    chroma_format, extension, start_code, PictureStructure, PictureType, DEFAULT_INTRA_QUANT,
+    DEFAULT_NON_INTRA_QUANT, ZIGZAG_SCAN,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -189,31 +188,28 @@ pub fn picture_display_size(picture: &Picture) -> (u32, u32) {
     }
 }
 
-/// What the H.264 parameter sets and the MP4 initialization segment are built
-/// out of, as the sequence header states it.
+/// What the MP4 initialization segment is built out of, as the sequence header
+/// states it.
 ///
 /// A broadcast is not one sequence from end to end: a station switching between
 /// its main service and a sub-channel, or between an HD programme and an SD
 /// commercial, sends a new sequence header and codes everything after it
-/// differently. Everything here is something the SPS or the MP4 sample entry
-/// carries, so a stream that changes any of it has to be described again -- and
-/// nothing else in the sequence header needs a decoder to be told twice.
+/// differently. Everything here is something the MP4 sample entry carries, so a
+/// stream that changes any of it has to be described again -- and nothing else
+/// in the sequence header needs a decoder to be told twice.
 ///
-/// The quantiser matrices are deliberately not here, although the PPS declares
-/// the non-intra one as its scaling list. Some broadcast encoders adapt them
-/// picture by picture, several times within one group of pictures, and a
-/// picture whose matrices differ from the unit's is still coded: it is
-/// requantised against the list the decoder was given, which the search for a
-/// quantiser step already allows for. Counting them here instead would drop
-/// every picture but the one a unit opens with.
+/// The quantiser matrices are deliberately not here. Some broadcast encoders
+/// adapt them picture by picture, several times within one group of pictures,
+/// and a picture whose matrices differ from the unit's is still kept: each
+/// picture carries the matrices it is decoded with. Counting them here instead
+/// would drop every picture but the one a unit opens with.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct SequenceDescription {
     pub width: u32,
     pub height: u32,
-    /// Whether frames are coded as complementary field pairs, which is what the
-    /// H.264 side represents as macroblock-adaptive frame/field coding and
-    /// declares in the SPS.
-    pub mbaff: bool,
+    /// Whether the sequence is interlaced, so that its frames may be coded as
+    /// complementary field pairs.
+    pub interlaced: bool,
     pub sample_aspect_ratio: Option<SampleAspectRatio>,
 }
 
@@ -222,7 +218,7 @@ pub fn picture_sequence_description(picture: &Picture) -> SequenceDescription {
     SequenceDescription {
         width: picture.sequence.horizontal_size,
         height: picture.sequence.vertical_size,
-        mbaff: !picture.sequence_ext.progressive_sequence,
+        interlaced: !picture.sequence_ext.progressive_sequence,
         sample_aspect_ratio: sequence_sample_aspect_ratio(&picture.sequence),
     }
 }
@@ -272,7 +268,7 @@ pub fn stream_sequence_description(data: &[u8]) -> Option<SequenceDescription> {
                 return Some(SequenceDescription {
                     width: sequence.horizontal_size,
                     height: sequence.vertical_size,
-                    mbaff: !progressive_sequence,
+                    interlaced: !progressive_sequence,
                     sample_aspect_ratio: sequence_sample_aspect_ratio(&sequence),
                 });
             }
@@ -387,62 +383,6 @@ pub struct Picture {
     /// `None` when the sequence carries no colour description.
     pub matrix_coefficients: Option<u8>,
     pub slices: Vec<Slice>,
-    /// Byte range of the sequence-level headers standing in front of this
-    /// picture: from its sequence header to one past the last thing that
-    /// changed the description, which is the sequence extension, the sequence
-    /// display extension and any quantiser matrix extension that arrived
-    /// before it.
-    ///
-    /// This is what a converter has to put in front of the picture's own bytes
-    /// for a fresh parse to describe it the way this walk did. Normally it is
-    /// the block a sequence opens with, a hundred-odd bytes holding no picture
-    /// at all. A stream that changes its quantiser matrices part way through a
-    /// sequence stretches the range over the pictures in between, which is why
-    /// a reader takes the last picture of a prefixed stream rather than the
-    /// first.
-    pub context_start: usize,
-    pub context_end: usize,
-}
-
-/// Derived, ready-to-use view of the picture geometry.
-#[derive(Clone, Copy, Debug)]
-pub struct PictureGeometry {
-    pub width: u32,
-    pub height: u32,
-    pub mb_width: usize,
-    pub mb_height: usize,
-    pub frame_mb_height: usize,
-    pub is_field_picture: bool,
-}
-
-pub fn picture_geometry(pic: &Picture) -> PictureGeometry {
-    let width = pic.sequence.horizontal_size;
-    let height = pic.sequence.vertical_size;
-    let mb_width = ((width + 15) >> 4) as usize;
-    // Field pictures code half the macroblock rows.
-    let frame_mb_height = ((height + 15) >> 4) as usize;
-    let is_field_picture = pic.coding.picture_structure != PictureStructure::Frame;
-    let mb_height = if is_field_picture {
-        ((height + 31) >> 5) as usize
-    } else {
-        frame_mb_height
-    };
-    PictureGeometry {
-        width,
-        height,
-        mb_width,
-        mb_height,
-        frame_mb_height,
-        is_field_picture,
-    }
-}
-
-pub fn scan_table(pic: &Picture) -> &'static [usize; 64] {
-    if pic.coding.alternate_scan {
-        &ALTERNATE_SCAN
-    } else {
-        &ZIGZAG_SCAN
-    }
 }
 
 /// Quantiser matrices are transmitted in scan order; store them in raster order.
@@ -605,8 +545,7 @@ fn read_picture_coding_extension(r: &mut BitReader<'_>) -> PictureCodingExtensio
 /// Parse a full MPEG-2 elementary stream into pictures.
 ///
 /// Slices are recorded as bit ranges rather than being decoded here: the
-/// macroblock layer is re-coded rather than reconstructed, so it is handled by a
-/// separate pass that can run per-slice.
+/// macroblock layer is handled by a separate pass that can run per-slice.
 pub fn parse_elementary_stream(data: &[u8]) -> Result<Vec<Picture>> {
     let codes = find_start_codes(data);
     let mut pictures: Vec<Picture> = Vec::new();
@@ -617,13 +556,8 @@ pub fn parse_elementary_stream(data: &[u8]) -> Result<Vec<Picture>> {
     let mut matrix_coefficients: Option<u8> = None;
     let mut current: Option<usize> = None;
     let mut saw_gop_header = false;
-    // The sequence description in hand: where its header starts, and one past
-    // the last thing that changed it. Recorded on each picture so that one
-    // picture can be re-parsed on its own; see [`Picture::context_start`].
-    let mut context_start = 0;
-    let mut context_end = 0;
 
-    for (position, sc) in codes.iter().enumerate() {
+    for sc in &codes {
         // A start code terminates whatever slice was in progress.
         if let Some(index) = current {
             if let Some(last) = pictures[index].slices.last_mut() {
@@ -634,10 +568,6 @@ pub fn parse_elementary_stream(data: &[u8]) -> Result<Vec<Picture>> {
         }
 
         let mut r = BitReader::at_bit(data, sc.payload_offset * 8);
-        // Where this header stops, which is where the next one starts.
-        let ends_at = codes
-            .get(position + 1)
-            .map_or(data.len(), |next| next.offset);
 
         if sc.code == start_code::SEQUENCE_HEADER {
             let (header, matrices) = read_sequence_header(&mut r)?;
@@ -645,22 +575,17 @@ pub fn parse_elementary_stream(data: &[u8]) -> Result<Vec<Picture>> {
             quant = matrices;
             seq_ext = None;
             matrix_coefficients = None;
-            context_start = sc.offset;
-            context_end = ends_at;
         } else if sc.code == start_code::EXTENSION {
             let id = r.u(4);
             if id == extension::SEQUENCE {
                 if let Some(header) = seq.as_mut() {
                     seq_ext = Some(read_sequence_extension(&mut r, header)?);
-                    context_end = ends_at;
                 }
             } else if id == extension::SEQUENCE_DISPLAY {
                 if seq.is_some() {
                     matrix_coefficients = read_sequence_display_matrix(&mut r);
-                    context_end = ends_at;
                 }
             } else if id == extension::QUANT_MATRIX {
-                context_end = ends_at;
                 // Applies from the next picture onwards; the already-emitted
                 // pictures keep the matrices they were coded with, which value
                 // semantics give for free.
@@ -694,8 +619,6 @@ pub fn parse_elementary_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 quant: quant.clone(),
                 matrix_coefficients,
                 slices: Vec::new(),
-                context_start,
-                context_end,
             });
             saw_gop_header = false;
             current = Some(pictures.len() - 1);

@@ -24,10 +24,15 @@ const fs = require("node:fs");
 const crypto = require("node:crypto");
 const { performance } = require("node:perf_hooks");
 
-const [inputPath, roundsArg, ...specs] = process.argv.slice(2);
-if (!inputPath || !roundsArg || specs.length < 1) {
+const [inputPath, roundsArg, video, ...specs] = process.argv.slice(2);
+if (
+  !inputPath ||
+  !roundsArg ||
+  (video !== "passthrough" && video !== "decode") ||
+  specs.length < 1
+) {
   console.error(
-    "usage: node tools/compare-wasm.cjs INPUT ROUNDS NAME=BINDINGS [NAME=BINDINGS ...]",
+    "usage: node tools/compare-wasm.cjs INPUT ROUNDS passthrough|decode NAME=BINDINGS [NAME=BINDINGS ...]",
   );
   process.exit(2);
 }
@@ -48,7 +53,13 @@ const CHUNK = 1 << 20;
 
 function run(bindings) {
   const { Session } = require(bindings);
-  const session = new Session();
+  const session = new Session(
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    video,
+  );
   const hash = crypto.createHash("sha256");
   let videoSamples = 0;
   const started = performance.now();
@@ -56,6 +67,8 @@ function run(bindings) {
     for (const fragment of fragments) {
       hash.update(fragment.data);
       if (fragment.kind === "media") videoSamples += fragment.videoSamples;
+      // Decode mode hands the pictures out as units, which carry no samples.
+      if (fragment.kind === "video") videoSamples += fragment.pictures.length;
     }
   };
   for (let at = 0; at < input.length; at += CHUNK) {
@@ -91,7 +104,9 @@ for (let round = 0; round < rounds; round += 1) {
 const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
 const base = mean(times.get(builds[0].name));
 console.log();
-console.log(`${input.length} bytes, ${videoSamples} video samples`);
+console.log(
+  `${input.length} bytes, ${videoSamples} video ${video === "decode" ? "pictures" : "samples"}`,
+);
 for (const build of builds) {
   const ms = mean(times.get(build.name));
   console.log(

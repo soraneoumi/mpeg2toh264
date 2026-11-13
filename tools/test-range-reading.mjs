@@ -5,7 +5,7 @@ import { createServer } from "vite";
 
 // Execute the production read loop, not a duplicate of the EOF decision.
 // Only transport/queue notifications are simulated; conversion is outside
-// this test and remains covered by the transcoder and MSE suites.
+// this test and remains covered by the decode-mode and MSE suites.
 const source = fs.readFileSync("packages/player/src/worker.ts", "utf8");
 const tree = ts.createSourceFile(
   "worker.ts",
@@ -54,7 +54,7 @@ try {
     "isRangeExhaustion",
     "withRangeContext",
     "INPUT_QUEUE_HIGH_WATER_BYTES",
-    "MAX_TRANSCODE_CHUNK_BYTES",
+    "MAX_PACKAGE_CHUNK_BYTES",
     "post",
     "mark",
     `${js}; return Reader;`,

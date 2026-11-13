@@ -60,7 +60,7 @@ async function fixture(t, moz = true, playbackRate = 1, pictures = undefined) {
   globalThis.HTMLVideoElement = Video;
   const video = new Video();
   video.playbackRate = playbackRate;
-  const frames = new VideoFrames(video, undefined, pictures?.(video));
+  const frames = new VideoFrames(video, pictures?.(video));
   t.after(() => {
     frames.destroy();
     globalThis.HTMLVideoElement = previous;

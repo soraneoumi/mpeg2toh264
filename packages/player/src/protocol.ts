@@ -75,7 +75,7 @@ export const TAIL_PROBE_BYTES = 1 << 20;
  * A transport stream carries a PES header every picture, so the answer is in
  * the first few kilobytes; this is sized for the gap between them in a stream
  * whose video has stopped for a moment, and it is small enough that spending
- * several of them still costs less than transcoding a second of video.
+ * several of them still costs less than packaging a second of video.
  */
 export const SEEK_PROBE_BYTES = 128 * 1024;
 
@@ -106,12 +106,12 @@ export const PICTURE_NEED_AHEAD_SECONDS = 0.3;
 export type SinkKind = "worker" | "main";
 
 /**
- * What becomes of the pictures. `transcode` converts them to H.264 and
- * `passthrough` carries the MPEG-2 into the MP4; `decode` decodes them in
- * the worker for a deinterlacer that takes decoded pictures, and the MP4
- * carries the sound alone.
+ * What becomes of the pictures. `passthrough` carries the MPEG-2 into the MP4
+ * for the browser to decode; `decode` decodes them in the worker for a
+ * deinterlacer that takes decoded pictures, and the MP4 carries the sound
+ * alone.
  */
-export type VideoMode = "transcode" | "passthrough" | "decode";
+export type VideoMode = "passthrough" | "decode";
 
 /**
  * One decoded picture, as a deinterlacer's `decodedVideo.push` takes it.
@@ -141,9 +141,8 @@ export interface DecodedPicture {
 /**
  * How the source pictures were captured, as the MPEG-2 headers said.
  *
- * This is the one thing about the picture that the conversion cannot carry:
- * H.264 is decoded into frames, and a frame holding two moments is not
- * distinguishable from one holding a single moment once it has been decoded.
+ * A picture does not say this once it has been decoded into a frame: a frame
+ * holding two moments is not distinguishable from one holding a single moment.
  * A player that deinterlaces has to be told, and this is the telling -- which
  * lines to keep, and whether to filter at all.
  *
@@ -196,10 +195,9 @@ export interface LoadCommand {
   url: string;
   /** Where the `.wasm` is, or null to take the copy next to the worker. */
   wasmUrl: string | null;
-  oversample: number | undefined;
   recoveryInterval: number | undefined;
-  openGopRecovery: "idr" | "recovery-point" | "discard" | undefined;
-  /** Give each field of a complementary pair its own MP4 sample. */
+  openGopRecovery: "recovery-point" | "discard" | undefined;
+  /** Give each field of a complementary pair its own MP4 sample. Passthrough only. */
   splitFieldSamples: boolean | undefined;
   /**
    * Steps of 2^(1/4) to raise the sound by, for up to two channels and for
@@ -209,27 +207,12 @@ export interface LoadCommand {
   surroundAudioGainSteps: number;
   video: VideoMode;
   /**
-   * How many workers convert pictures alongside the one that owns the session.
-   *
-   * A group of pictures divides into frames that have nothing to say to each
-   * other, so they can be converted at once; what cannot be divided is under a
-   * tenth of the work. Undefined sizes it from `hardwareConcurrency`, and 1
-   * converts them in the session's own worker as it always did.
-   *
-   * The output does not depend on this. Where a worker cannot spawn workers
-   * the pool is quietly not there, and the `workers` notification says what
-   * was settled on.
-   */
-  pictureWorkers: number | undefined;
-  /**
    * Which service to convert, out of a transport stream that carries more than
    * one. Null takes the first that turns up with a picture in it, which is
    * what a recording of a single programme has anyway.
    */
   serviceId: number | null;
   sink: SinkKind;
-  /** Also forward compressed video to a filter that decodes its own input before presentation. Never with `decode`. */
-  encodedVideo: boolean;
   /**
    * Open a Managed Media Source where the browser has both. It reaches the
    * worker because either side may be the one holding the source.
@@ -287,7 +270,6 @@ export type Notification =
     }
   /** Open a `SourceBuffer` and append this. Main-sink loads only. */
   | { type: "open"; id: number; mimeCodec: string; data: ArrayBuffer }
-  | { type: "video-data"; id: number; data: ArrayBuffer | null }
   | {
       type: "video-config";
       id: number;
@@ -350,11 +332,6 @@ export type Notification =
    */
   | { type: "services"; id: number; services: Services }
   /**
-   * How many picture workers came up, which is zero where this browser would
-   * not have them and the conversion runs in one worker as before.
-   */
-  | { type: "workers"; id: number; pictureWorkers: number }
-  /**
    * What sound the programme is carrying and which of it is being taken. Sent
    * once the program map has been read, and again whenever either changes --
    * including when the change is the viewer's own.
@@ -388,7 +365,7 @@ export type TimingMark =
   | "response"
   /** The first slice of the input has been read. */
   | "first-byte"
-  /** The transcoder has produced a fragment: the first picture is converted. */
+  /** The session has produced a fragment: the first picture is packaged. */
   | "first-fragment"
   /** The initialization segment has reached the sink; the stream is open. */
   | "opened"
@@ -440,7 +417,7 @@ export interface Stats {
   /**
    * Where the read loop's wall time went since the last report, in
    * milliseconds. The three cover everything it does, so which one is large
-   * says which machine is the slow one: `converting` is this transcoder,
+   * says which machine is the slow one: `converting` is this packager,
    * `reading` is the network or the disk behind the URL, and `waiting` is Media
    * Source Extensions refusing more until it has appended what it has.
    *

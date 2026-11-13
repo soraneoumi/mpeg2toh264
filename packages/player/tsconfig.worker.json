@@ -5,13 +5,10 @@
   },
   "include": [
     "src/worker.ts",
-    "src/picture-worker.ts",
-    "src/pool.ts",
-    "src/transcoder.ts",
+    "src/packager.ts",
     "src/source.ts",
     "src/mse.ts",
     "src/protocol.ts",
-    "src/worker-mse.d.ts",
-    "src/worker-modules.d.ts"
+    "src/worker-mse.d.ts"
   ]
 }

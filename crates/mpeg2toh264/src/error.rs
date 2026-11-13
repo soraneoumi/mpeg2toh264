@@ -1,10 +1,12 @@
 use std::fmt;
 
-/// Anything that stops a transcode, carrying the message the caller sees.
+/// Anything that stops a session or a decode, carrying the message the caller
+/// sees.
 ///
 /// The failures here are all "this stream is not something we can handle".
 /// One of them a caller acts on: a stream without AAC sound cannot be played
-/// in decode mode but can be transcoded, so that one can be told apart.
+/// in decode mode but can be carried through in passthrough mode, so that one
+/// can be told apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
     message: String,

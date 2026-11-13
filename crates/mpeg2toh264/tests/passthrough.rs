@@ -1,28 +1,27 @@
-//! Carrying the MPEG-2 video through to the MP4 instead of converting it.
+//! Carrying the MPEG-2 video through to the MP4 as it stands.
 //!
 //! The point of this path is that nothing happens to the picture, so that is
 //! what these check: the bytes that come out are the bytes that went in, cut
-//! into the same access units the transcoding path would have coded, sitting at
-//! the same times on the same timeline.
+//! into one sample per picture and sitting at the times the timeline gives
+//! them.
 
 mod support;
 
 use std::collections::HashMap;
 
-use mpeg2toh264::mpeg2::headers::parse_elementary_stream;
-use mpeg2toh264::{
-    mpeg2_passthrough_unit, mpeg2_to_fmp4, Fragment, Session, TranscodeOptions, VideoMode,
+use mpeg2toh264::mpeg2::headers::{
+    parse_elementary_stream, picture_sequence_description, pictures_interlacing,
+    stream_sequence_description,
 };
-use support::{fnv1a, read_fixture, wrap_mpeg2_es_in_ts, FIXTURES};
+use mpeg2toh264::{
+    mpeg2_passthrough_unit, mpeg2_to_fmp4, mpeg2_video_timeline, Fragment, Session, SessionOptions,
+};
+use support::{
+    fnv1a, non_intra_matrix_extension, passthrough, read_fixture, with_extension_in_pictures,
+    wrap_mpeg2_es_in_ts, FIXTURES,
+};
 
-fn passthrough_options() -> TranscodeOptions {
-    TranscodeOptions {
-        video: VideoMode::Passthrough,
-        ..TranscodeOptions::default()
-    }
-}
-
-fn run_session(stream: &[u8], options: TranscodeOptions) -> Vec<Fragment> {
+fn run_session(stream: &[u8], options: SessionOptions) -> Vec<Fragment> {
     let mut session = Session::new(options);
     let mut fragments = Vec::new();
     for chunk in stream.chunks(64 * 1024) {
@@ -59,13 +58,6 @@ fn media_bytes(fragments: &[Fragment]) -> Vec<u8> {
         }
     }
     out
-}
-
-fn media_only(fragments: &[Fragment]) -> Vec<&Fragment> {
-    fragments
-        .iter()
-        .filter(|f| matches!(f, Fragment::Media { .. }))
-        .collect()
 }
 
 // ------------------------------------------------------------ the whole unit
@@ -130,7 +122,7 @@ fn carries_the_source_bytes_unchanged() {
 fn describes_the_video_as_mpeg_2_with_its_sequence_header() {
     let source = read_fixture("ibbp.m2v");
     let unit = mpeg2_passthrough_unit(&source, false).expect("passthrough unit");
-    let mp4 = mpeg2_to_fmp4(&source, &unit).expect("mp4 packaging");
+    let mp4 = mpeg2_to_fmp4(&source, &unit);
 
     assert_eq!(
         mp4.mime_codec, "video/mp4; codecs=\"mp4v.61\"",
@@ -145,10 +137,6 @@ fn describes_the_video_as_mpeg_2_with_its_sequence_header() {
         mp4.init_segment.windows(4).any(|w| w == b"esds"),
         "which carries its decoder configuration in an esds"
     );
-    assert!(
-        !mp4.init_segment.windows(4).any(|w| w == b"avcC"),
-        "and nothing about H.264"
-    );
     // The decoder specific info is the sequence header the unit opens with.
     let sequence_header = &source[..unit.sequence_header_len];
     assert!(
@@ -158,6 +146,142 @@ fn describes_the_video_as_mpeg_2_with_its_sequence_header() {
         "the esds does not hold the sequence header"
     );
     assert_eq!(mp4.sample_count, unit.samples.len());
+}
+
+#[test]
+fn packages_each_fixture_as_a_fragmented_mp4() {
+    for name in FIXTURES {
+        let source = read_fixture(name);
+        let unit = mpeg2_passthrough_unit(&source, false).expect("passthrough unit");
+        let mp4 = mpeg2_to_fmp4(&source, &unit);
+
+        assert_eq!(
+            &mp4.init_segment[4..8],
+            b"ftyp",
+            "{name} init is not an MP4"
+        );
+        assert!(
+            mp4.init_segment.windows(4).any(|w| w == b"moov"),
+            "{name} init has no moov"
+        );
+        assert_eq!(
+            &mp4.media_segment[4..8],
+            b"moof",
+            "{name} media segment is not a fragment"
+        );
+        assert!(mp4.mime_codec.starts_with("video/mp4; codecs=\"mp4v.61"));
+        assert_eq!(
+            mp4.sample_count,
+            unit.timeline.presentation_indices.len(),
+            "{name} sample count"
+        );
+    }
+}
+
+#[test]
+fn reading_the_description_from_the_headers_agrees_with_the_parse() {
+    // A unit is packaged before it is planned, so what the muxer is told about
+    // a unit comes from the headers walk and which of its pictures are kept
+    // comes from the parse. The two answering differently is what would leave
+    // a fragment describing a unit its pictures do not belong to.
+    for name in FIXTURES {
+        let source = read_fixture(name);
+        let pictures = parse_elementary_stream(&source).expect("fixture parses");
+        assert_eq!(
+            stream_sequence_description(&source),
+            Some(picture_sequence_description(&pictures[0])),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_unit_carrying_two_descriptions_keeps_only_the_pictures_of_the_one_it_opens_with() {
+    // A unit is described by the sequence header it opens with, and the group
+    // splitter cuts where that changes. Handed the two in one piece anyway --
+    // an elementary stream carried in one call, or the tail of a recording that
+    // had no group header left to cut on -- the pictures coded under the other
+    // description are dropped rather than carried under a description that
+    // does not fit them.
+    let first = read_fixture("ibbp.m2v");
+    let second = read_fixture("hd1080i.m2v");
+    let combined = [first.as_slice(), second.as_slice()].concat();
+
+    let alone = mpeg2_passthrough_unit(&first, false).expect("one description");
+    let both = mpeg2_passthrough_unit(&combined, false).expect("two descriptions");
+    assert_eq!(
+        both.timeline.presentation_indices, alone.timeline.presentation_indices,
+        "the second description contributes no picture"
+    );
+    assert_eq!(both.samples, alone.samples);
+}
+
+#[test]
+fn a_matrix_that_changes_within_a_unit_drops_no_picture() {
+    // Some broadcast encoders adapt the quantiser matrices picture by picture,
+    // several times within one group. The matrices are not part of what
+    // describes a unit, so the pictures behind the change are kept rather than
+    // dropped for disagreeing with it -- which would leave a recording playing
+    // at the two frames a second its groups opened with.
+    let source = read_fixture("ibbp.m2v");
+    let plain = mpeg2_passthrough_unit(&source, false).expect("passthrough unit");
+    let pictures: Vec<usize> = (1..15).collect();
+    let adapted =
+        with_extension_in_pictures(&source, &pictures, &non_intra_matrix_extension(&[24u8; 64]));
+    let unit = mpeg2_passthrough_unit(&adapted, false).expect("passthrough unit");
+
+    assert_eq!(
+        unit.timeline.presentation_indices, plain.timeline.presentation_indices,
+        "a picture coded under another matrix is still kept"
+    );
+    assert_eq!(unit.samples.len(), plain.samples.len());
+}
+
+/// fixture, interlaced, top field first. Checked against what ffprobe reports
+/// for the same files: `tt` for hd1080i, `bb` for altscan, progressive for the
+/// rest. A player has no other way to learn this -- a frame of two moments
+/// looks like one of one -- so getting it wrong deinterlaces a progressive
+/// picture, or moves an interlaced one half a field the wrong way.
+const SCAN: [(&str, bool, bool); 6] = [
+    ("altscan.m2v", true, false),
+    ("escape.m2v", false, true),
+    ("hd1080i.m2v", true, true),
+    ("i_only.m2v", false, true),
+    ("ibbp.m2v", false, true),
+    ("ip.m2v", false, true),
+];
+
+#[test]
+fn reads_the_field_order_of_every_fixture() {
+    for &(name, interlaced, top_field_first) in &SCAN {
+        let source = read_fixture(name);
+        let pictures = parse_elementary_stream(&source).expect("parse");
+        let interlacing = pictures_interlacing(&pictures);
+        assert_eq!(interlacing.interlaced, interlaced, "{name} interlaced");
+        if interlaced {
+            assert_eq!(
+                interlacing.top_field_first, top_field_first,
+                "{name} top field first"
+            );
+        }
+        // The first retained picture is what a player applies when playback
+        // enters the fixture; later pictures carry their own scan separately.
+        let timeline = mpeg2_video_timeline(&source, false).expect("timeline");
+        let first = timeline.sample_scans.first().expect("picture scan");
+        assert_eq!(first.interlaced, interlaced, "{name} timeline interlaced");
+        if interlaced {
+            assert_eq!(
+                first.top_field_first, top_field_first,
+                "{name} timeline top field first"
+            );
+        }
+    }
+}
+
+#[test]
+fn rejects_a_stream_with_no_pictures() {
+    let error = mpeg2_passthrough_unit(&[0u8; 16], false).expect_err("must fail");
+    assert!(error.to_string().contains("no MPEG-2 pictures"));
 }
 
 // ---------------------------------------------------------------- a session
@@ -173,10 +297,7 @@ fn video_only_stream(copies: usize, continuity: &mut HashMap<u16, u8>) -> Vec<u8
 
 #[test]
 fn a_passthrough_session_says_it_carries_mpeg_2() {
-    let fragments = run_session(
-        &video_only_stream(3, &mut HashMap::new()),
-        passthrough_options(),
-    );
+    let fragments = run_session(&video_only_stream(3, &mut HashMap::new()), passthrough());
     let Some(Fragment::Init {
         data, mime_codec, ..
     }) = fragments.first()
@@ -198,7 +319,7 @@ fn a_passthrough_session_says_it_carries_mpeg_2() {
 #[test]
 fn a_session_carries_the_source_pictures_end_to_end() {
     let stream = video_only_stream(3, &mut HashMap::new());
-    let fragments = run_session(&stream, passthrough_options());
+    let fragments = run_session(&stream, passthrough());
     let carried = media_bytes(&fragments);
 
     let pictures = parse_elementary_stream(&carried).expect("the samples parse as MPEG-2");
@@ -221,89 +342,10 @@ fn a_session_carries_the_source_pictures_end_to_end() {
 }
 
 #[test]
-fn both_paths_place_the_same_pictures_on_the_same_timeline() {
-    // The invariant the two paths share: they accept and drop exactly the same
-    // source pictures, and put what they keep at the same times. A fragment
-    // that disagreed would drift against the audio track beside it.
-    let stream = video_only_stream(26, &mut HashMap::new());
-    let transcoded = run_session(&stream, TranscodeOptions::default());
-    let carried = run_session(&stream, passthrough_options());
-    let transcoded = media_only(&transcoded);
-    let carried = media_only(&carried);
-    assert_eq!(transcoded.len(), carried.len(), "fragment count");
-
-    let mut opening_clones = 0i64;
-    for (index, (left, right)) in transcoded.iter().zip(carried.iter()).enumerate() {
-        let (
-            Fragment::Media {
-                start: transcoded_start,
-                random_access: transcoded_restart,
-                video_samples: transcoded_samples,
-                scans: transcoded_scans,
-                ..
-            },
-            Fragment::Media {
-                start: carried_start,
-                random_access: carried_restart,
-                video_samples: carried_samples,
-                scans: carried_scans,
-                ..
-            },
-        ) = (left, right)
-        else {
-            unreachable!()
-        };
-        // A closed group of pictures leaves the transcoder's IDR clone no
-        // display slot to fill, and a sample of no duration is not something
-        // to hand a parser, so it takes one tick. Passthrough adds no sample
-        // and so takes none. That is the whole of the difference between the
-        // two timelines, and only the opening fragment has an IDR in it: a
-        // single 90 kHz tick, or eleven microseconds over the whole stream.
-        let ticks = |seconds: &f64| (seconds * 90_000.0).round() as i64;
-        let drift = ticks(transcoded_start) - ticks(carried_start);
-        assert!(
-            (0..=opening_clones).contains(&drift),
-            "fragment {index} starts {drift} ticks from the transcoded one"
-        );
-        assert_eq!(
-            transcoded_restart, carried_restart,
-            "fragment {index} restart point"
-        );
-        assert_eq!(
-            transcoded_scans.len(),
-            carried_scans.len(),
-            "fragment {index} scan count"
-        );
-        for (transcoded, carried) in transcoded_scans.iter().zip(carried_scans) {
-            assert_eq!(transcoded.scan, carried.scan);
-            assert!(
-                (0..=opening_clones).contains(&(ticks(&transcoded.start) - ticks(&carried.start))),
-                "fragment {index} scan time"
-            );
-        }
-        // The fragment that opens the presentation is the one the transcoder
-        // adds a copy of its IDR to, to hang the flat prediction on.
-        // Passthrough needs neither the opening reference clone nor the IDR
-        // and reference clone at a periodic recovery boundary.
-        let opening_clone = usize::from(index == 0);
-        let recovery_copies = 2 * usize::from(index != 0 && *transcoded_restart);
-        opening_clones += opening_clone as i64;
-        assert_eq!(
-            *transcoded_samples,
-            carried_samples + opening_clone + recovery_copies,
-            "fragment {index} sample count"
-        );
-    }
-}
-
-#[test]
 fn a_restart_point_opens_with_a_sequence_header() {
     // A player evicting what it has shown cuts back to a restart point, so the
     // sample there has to be one a decoder can be handed cold.
-    let fragments = run_session(
-        &video_only_stream(26, &mut HashMap::new()),
-        passthrough_options(),
-    );
+    let fragments = run_session(&video_only_stream(26, &mut HashMap::new()), passthrough());
     let mut restarts = 0;
     for fragment in &fragments {
         let Fragment::Media {
@@ -329,8 +371,8 @@ fn a_restart_point_opens_with_a_sequence_header() {
 
 #[test]
 fn a_passthrough_session_muxes_the_aac_track_beside_it() {
-    // The audio path is the same on both, but the fragment is put together by
-    // different code, so the two trafs still have to arrive.
+    // The video and the sound are put into one fragment, so the two trafs
+    // have to arrive together.
     let stream = support::mux_transport_stream(
         &[
             (support::VIDEO_PID, support::STREAM_TYPE_MPEG2_VIDEO),
@@ -352,7 +394,7 @@ fn a_passthrough_session_muxes_the_aac_track_beside_it() {
         ],
         &mut HashMap::new(),
     );
-    let fragments = run_session(&stream, passthrough_options());
+    let fragments = run_session(&stream, passthrough());
     let Some(Fragment::Init { mime_codec, .. }) = fragments.first() else {
         panic!("the init segment comes first");
     };

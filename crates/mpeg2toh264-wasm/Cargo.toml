@@ -1,6 +1,6 @@
 [package]
 name = "mpeg2toh264-wasm"
-description = "WebAssembly bindings for the mpeg2toh264 streaming transcoder"
+description = "WebAssembly bindings for the mpeg2toh264 streaming packager and decoder"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -109,9 +109,9 @@
     <main>
       <header>
         <h1>mpeg2toh264 demo</h1>
-        <p>MPEG-2 TSに含まれるMPEG-2をブラウザ内でH.264へ変換し再生するデモ</p>
+        <p>MPEG-2 TSをブラウザ内で再生するデモ</p>
         <p><a href="https://github.com/otya128/mpeg2toh264">https://github.com/otya128/mpeg2toh264</a></p>
-        <p>一般的なトランスコーダーではMPEG-2をデコードしてH.264エンコーダーで1からエンコードするという処理を行いますが、この実装はMPEG-2が持つ量子化係数、マクロブロック種別、動きベクトル、ピクチャ参照関係を再利用し、動き補償などの処理を行わずに対応するH.264のビットストリームへ直接変換します。</p>
+        <p>映像のMPEG-2はWebAssemblyでデコードしてWebGLのデインタレースへ渡し、音声はMSEで再生します。デコードできない場合は、MPEG-2を変更せずにMP4へ入れてブラウザーのデコーダーで再生するパススルーを使えます。</p>
       </header>
       <section>
         <div id="stage">
@@ -180,16 +180,6 @@
           <option value="managed-worker">ManagedMediaSource (Worker)</option>
           <option value="managed-main">ManagedMediaSource (メイン)</option>
         </select>
-        <label for="oversample">oversample</label>
-        <input id="oversample" type="number" min="0.1" step="0.1" value="2" />
-        <label for="picture-workers">変換ワーカー数</label>
-        <input
-          id="picture-workers"
-          type="number"
-          min="1"
-          step="1"
-          placeholder="自動"
-        />
         <label for="recovery-interval">リカバリー間隔 (GOP数)</label>
         <input
           id="recovery-interval"
@@ -204,7 +194,7 @@
           <li>
             <label>
               <input id="passthrough" type="checkbox" />
-              MPEG-2のまま再生 (変換せずremux、MPEG-2を再生できるSafariなど)
+              デコードできない場合にMPEG-2のまま再生 (MPEG-2を再生できるSafariなど)
             </label>
           </li>
           <li>
@@ -234,7 +224,7 @@
           <li>
             <label>
               <input id="split-field-samples" type="checkbox" checked />
-              フィールドを別サンプルに分割
+              フィールドを別サンプルに分割 (パススルー時)
               (無効にするとフレームピクチャとフィールドピクチャが混在する場合にWindows版Firefoxでは映像がフリーズしSafariではデコードエラーで再生が止まる)
             </label>
           </li>

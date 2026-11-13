@@ -1,16 +1,15 @@
-//! Packaging this transcoder's Annex B output as a fragmented MP4.
+//! Packaging MPEG-2 video and AAC sound as fragmented MP4.
 
 use crate::container::adts::{AacConfig, AAC_FRAME_SAMPLES};
 use crate::container::rff::{display_timing, frame_rate, is_film_repeat, supports_film, RffState};
 use crate::error::{bail, Result};
-use crate::h264::bitwriter::next_zero;
 use crate::mpeg2::constants::{start_code, PictureStructure, PictureType, FRAME_RATE};
 use crate::mpeg2::headers::{
     parse_elementary_stream, picture_sequence_description, sequence_sample_aspect_ratio,
     Interlacing, Picture, SampleAspectRatio,
 };
 use crate::round_half_up;
-use crate::TranscodeOptions;
+use crate::session::DEFAULT_SPLIT_FIELD_SAMPLES;
 
 const TIMESCALE: u32 = 90_000;
 
@@ -92,72 +91,18 @@ fn concat(parts: &[&[u8]]) -> Vec<u8> {
     out
 }
 
-/// Split an Annex B byte stream into its NAL units, dropping the start codes.
-fn split_annex_b(data: &[u8]) -> Vec<&[u8]> {
-    let mut starts: Vec<(usize, usize)> = Vec::new();
-    let mut i = 0;
-    // A start code begins with two zeros, so everything up to the next zero
-    // byte is skipped a word at a time and only a zero is looked at closely.
-    while i + 3 < data.len() {
-        let zero = next_zero(data, i);
-        if zero + 3 >= data.len() {
-            break;
-        }
-        if data[zero + 1] != 0 {
-            i = zero + 2;
-        } else if data[zero + 2] == 1 {
-            starts.push((zero, 3));
-            i = zero + 3;
-        } else if data[zero + 2] == 0 && data[zero + 3] == 1 {
-            starts.push((zero, 4));
-            i = zero + 4;
-        } else {
-            i = zero + 1;
-        }
-    }
-    let mut nals = Vec::with_capacity(starts.len());
-    for (index, &(at, length)) in starts.iter().enumerate() {
-        let start = at + length;
-        let end = starts.get(index + 1).map_or(data.len(), |next| next.0);
-        if end > start {
-            nals.push(&data[start..end]);
-        }
-    }
-    nals
-}
-
 type VideoSample<'a> = Vec<&'a [u8]>;
 
-/// The video samples of one fragment, and how the sample entry says to read
-/// them.
-///
-/// Two shapes reach the same `mdat`: AVC, whose access units are NAL units the
-/// `avcC` says are length-prefixed, and MPEG-2 carried through untouched, whose
+/// The video samples of one fragment: MPEG-2 carried through untouched, whose
 /// samples are elementary stream bytes with their own start codes. Everything
 /// downstream needs is a size and a way to write, so that is what this is.
 struct VideoPayload<'a> {
     samples: Vec<VideoSample<'a>>,
-    length_prefixed: bool,
 }
 
 impl<'a> VideoPayload<'a> {
-    /// AVC access units, with anything belonging ahead of the first sample --
-    /// parameter-set-adjacent SEI -- prepended to it.
-    fn avc(mut samples: Vec<VideoSample<'a>>, prefixes: &[&'a [u8]]) -> Self {
-        if let Some(first) = samples.first_mut() {
-            first.splice(0..0, prefixes.iter().copied());
-        }
-        Self {
-            samples,
-            length_prefixed: true,
-        }
-    }
-
     fn mpeg2(samples: Vec<VideoSample<'a>>) -> Self {
-        Self {
-            samples,
-            length_prefixed: false,
-        }
+        Self { samples }
     }
 
     fn len(&self) -> usize {
@@ -169,11 +114,7 @@ impl<'a> VideoPayload<'a> {
     }
 
     fn sample_bytes(&self, index: usize) -> usize {
-        let prefix = if self.length_prefixed { 4 } else { 0 };
-        self.samples[index]
-            .iter()
-            .map(|part| prefix + part.len())
-            .sum()
+        self.samples[index].iter().map(|part| part.len()).sum()
     }
 
     fn total_bytes(&self) -> usize {
@@ -182,68 +123,9 @@ impl<'a> VideoPayload<'a> {
 
     fn write_sample(&self, index: usize, out: &mut Vec<u8>) {
         for part in &self.samples[index] {
-            if self.length_prefixed {
-                out.extend_from_slice(&(part.len() as u32).to_be_bytes());
-            }
             out.extend_from_slice(part);
         }
     }
-}
-
-/// Group VCL NAL units into access units. New streams carry AUDs so a PAFF
-/// field pair becomes one MP4 sample; accepting streams without AUDs preserves
-/// compatibility with callers that provide one VCL NAL per picture.
-fn video_samples<'a>(nals: &[&'a [u8]]) -> Vec<VideoSample<'a>> {
-    let has_aud = nals.iter().any(|nal| nal[0] & 0x1f == 9);
-    if !has_aud {
-        return nals
-            .iter()
-            .filter(|nal| matches!(nal[0] & 0x1f, 1 | 5))
-            .map(|&nal| vec![nal])
-            .collect();
-    }
-    let mut samples = Vec::new();
-    let mut current = Vec::new();
-    for &nal in nals {
-        match nal[0] & 0x1f {
-            9 => {
-                if !current.is_empty() {
-                    samples.push(std::mem::take(&mut current));
-                }
-            }
-            1 | 5 => current.push(nal),
-            _ => {}
-        }
-    }
-    if !current.is_empty() {
-        samples.push(current);
-    }
-    samples
-}
-
-/// The access unit immediately following a recovery-point SEI.
-fn recovery_sample_index(nals: &[&[u8]]) -> Option<usize> {
-    let has_aud = nals.iter().any(|nal| nal[0] & 0x1f == 9);
-    let mut completed = 0usize;
-    let mut current_vcl = false;
-    for nal in nals {
-        match nal[0] & 0x1f {
-            9 if has_aud => {
-                completed += usize::from(current_vcl);
-                current_vcl = false;
-            }
-            1 | 5 => {
-                if !has_aud {
-                    completed += 1;
-                } else {
-                    current_vcl = true;
-                }
-            }
-            6 if nal.get(1) == Some(&6) => return Some(completed),
-            _ => {}
-        }
-    }
-    None
 }
 
 #[derive(Clone, Debug)]
@@ -264,19 +146,19 @@ pub struct Mpeg2VideoTimeline {
     /// Field metadata of each coded picture, parallel with
     /// `presentation_indices` and still in decode order.
     pub sample_scans: Vec<Interlacing>,
-    /// Presentation index for each coded picture, excluding the IDR clone.
+    /// Presentation index for each coded picture.
     pub presentation_indices: Vec<u32>,
     /// Whether each coded picture is a complementary field pair rather than a
     /// frame. Parallel with `presentation_indices`.
     pub field_pairs: Vec<bool>,
-    /// Whether the transcoder gave each field of a pair its own access unit,
-    /// which makes such a picture occupy two MP4 samples instead of one. Set by
-    /// the caller from [`TranscodeOptions::split_field_samples`]; parsing the
-    /// source cannot tell. [`mpeg2_video_timeline`] fills it in to match that
-    /// option's default, so a caller that transcodes with the defaults and
-    /// never touches this still counts the same samples the bitstream holds.
+    /// Whether each field of a pair has an MP4 sample of its own, which makes
+    /// such a picture occupy two samples instead of one. Set by the caller from
+    /// [`SessionOptions::split_field_samples`]; parsing the source cannot tell.
+    /// [`mpeg2_video_timeline`] fills it in to match that option's default, so
+    /// a caller that never touches this still counts the samples the default
+    /// packaging makes.
     ///
-    /// [`TranscodeOptions::split_field_samples`]: crate::TranscodeOptions::split_field_samples
+    /// [`SessionOptions::split_field_samples`]: crate::SessionOptions::split_field_samples
     pub split_field_samples: bool,
     pub sample_aspect_ratio: Option<SampleAspectRatio>,
     /// Extra ticks the unit's opening sample is held for, covering a hole
@@ -291,9 +173,9 @@ pub struct Mpeg2VideoTimeline {
     /// caller, which is the only one that knows where the unit before this
     /// ended; zero for a unit that follows without a break.
     ///
-    /// It goes to the sample that covers the unit's leading display slots -- an
-    /// IDR clone or the first picture -- so a caller that sets it asks for a
-    /// random access point as well.
+    /// It goes to the sample that covers the unit's leading display slots -- the
+    /// first picture -- so a caller that sets it asks for a random access point
+    /// as well.
     pub hold_ticks: u32,
     /// Extra ticks added to every composition offset of the unit, for a unit
     /// that continues a group whose earlier units left display slots empty.
@@ -350,8 +232,8 @@ impl Mpeg2VideoTimeline {
 /// A unit that begins between the two fields of a pair has only the second, and
 /// one that ends between them has only the first; a broadcast that loses a
 /// field leaves the same thing in the middle. None of the three can be made
-/// into a frame, so the odd field is dropped -- by the transcoder and by the
-/// timeline alike, which is why this decision lives in one place.
+/// into a frame, so the odd field is dropped -- by the timeline and by the
+/// decoder alike, which is why this decision lives in one place.
 pub fn complementary_field<'a>(
     candidate: Option<&'a Picture>,
     picture: &Picture,
@@ -411,35 +293,26 @@ pub struct Mpeg2Unit {
     pub sequence_header_len: usize,
 }
 
-/// Reproduce the transcoder's accepted-picture timeline in MP4 timescale units.
+/// Work out which pictures of a unit are kept, and when each is presented, in
+/// MP4 timescale units.
 ///
 /// `has_references` is set when the unit continues an already-populated decoded
-/// picture buffer, so its leading B pictures are codeable.
-///
-/// `undecodable`, indexed by source picture, names the pictures the transcoder
-/// found damaged. The timeline must reserve a sample for each picture the
-/// transcoder emits and no others, and this is how it is told which those are;
-/// an empty slice means none were, which is the ordinary case.
-pub fn mpeg2_video_timeline(
-    data: &[u8],
-    has_references: bool,
-    undecodable: &[bool],
-) -> Result<Mpeg2VideoTimeline> {
+/// picture buffer, so its leading B pictures can be decoded.
+pub fn mpeg2_video_timeline(data: &[u8], has_references: bool) -> Result<Mpeg2VideoTimeline> {
     Ok(
-        timed_mpeg2_unit(data, has_references, undecodable, RffState::default(), 0)?
+        timed_mpeg2_unit(data, has_references, RffState::default(), 0)?
             .unit
             .timeline,
     )
 }
 
-/// Cut a unit into the samples a passthrough MP4 carries, alongside the same
-/// timeline the transcoding path would build for it.
+/// Cut a unit into the samples a passthrough MP4 carries, alongside the
+/// timeline [`mpeg2_video_timeline`] builds for it.
 ///
-/// The pictures kept here are exactly the pictures the transcoder would code,
-/// bar the ones it drops for being undecodable: nothing is decoded on this
-/// path, and a damaged slice is the decoder's business rather than this one's.
+/// Nothing is decoded here, so every picture that has a slice is kept: a
+/// damaged slice is the decoder's business rather than this one's.
 pub fn mpeg2_passthrough_unit(data: &[u8], has_references: bool) -> Result<Mpeg2Unit> {
-    Ok(timed_mpeg2_unit(data, has_references, &[], RffState::default(), 0)?.unit)
+    Ok(timed_mpeg2_unit(data, has_references, RffState::default(), 0)?.unit)
 }
 
 /// Source-clock information kept alongside the public, retimed MP4 unit.
@@ -490,18 +363,17 @@ impl TimedUnit {
     }
 }
 
-/// Walk a unit's pictures, keeping exactly those the transcoder can emit.
-/// Parsing reserves their display slots even when a damaged or missing picture
-/// leaves one empty; retiming must not close up that hole.
+/// Walk a unit's pictures, keeping those a decoder can produce a frame from.
+/// Parsing reserves their display slots even when a missing picture leaves one
+/// empty; retiming must not close up that hole.
 ///
 /// `consumed` is how many display slots of its group earlier units have already
 /// covered, for a unit that continues one, and zero for one that opens its
 /// group. The unit's slots are counted from there, and a picture that belongs
-/// to a slot already covered is dropped: the transcoder does the same.
+/// to a slot already covered is dropped.
 pub(crate) fn timed_mpeg2_unit(
     data: &[u8],
     has_references: bool,
-    undecodable: &[bool],
     before: RffState,
     consumed: u32,
 ) -> Result<TimedUnit> {
@@ -535,9 +407,7 @@ pub(crate) fn timed_mpeg2_unit(
     // A unit that opens the decoded picture buffer can hold nothing until the
     // picture that opens it arrives, and only an I picture can. One that starts
     // part way through a group of pictures -- which is what a seek lands on --
-    // may have none, and then it holds nothing at all. The transcoder decides
-    // this the same way, and the two have to agree or the fragment claims
-    // samples the H.264 stream does not have.
+    // may have none, and then it holds nothing at all.
     let mut awaiting_intra = !has_references;
     let mut gop_base: u32 = 0;
     // The slots of the group in hand that are behind the unit, and how many the
@@ -569,16 +439,16 @@ pub(crate) fn timed_mpeg2_unit(
     };
     while picture_index < pictures.len() {
         let picture = &pictures[picture_index];
-        // Where this picture sits among the unit's own, which is how the
-        // transcoder names the ones it could not decode.
+        // Where this picture sits among the unit's own, which is how a sample
+        // names the picture it carries.
         let source_index = picture_index;
         let mut mate = None;
         let mut unpaired = false;
         if picture.coding.picture_structure != PictureStructure::Frame {
             match complementary_field(pictures.get(picture_index + 1), picture) {
-                // The transcoder combines complementary fields into one MBAFF
-                // frame, so they occupy one MP4 sample and advance reference
-                // state only once as well.
+                // Complementary fields make one frame, so they occupy one
+                // picture of the timeline and advance reference state only once
+                // as well.
                 Some(field_mate) => {
                     mate = Some(field_mate);
                     picture_index += 2;
@@ -608,8 +478,7 @@ pub(crate) fn timed_mpeg2_unit(
             slots_in_group = 0;
         }
         slots_in_group = slots_in_group.max(tr + 1);
-        // A slot an earlier unit covered is not given again. The transcoder
-        // drops the picture for the same reason.
+        // A slot an earlier unit covered is not given again.
         if tr < group_consumed {
             continue;
         }
@@ -627,23 +496,18 @@ pub(crate) fn timed_mpeg2_unit(
             2
         };
         repeats[presentation_index] = is_film_repeat(picture);
-        // A lone field is no frame, and the transcoder drops it for the same
-        // reason. Both have to, or the timeline reserves a sample the H.264
-        // stream does not hold.
+        // A lone field is no frame, so it is dropped.
         if unpaired {
             continue;
         }
         // Nor is a picture coded under a description other than the one this
-        // unit opens with: the parameter sets in front of it describe that one,
-        // and the transcoder drops it for the same reason.
+        // unit opens with: the initialization segment in front of it describes
+        // that one.
         if picture_sequence_description(picture) != description {
             continue;
         }
-        let kept = |index: usize, picture: &Picture| {
-            !picture.slices.is_empty() && !undecodable.get(index).copied().unwrap_or(false)
-        };
         let decodable =
-            kept(source_index, picture) && mate.is_none_or(|field| kept(source_index + 1, field));
+            !picture.slices.is_empty() && mate.is_none_or(|field| !field.slices.is_empty());
         if !decodable {
             continue;
         }
@@ -696,7 +560,7 @@ pub(crate) fn timed_mpeg2_unit(
             sample_scans,
             presentation_indices,
             field_pairs,
-            split_field_samples: TranscodeOptions::default().split_field_samples,
+            split_field_samples: DEFAULT_SPLIT_FIELD_SAMPLES,
             sample_aspect_ratio: sequence_sample_aspect_ratio(&first.sequence),
             hold_ticks: 0,
             lag_ticks: 0,
@@ -717,38 +581,6 @@ pub(crate) fn timed_mpeg2_unit(
     };
     timed.retime(before);
     Ok(timed)
-}
-
-/// How many MP4 samples the timeline's pictures occupy, before the IDR clone.
-/// One each, unless split field pairs are taking two.
-fn content_sample_count(timeline: &Mpeg2VideoTimeline) -> usize {
-    let pictures = timeline.presentation_indices.len();
-    let split_pairs = if timeline.split_field_samples {
-        (0..pictures)
-            .filter(|&at| timeline.is_field_pair(at))
-            .count()
-    } else {
-        0
-    };
-    pictures + split_pairs
-}
-
-/// Validate the samples synthesized around a random-access point and return
-/// how many timing entries they need. An ordinary IDR has one reference clone.
-/// Recovery in IDR mode has an IDR copy plus its clone; when that copied source
-/// picture is a split field pair, the IDR copy itself occupies two samples.
-fn recovery_extra_samples(
-    sample_count: usize,
-    content_samples: usize,
-    recovery_copy: bool,
-    split_field_samples: bool,
-) -> Option<usize> {
-    let extra = sample_count.checked_sub(content_samples)?;
-    if recovery_copy {
-        (extra == 2 || (split_field_samples && extra == 3)).then_some(extra)
-    } else {
-        (extra <= 1).then_some(extra)
-    }
 }
 
 /// Where a picture's coded data ends, which is the start code that terminated
@@ -801,124 +633,23 @@ pub struct SampleTiming {
     pub reorder_delay: i64,
 }
 
-/// Place the recovery copies of a unit's intra picture inside the display slot
-/// that picture has.
-///
-/// The picture, its IDR copy and the clone share the slot in thirds, in that
-/// order, so each is on screen for a stretch a display can show. A split field
-/// pair and its IDR copy take two samples each, which divide their third in
-/// halves.
-///
-/// Samples decoded between the picture and the copies decode earlier by what
-/// the picture gave up and keep their presentation times. Nothing after the
-/// copies moves, so the unit lasts as long as before.
-fn insert_recovery_copy_timing(
-    timing: &mut SampleTiming,
-    index: usize,
-    copies: usize,
-) -> Result<()> {
-    if index > timing.durations.len() {
-        bail!("recovery copies come after samples that do not exist");
-    }
-    // The picture the copies repeat is the one displayed last of those decoded
-    // ahead of them. It takes as many samples as the IDR copy does, which is
-    // every copy but the clone.
-    let samples = copies - 1;
-    let mut decode_end = 0u64;
-    let mut last: Option<(u64, usize)> = None;
-    for (at, (&duration, &composition)) in timing.durations[..index]
-        .iter()
-        .zip(&timing.compositions)
-        .enumerate()
-    {
-        let shown = decode_end + u64::from(composition);
-        if last.is_none_or(|(latest, _)| shown >= latest) {
-            last = Some((shown, at));
-        }
-        decode_end += u64::from(duration);
-    }
-    let Some((_, last)) = last else {
-        bail!("recovery copies have no picture to share a slot with");
-    };
-    let Some(first) = (last + 1).checked_sub(samples) else {
-        bail!("recovery copies repeat a picture that has too few samples");
-    };
-    let Some(slot) = timing.durations[first..=last]
-        .iter()
-        .try_fold(0u32, |total, &duration| total.checked_add(duration))
-    else {
-        bail!("recovery copies repeat a picture longer than the timeline can hold");
-    };
-    let share = slot / 3;
-    if share < samples as u32 {
-        bail!("recovery copies cannot share the slot of the picture they repeat");
-    }
-    let given = 2 * share;
-    let kept = slot - given;
-    // The copies decode back to back and end where the samples ahead of them
-    // ended, and display back to back from the end of what the picture kept,
-    // so one composition offset serves all of them.
-    let decode_start: u64 = timing.durations[..first]
-        .iter()
-        .map(|&d| u64::from(d))
-        .sum();
-    let slot_end = decode_start + u64::from(timing.compositions[first]) + u64::from(slot);
-    let Some(composition) = slot_end
-        .checked_sub(decode_end)
-        .and_then(|offset| u32::try_from(offset).ok())
-    else {
-        bail!("recovery copies cannot reach the picture they repeat");
-    };
-    for composition in &mut timing.compositions[last + 1..index] {
-        let Some(earlier) = composition.checked_add(given) else {
-            bail!("recovery copies move a sample past the end of the timeline");
-        };
-        *composition = earlier;
-    }
-    // The first half rounds down, as when the pair was timed.
-    let halves = |total: u32| {
-        let each = total / samples as u32;
-        (0..samples).map(move |at| {
-            if at + 1 == samples {
-                total - each * (samples as u32 - 1)
-            } else {
-                each
-            }
-        })
-    };
-    for (duration, half) in timing.durations[first..=last].iter_mut().zip(halves(kept)) {
-        *duration = half;
-    }
-    let inserted = halves(share).chain(std::iter::once(share));
-    timing.durations.splice(index..index, inserted);
-    timing
-        .compositions
-        .splice(index..index, std::iter::repeat_n(composition, copies));
-    Ok(())
-}
-
 /// What the sample that opens a unit has to stand in for.
 ///
 /// A unit that opens the presentation is short of pictures at the front: an
 /// open GOP's leading B pictures reference an anchor that is not there, so
-/// neither path can carry them and the first retained picture sits that many
-/// display slots in. Those empty slots are given to the opening sample, which
-/// leaves no gap to stall on and -- the reason this matters -- makes every unit
-/// span exactly as many frames as the source did, so units appended end to end
+/// they cannot be carried and the first retained picture sits that many display
+/// slots in. Those empty slots are given to the opening sample, which leaves no
+/// gap to stall on and -- the reason this matters -- makes every unit span
+/// exactly as many frames as the source did, so units appended end to end
 /// cannot creep away from the audio.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum UnitLeadIn {
     /// Nothing: the unit continues a decode chain and every display slot in it
     /// has a picture of its own.
     None,
-    /// The empty slots, held by the extra copy of the IDR that the transcoder
-    /// puts ahead of the unit to start its short-term reference chain. That
-    /// copy is a sample the timeline has no picture for, so the unit holds one
-    /// more sample than the timeline has pictures.
-    IdrClone,
-    /// The empty slots, held by the unit's own first picture, which is what
-    /// passthrough does: it adds no samples of its own, so the picture that
-    /// opens the unit is simply shown for longer.
+    /// The empty slots, held by the unit's own first picture: it adds no
+    /// samples of its own, so the picture that opens the unit is simply shown
+    /// for longer.
     FirstPicture,
 }
 
@@ -969,7 +700,7 @@ pub fn mpeg2_sample_timing(timeline: &Mpeg2VideoTimeline, lead_in: UnitLeadIn) -
     // begins and the units are appended to one timeline. A unit that measured
     // its own would start a frame later than its neighbours whenever it had no
     // picture displaying ahead of its decode slot -- a group coded without B
-    // pictures, or one whose leading B pictures the transcoder dropped -- which
+    // pictures, or one whose leading B pictures were dropped -- which
     // leaves a hole in the decode timeline in front of it and lands its last
     // sample on the decode time of the next unit's first. Media Source
     // Extensions reads that overlap as an append over buffered frames and
@@ -979,50 +710,21 @@ pub fn mpeg2_sample_timing(timeline: &Mpeg2VideoTimeline, lead_in: UnitLeadIn) -
     // unpaired RFF picture can occupy three fields at the end of a film run.
     let measured = -offsets.iter().copied().min().unwrap_or(0).min(0);
     let reorder_delay = measured.max(duration);
-    let mut compositions: Vec<u32> = offsets
+    let compositions: Vec<u32> = offsets
         .iter()
         .map(|offset| (offset + reorder_delay) as u32 + timeline.lag_ticks)
         .collect();
-    // The hole in front of the unit, which the sample covering its leading
-    // slots is held over. A unit that has no such sample cannot hold anything,
-    // and the caller keeps the hole for the next one that can.
-    let hold = match lead_in {
-        UnitLeadIn::None => 0,
-        _ => timeline.hold_ticks,
-    };
     match lead_in {
         UnitLeadIn::None => {}
-        UnitLeadIn::IdrClone => {
-            let lead = first_presentation_time as u32 + hold;
-            let opens_on_a_pair = timeline.split_field_samples && timeline.is_field_pair(0);
-            if let (true, [first, second, ..]) = (opens_on_a_pair, durations.as_slice()) {
-                // The clone is the unit's third sample, because the pair it
-                // repeats takes two. Holding the first field over the hole --
-                // which is what inserting the extra slot in front does -- puts
-                // the second field a whole hole after its own first, so the
-                // pair is torn across frames and every field behind it lands
-                // on the wrong half of the frame. Hold the second field
-                // instead, and give the clone the frame the pair belongs to.
-                let (first, second) = (*first, *second);
-                let total = lead + first + second;
-                let held = lead.saturating_sub(first).max(1);
-                let start = (reorder_delay as u32 + lead).max(reorder_delay as u32 + first + 1);
-                durations[1] = held;
-                durations.insert(2, (total - first - held).max(1));
-                compositions.insert(2, start - (first + held));
-            } else {
-                durations.insert(0, lead.max(1));
-                compositions.insert(0, reorder_delay as u32);
-            }
-        }
         // The opening sample is displayed from the first empty slot through its
-        // own, so the unit spans exactly what it would have with a clone in
-        // front of it. Holding it longer moves the decode slot of everything
-        // after it by the same amount, which is what the clone did too, so the
-        // composition offsets already computed still land where they should.
+        // own, and over the hole in front of the unit. A unit that has no such
+        // sample cannot hold anything, and the caller keeps the hole for the
+        // next one that can. Holding the sample longer moves the decode slot of
+        // everything after it by the same amount, so the composition offsets
+        // already computed still land where they should.
         UnitLeadIn::FirstPicture => {
             if let Some(first) = durations.first_mut() {
-                *first += first_presentation_time as u32 + hold;
+                *first += first_presentation_time as u32 + timeline.hold_ticks;
             }
         }
     }
@@ -1031,20 +733,6 @@ pub fn mpeg2_sample_timing(timeline: &Mpeg2VideoTimeline, lead_in: UnitLeadIn) -
         compositions,
         reorder_delay,
     }
-}
-
-fn make_avc_c(sps: &[u8], pps: &[u8]) -> Result<Vec<u8>> {
-    if sps.len() < 4 {
-        bail!("H.264 SPS is too short for avcC");
-    }
-    let mut body = Buf::new();
-    body.bytes(&[1, sps[1], sps[2], sps[3], 0xff, 0xe1])
-        .u16(sps.len() as u16)
-        .bytes(sps)
-        .u8(1)
-        .u16(pps.len() as u16)
-        .bytes(pps);
-    Ok(boxed("avcC", &body.into_vec()))
 }
 
 /// `objectTypeIndication` for ISO/IEC 13818-2 Main Profile video, which is what
@@ -1056,40 +744,6 @@ const OTI_MPEG4_AUDIO: u8 = 0x40;
 const STREAM_TYPE_VISUAL: u8 = 0x11;
 /// `streamType` 5 (audio), upstream off.
 const STREAM_TYPE_AUDIO: u8 = 0x15;
-
-/// Which codec the video track holds, and so what its sample entry says.
-#[derive(Clone, Copy, Debug)]
-enum VideoCodec<'a> {
-    /// H.264, described by the parameter sets an `avcC` carries out of band.
-    Avc { sps: &'a [u8], pps: &'a [u8] },
-    /// MPEG-2 video carried through as it stood, described by the sequence
-    /// header. The samples keep their start codes and their own copy of that
-    /// header, so this is a declaration rather than the only copy.
-    Mpeg2 { sequence_header: &'a [u8] },
-}
-
-impl VideoCodec<'_> {
-    /// The four-character sample entry type and the configuration box inside it.
-    fn sample_entry(&self) -> Result<(&'static str, Vec<u8>)> {
-        match *self {
-            Self::Avc { sps, pps } => Ok(("avc1", make_avc_c(sps, pps)?)),
-            Self::Mpeg2 { sequence_header } => Ok((
-                "mp4v",
-                make_esds(1, OTI_MPEG2_VIDEO_MAIN, STREAM_TYPE_VISUAL, sequence_header),
-            )),
-        }
-    }
-
-    /// What the codecs parameter of a MIME type calls this track (RFC 6381).
-    fn codecs_parameter(&self) -> String {
-        match *self {
-            Self::Avc { sps, .. } => {
-                format!("avc1.{:02x}{:02x}{:02x}", sps[1], sps[2], sps[3])
-            }
-            Self::Mpeg2 { .. } => format!("mp4v.{OTI_MPEG2_VIDEO_MAIN:02x}"),
-        }
-    }
-}
 
 /// An MPEG-4 descriptor: a tag, a length in the four-byte expanded form every
 /// muxer emits, then the payload.
@@ -1171,14 +825,18 @@ fn identity_matrix(buf: &mut Buf) {
 
 /// The initialization segment for a presentation, and the MIME type to open a
 /// `SourceBuffer` with.
+///
+/// The video track is MPEG-2 carried through as it stood, described by
+/// `sequence_header`. The samples keep their start codes and their own copy of
+/// that header, so this is a declaration rather than the only copy.
 fn make_init_segment(
-    video: VideoCodec<'_>,
+    sequence_header: &[u8],
     width: u32,
     height: u32,
     sample_aspect_ratio: Option<SampleAspectRatio>,
     audio: Option<&AacConfig>,
-) -> Result<(Vec<u8>, String)> {
-    let (sample_entry_type, decoder_config) = video.sample_entry()?;
+) -> (Vec<u8>, String) {
+    let decoder_config = make_esds(1, OTI_MPEG2_VIDEO_MAIN, STREAM_TYPE_VISUAL, sequence_header);
     let ftyp = {
         let mut body = Buf::new();
         body.ascii("isom").u32(0x200).ascii("isomiso6mp41avc1");
@@ -1226,7 +884,7 @@ fn make_init_segment(
             pasp.u32(sar.width).u32(sar.height);
             body.bytes(&boxed("pasp", &pasp.into_vec()));
         }
-        boxed(sample_entry_type, &body.into_vec())
+        boxed("mp4v", &body.into_vec())
     };
     let stsd = {
         let mut body = Buf::new();
@@ -1268,13 +926,11 @@ fn make_init_segment(
     } else {
         String::new()
     };
-    Ok((
+    (
         concat(&[&ftyp, &moov]),
-        format!(
-            "video/mp4; codecs=\"{}{audio_codec}\"",
-            video.codecs_parameter()
-        ),
-    ))
+        // The codecs parameter names the video track as RFC 6381 does.
+        format!("video/mp4; codecs=\"mp4v.{OTI_MPEG2_VIDEO_MAIN:02x}{audio_codec}\""),
+    )
 }
 
 /// What the codecs parameter of a MIME type calls AAC-LC (RFC 6381).
@@ -1402,10 +1058,9 @@ fn make_media_segment(
     for i in 0..video.len() {
         entries.u32(durations[i]);
         entries.u32(video.sample_bytes(i) as u32);
-        // sample_flags: non-reference and non-sync unless this is an IDR or a
-        // recovery picture. Safari needs the container flag to retain an MSE
-        // eviction boundary; the recovery-point SEI tells the decoder how the
-        // non-IDR I picture becomes independently usable.
+        // sample_flags: non-reference and non-sync unless this is a restart
+        // point. Safari needs the container flag to retain an MSE eviction
+        // boundary.
         entries.u32(if sync_samples[i] {
             0x0200_0000
         } else {
@@ -1571,96 +1226,21 @@ pub struct Fmp4Output {
     pub sample_count: usize,
 }
 
-/// Package this transcoder's Annex B output as one video-only presentation.
-pub fn h264_to_fmp4(h264: &[u8], timeline: &Mpeg2VideoTimeline) -> Result<Fmp4Output> {
-    let nals = split_annex_b(h264);
-    let nal_type = |nal: &&[u8]| nal[0] & 0x1f;
-    let sps = nals.iter().find(|nal| nal_type(nal) == 7).copied();
-    let pps = nals.iter().find(|nal| nal_type(nal) == 8).copied();
-    let sei = nals.iter().find(|nal| nal_type(nal) == 6).copied();
-    let mut samples = video_samples(&nals);
-    let (Some(sps), Some(pps)) = (sps, pps) else {
-        bail!("H.264 stream lacks SPS or PPS");
-    };
-    let content_samples = content_sample_count(timeline);
-    let recovery = recovery_sample_index(&nals);
-    let recovery_copy = recovery.filter(|&index| {
-        samples
-            .get(index)
-            .is_some_and(|sample| sample.iter().any(|nal| nal[0] & 0x1f == 5))
-    });
-    let Some(extra_samples) = recovery_extra_samples(
-        samples.len(),
-        content_samples,
-        recovery_copy.is_some(),
-        timeline.split_field_samples,
-    ) else {
-        bail!(
-            "H.264 sample count {} does not match MPEG-2 timeline {content_samples}",
-            samples.len(),
-        );
-    };
-    let has_idr_clone = extra_samples == 1 && recovery_copy.is_none();
-    let lead_in = if has_idr_clone {
-        UnitLeadIn::IdrClone
-    } else {
-        UnitLeadIn::None
-    };
-    let mut timing = mpeg2_sample_timing(timeline, lead_in);
-    let mut sync_samples: Vec<bool> = samples
-        .iter()
-        .map(|sample| sample.iter().any(|nal| nal[0] & 0x1f == 5))
-        .collect();
-    if let Some(index) = recovery.filter(|&index| index < sync_samples.len()) {
-        sync_samples[index] = true;
-    }
-    if let Some(index) = recovery_copy.filter(|&index| index < sync_samples.len()) {
-        insert_recovery_copy_timing(&mut timing, index, extra_samples)?;
-    }
-    if let (Some(index), Some(sei)) = (recovery, sei) {
-        samples[index].insert(0, sei);
-    }
-    let video = VideoPayload::avc(samples, &[]);
-    let (init_segment, mime_codec) = make_init_segment(
-        VideoCodec::Avc { sps, pps },
-        timeline.width,
-        timeline.height,
-        timeline.sample_aspect_ratio,
-        None,
-    )?;
-
-    Ok(Fmp4Output {
-        media_segment: make_media_segment(
-            &video,
-            &timing.durations,
-            &timing.compositions,
-            &sync_samples,
-            1,
-            0,
-        ),
-        sample_count: video.len(),
-        init_segment,
-        mime_codec,
-    })
-}
-
 /// Package an MPEG-2 unit as one video-only presentation, carrying its video
 /// through untouched.
-pub fn mpeg2_to_fmp4(es: &[u8], unit: &Mpeg2Unit) -> Result<Fmp4Output> {
+pub fn mpeg2_to_fmp4(es: &[u8], unit: &Mpeg2Unit) -> Fmp4Output {
     let timing = mpeg2_sample_timing(&unit.timeline, UnitLeadIn::FirstPicture);
     // A whole presentation opens where a decoder has to be able to start.
     let sync_samples = mpeg2_sync_samples(unit, true);
     let video = mpeg2_payload(es, unit);
     let (init_segment, mime_codec) = make_init_segment(
-        VideoCodec::Mpeg2 {
-            sequence_header: &es[..unit.sequence_header_len],
-        },
+        &es[..unit.sequence_header_len],
         unit.timeline.width,
         unit.timeline.height,
         unit.timeline.sample_aspect_ratio,
         None,
-    )?;
-    Ok(Fmp4Output {
+    );
+    Fmp4Output {
         media_segment: make_media_segment(
             &video,
             &timing.durations,
@@ -1672,7 +1252,7 @@ pub fn mpeg2_to_fmp4(es: &[u8], unit: &Mpeg2Unit) -> Result<Fmp4Output> {
         sample_count: video.len(),
         init_segment,
         mime_codec,
-    })
+    }
 }
 
 /// The samples of a passthrough unit as the `mdat` will carry them.
@@ -1705,10 +1285,9 @@ fn mpeg2_payload<'a>(es: &'a [u8], unit: &Mpeg2Unit) -> VideoPayload<'a> {
 /// Which of a passthrough unit's samples a decoder can be started on, in step
 /// with what [`mpeg2_payload`] emits.
 ///
-/// Only the sample that opens a restart point is marked, which is where the
-/// transcoding path puts its IDR and its recovery points. The intra pictures
-/// between them are no more startable here than there: an open group's leading
-/// B pictures follow one in decode order and reference the group before it.
+/// Only the sample that opens a restart point is marked. The intra pictures
+/// between restart points are not startable: an open group's leading B pictures
+/// follow one in decode order and reference the group before it.
 fn mpeg2_sync_samples(unit: &Mpeg2Unit, random_access: bool) -> Vec<bool> {
     let split_fields = unit.timeline.split_field_samples;
     let mut sync = Vec::with_capacity(unit.samples.len());
@@ -1745,100 +1324,23 @@ pub struct Fmp4AudioSamples {
 
 #[derive(Clone, Debug)]
 pub struct Fmp4Fragment {
-    /// Empty for every fragment after the first: the transcoder emits the
-    /// parameter sets once, and MSE needs the initialization segment once.
+    /// Empty unless the fragment was asked to describe itself: MSE needs the
+    /// initialization segment once, and again when the description changes.
     pub init_segment: Vec<u8>,
     pub media_segment: Vec<u8>,
-    /// Empty when this fragment carries no parameter sets to describe.
+    /// Empty when this fragment carries no initialization segment.
     pub mime_codec: String,
     pub sample_count: usize,
     /// Presentation time this fragment covers; see [`mpeg2_sample_timing`].
     pub duration: u64,
 }
 
-/// Package one independently transcoded GOP for incremental appending.
-///
-/// `presentation_start` is the media time of the fragment's first displayed
-/// picture, in the 90 kHz movie timescale.
-pub fn h264_gop_to_fmp4(
-    h264: &[u8],
-    timeline: &Mpeg2VideoTimeline,
-    sequence_number: u32,
-    presentation_start: u64,
-    audio: Option<&AacConfig>,
-    audio_track: Option<&Fmp4AudioSamples>,
-) -> Result<Fmp4Fragment> {
-    let nals = split_annex_b(h264);
-    let nal_type = |nal: &&[u8]| nal[0] & 0x1f;
-    let sps = nals.iter().find(|nal| nal_type(nal) == 7).copied();
-    let pps = nals.iter().find(|nal| nal_type(nal) == 8).copied();
-    let sei = nals.iter().find(|nal| nal_type(nal) == 6).copied();
-    let mut samples = video_samples(&nals);
-
-    let content_samples = content_sample_count(timeline);
-    let recovery = recovery_sample_index(&nals);
-    let recovery_copy = recovery.filter(|&index| {
-        samples
-            .get(index)
-            .is_some_and(|sample| sample.iter().any(|nal| nal[0] & 0x1f == 5))
-    });
-    let Some(extra_samples) = recovery_extra_samples(
-        samples.len(),
-        content_samples,
-        recovery_copy.is_some(),
-        timeline.split_field_samples,
-    ) else {
-        bail!(
-            "H.264 GOP sample count {} does not match MPEG-2 timeline {content_samples}",
-            samples.len(),
-        );
-    };
-    let has_idr_clone = extra_samples == 1 && recovery_copy.is_none();
-    let lead_in = if has_idr_clone {
-        UnitLeadIn::IdrClone
-    } else {
-        UnitLeadIn::None
-    };
-    let mut timing = mpeg2_sample_timing(timeline, lead_in);
-    let mut sync_samples: Vec<bool> = samples
-        .iter()
-        .map(|sample| sample.iter().any(|nal| nal[0] & 0x1f == 5))
-        .collect();
-    if let Some(index) = recovery.filter(|&index| index < sync_samples.len()) {
-        sync_samples[index] = true;
-    }
-    if let Some(index) = recovery_copy.filter(|&index| index < sync_samples.len()) {
-        insert_recovery_copy_timing(&mut timing, index, extra_samples)?;
-    }
-    if let (Some(index), Some(sei)) = (recovery, sei) {
-        samples[index].insert(0, sei);
-    }
-    // The parameter sets are written once, by the unit that opens the stream,
-    // so that is the unit that has an initialization segment to describe.
-    let describe = match (sps, pps) {
-        (Some(sps), Some(pps)) => Some(VideoCodec::Avc { sps, pps }),
-        _ => None,
-    };
-    make_fragment(
-        VideoPayload::avc(samples, &[]),
-        timeline,
-        &timing,
-        &sync_samples,
-        describe,
-        sequence_number,
-        presentation_start,
-        audio,
-        audio_track,
-    )
-}
-
 /// Package one unit of MPEG-2 video for incremental appending, carrying the
 /// video through untouched.
 ///
 /// `describe` asks for the initialization segment, which the caller wants from
-/// the first fragment only: every unit opens with a sequence header, so unlike
-/// the transcoded path there is nothing in the unit itself to say which is
-/// which.
+/// the first fragment only: every unit opens with a sequence header, so there is
+/// nothing in the unit itself to say which is which.
 #[allow(clippy::too_many_arguments)]
 pub fn mpeg2_gop_to_fmp4(
     es: &[u8],
@@ -1850,13 +1352,11 @@ pub fn mpeg2_gop_to_fmp4(
     describe: bool,
     audio: Option<&AacConfig>,
     audio_track: Option<&Fmp4AudioSamples>,
-) -> Result<Fmp4Fragment> {
+) -> Fmp4Fragment {
     let timing = mpeg2_sample_timing(&unit.timeline, lead_in);
     let sync_samples = mpeg2_sync_samples(unit, random_access);
     let video = mpeg2_payload(es, unit);
-    let describe = describe.then_some(VideoCodec::Mpeg2 {
-        sequence_header: &es[..unit.sequence_header_len],
-    });
+    let describe = describe.then(|| &es[..unit.sequence_header_len]);
     make_fragment(
         video,
         &unit.timeline,
@@ -1954,19 +1454,20 @@ fn base_decode_time(presentation_start: u64, timing: &SampleTiming) -> u64 {
     presentation_start.saturating_sub(timing.reorder_delay as u64)
 }
 
-/// Put one fragment together, whatever the video in it is coded as.
+/// Put one fragment together. `describe` is the sequence header to build an
+/// initialization segment from, when one is wanted.
 #[allow(clippy::too_many_arguments)]
 fn make_fragment(
     video: VideoPayload<'_>,
     timeline: &Mpeg2VideoTimeline,
     timing: &SampleTiming,
     sync_samples: &[bool],
-    describe: Option<VideoCodec<'_>>,
+    describe: Option<&[u8]>,
     sequence_number: u32,
     presentation_start: u64,
     audio: Option<&AacConfig>,
     audio_track: Option<&Fmp4AudioSamples>,
-) -> Result<Fmp4Fragment> {
+) -> Fmp4Fragment {
     let base_decode_time = base_decode_time(presentation_start, timing);
     let media_segment = match audio_track {
         Some(track) => make_av_media_segment(
@@ -1989,83 +1490,27 @@ fn make_fragment(
         ),
     };
     let (init_segment, mime_codec) = match describe {
-        Some(codec) => make_init_segment(
-            codec,
+        Some(sequence_header) => make_init_segment(
+            sequence_header,
             timeline.width,
             timeline.height,
             timeline.sample_aspect_ratio,
             audio,
-        )?,
+        ),
         None => (Vec::new(), String::new()),
     };
-    Ok(Fmp4Fragment {
+    Fmp4Fragment {
         init_segment,
         media_segment,
         mime_codec,
         sample_count: video.len(),
         duration: timing.durations.iter().map(|&d| d as u64).sum(),
-    })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The splitter as it read before it skipped to zeros a word at a time,
-    /// one byte per step, which the faster form has to agree with.
-    fn split_annex_b_byte_by_byte(data: &[u8]) -> Vec<&[u8]> {
-        let mut starts: Vec<(usize, usize)> = Vec::new();
-        let mut i = 0;
-        while i + 3 < data.len() {
-            if data[i] != 0 || data[i + 1] != 0 {
-                i += 1;
-                continue;
-            }
-            if data[i + 2] == 1 {
-                starts.push((i, 3));
-                i += 3;
-            } else if data[i + 2] == 0 && data[i + 3] == 1 {
-                starts.push((i, 4));
-                i += 4;
-            } else {
-                i += 1;
-            }
-        }
-        let mut nals = Vec::new();
-        for (index, &(at, length)) in starts.iter().enumerate() {
-            let start = at + length;
-            let end = starts.get(index + 1).map_or(data.len(), |next| next.0);
-            if end > start {
-                nals.push(&data[start..end]);
-            }
-        }
-        nals
-    }
-
-    #[test]
-    fn splitting_agrees_with_the_byte_by_byte_form_on_zero_heavy_streams() {
-        let mut state = 0x9e37_79b9_7f4a_7c15u64;
-        let mut byte = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            match state % 8 {
-                0..=3 => 0u8,
-                4 => 1,
-                _ => (state >> 16) as u8,
-            }
-        };
-        for len in 0..48 {
-            for _ in 0..40 {
-                let data: Vec<u8> = (0..len).map(|_| byte()).collect();
-                assert_eq!(
-                    split_annex_b(&data),
-                    split_annex_b_byte_by_byte(&data),
-                    "{data:02x?}"
-                );
-            }
-        }
-    }
 
     /// 29.97 fps, and deliberately odd so a halved field duration cannot be
     /// exact: the two halves still have to add up to the frame.
@@ -2109,12 +1554,6 @@ mod tests {
     /// in the order it was coded in.
     const IPPP: [u32; 4] = [1, 2, 3, 4];
 
-    #[test]
-    fn a_split_field_recovery_copy_adds_three_samples() {
-        assert_eq!(recovery_extra_samples(33, 30, true, true), Some(3));
-        assert_eq!(recovery_extra_samples(33, 30, true, false), None);
-    }
-
     /// The delay is what the decode timeline of a unit is set back by, and the
     /// units share one timeline, so a unit with nothing to reorder has to be
     /// set back as far as its neighbours. Measuring it from this unit alone
@@ -2131,287 +1570,6 @@ mod tests {
         // Every picture displays a frame after it decodes, so none of them
         // moved: the offsets carry the delay rather than cancelling it.
         assert_eq!(in_order.compositions, vec![FRAME; 4]);
-    }
-
-    /// Decode time and presentation time of every sample, in decode order.
-    fn sample_times(timing: &SampleTiming) -> Vec<(u64, u64)> {
-        let mut decode_time = 0u64;
-        timing
-            .durations
-            .iter()
-            .zip(&timing.compositions)
-            .map(|(&duration, &composition)| {
-                let times = (decode_time, decode_time + u64::from(composition));
-                decode_time += u64::from(duration);
-                times
-            })
-            .collect()
-    }
-
-    /// Place `copies` recovery samples at `index` and check what holds for
-    /// every layout: the unit lasts as long as before, decode times only
-    /// increase, no two samples are presented at the same time, and what is
-    /// not part of the picture's slot is presented when it was. Returns the
-    /// timing as it was and as it is.
-    fn place(
-        mut timing: SampleTiming,
-        index: usize,
-        copies: usize,
-    ) -> (SampleTiming, SampleTiming) {
-        let before = timing.clone();
-        insert_recovery_copy_timing(&mut timing, index, copies).expect("timing has room");
-        assert_eq!(timing.durations.len(), before.durations.len() + copies);
-        assert_eq!(
-            timing.durations.iter().sum::<u32>(),
-            before.durations.iter().sum::<u32>()
-        );
-        assert!(timing.durations.iter().all(|&duration| duration > 0));
-        let times = sample_times(&timing);
-        assert!(times.windows(2).all(|pair| pair[0].0 < pair[1].0));
-        let mut presentation: Vec<u64> = times.iter().map(|&(_, shown)| shown).collect();
-        presentation.sort_unstable();
-        assert!(presentation.windows(2).all(|pair| pair[0] < pair[1]));
-        let previous = sample_times(&before);
-        for (at, &(_, shown)) in previous.iter().enumerate().skip(index) {
-            assert_eq!(times[at + copies].1, shown, "sample {at} after the copies");
-        }
-        assert_eq!(timing.reorder_delay, before.reorder_delay);
-        (before, timing)
-    }
-
-    /// An IPPP group: nothing displays ahead of the intra picture.
-    fn in_order() -> SampleTiming {
-        mpeg2_sample_timing(&timeline(&IPPP, &[false; 4], false), UnitLeadIn::None)
-    }
-
-    /// An open group's intra picture, with the two B pictures that display
-    /// ahead of it coded after it.
-    fn open_group(pairs: bool) -> SampleTiming {
-        mpeg2_sample_timing(&timeline(&[3, 1, 2], &[pairs; 3], pairs), UnitLeadIn::None)
-    }
-
-    #[test]
-    fn recovery_copies_share_the_slot_of_a_frame_picture_in_thirds() {
-        let (before, timing) = place(in_order(), 1, 2);
-        assert_eq!(before.durations, [3003; 4]);
-        // The picture and both copies are a third of a frame, and the pictures
-        // after them are presented when they were.
-        assert_eq!(timing.durations, [1001, 1001, 1001, 3003, 3003, 3003]);
-        assert_eq!(
-            sample_times(&timing),
-            [
-                (0, 3003),
-                (1001, 4004),
-                (2002, 5005),
-                (3003, 6006),
-                (6006, 9009),
-                (9009, 12012)
-            ]
-        );
-    }
-
-    #[test]
-    fn recovery_copies_ending_a_unit_take_nothing_from_the_next() {
-        let (_, timing) = place(in_order(), 4, 2);
-        // The last picture is the one they repeat.
-        assert_eq!(timing.durations, [3003, 3003, 3003, 1001, 1001, 1001]);
-        let times = sample_times(&timing);
-        assert_eq!(times[3].1, 12012);
-        assert_eq!(times[4].1, 13013);
-        assert_eq!(times[5].1, 14014);
-        assert_eq!(timing.durations.iter().sum::<u32>(), 4 * 3003);
-        let (_, alone) = place(
-            SampleTiming {
-                durations: vec![3003],
-                compositions: vec![3003],
-                reorder_delay: 3003,
-            },
-            1,
-            2,
-        );
-        assert_eq!(alone.durations, [1001, 1001, 1001]);
-        assert_eq!(
-            sample_times(&alone),
-            [(0, 3003), (1001, 4004), (2002, 5005)]
-        );
-    }
-
-    /// What is left of a slot that does not divide is the picture's.
-    #[test]
-    fn recovery_copies_leave_the_remainder_of_the_slot_to_the_picture() {
-        let (_, timing) = place(
-            SampleTiming {
-                durations: vec![4505, 3003],
-                compositions: vec![3003, 3003],
-                reorder_delay: 3003,
-            },
-            1,
-            2,
-        );
-        // Three fields are 1501 ticks each.
-        assert_eq!(timing.durations, [1503, 1501, 1501, 3003]);
-        assert_eq!(
-            sample_times(&timing),
-            [(0, 3003), (1503, 4506), (3004, 6007), (4505, 7508)]
-        );
-        let (_, timing) = place(
-            SampleTiming {
-                durations: vec![10, 10],
-                compositions: vec![10, 10],
-                reorder_delay: 10,
-            },
-            1,
-            2,
-        );
-        assert_eq!(timing.durations, [4, 3, 3, 10]);
-    }
-
-    /// The leading pictures decode between the intra picture and its copies.
-    /// They keep the times they display at and decode earlier, by what the
-    /// intra picture gave up.
-    #[test]
-    fn leading_pictures_between_a_picture_and_its_copies_keep_their_presentation_times() {
-        let (before, timing) = place(open_group(false), 3, 2);
-        assert_eq!(
-            sample_times(&before),
-            [(0, 9009), (3003, 3003), (6006, 6006)]
-        );
-        assert_eq!(timing.durations, [1001, 3003, 3003, 1001, 1001]);
-        assert_eq!(
-            sample_times(&timing),
-            [
-                (0, 9009),
-                (1001, 3003),
-                (4004, 6006),
-                (7007, 10010),
-                (8008, 11011)
-            ]
-        );
-        assert_eq!(timing.compositions, [9009, 2002, 2002, 3003, 3003]);
-    }
-
-    #[test]
-    fn leading_pictures_between_a_picture_and_its_copies_leave_what_follows_alone() {
-        let mut open = open_group(false);
-        // A following anchor picture, coded after the leading pictures.
-        open.durations.push(3003);
-        open.compositions.push(9009);
-        let (before, timing) = place(open, 3, 2);
-        assert_eq!(timing.durations, [1001, 3003, 3003, 1001, 1001, 3003]);
-        assert_eq!(sample_times(&timing)[5], (9009, 18018));
-        assert_eq!(sample_times(&before)[3], (9009, 18018));
-    }
-
-    /// A split pair spans two samples and so does its IDR copy, and the clone
-    /// is one more: three copies, which still make the pair's slot thirds.
-    #[test]
-    fn recovery_copies_of_a_field_pair_share_its_frame_slot_in_thirds() {
-        let (before, timing) = place(open_group(true), 6, 3);
-        assert_eq!(
-            before.durations,
-            [1501, 1502, 1501, 1502, 1501, 1502],
-            "the pair, then the leading pairs"
-        );
-        assert_eq!(
-            timing.durations,
-            [500, 501, 1501, 1502, 1501, 1502, 500, 501, 1001]
-        );
-        assert_eq!(
-            sample_times(&timing)
-                .iter()
-                .map(|&(_, shown)| shown)
-                .collect::<Vec<_>>(),
-            // The pair, the leading pairs where they were, then the copy of
-            // the pair and the clone, the last of which ends where the slot
-            // of the pair does.
-            [9009, 9509, 3003, 4504, 6006, 7507, 10010, 10510, 11011]
-        );
-        assert_eq!(timing.compositions[0], timing.compositions[1]);
-    }
-
-    #[test]
-    fn recovery_copies_of_a_field_pair_with_nothing_after_them_end_the_unit_on_its_slot() {
-        let pair = SampleTiming {
-            durations: vec![1501, 1502],
-            compositions: vec![3003, 3003],
-            reorder_delay: 3003,
-        };
-        let (_, timing) = place(pair, 2, 3);
-        assert_eq!(timing.durations, [500, 501, 500, 501, 1001]);
-        let times = sample_times(&timing);
-        assert_eq!(times[4], (2002, 5005));
-        assert_eq!(times[4].1 + 1001, 3003 + 3003);
-    }
-
-    #[test]
-    fn recovery_copies_that_cannot_share_a_slot_are_refused() {
-        let timing = |durations: &[u32], compositions: &[u32]| SampleTiming {
-            durations: durations.to_vec(),
-            compositions: compositions.to_vec(),
-            reorder_delay: 0,
-        };
-        // No picture ahead of them, a slot too short to divide, a pair with
-        // only one sample ahead of it, and a unit shorter than the index.
-        let cases = [
-            (timing(&[3003], &[0]), 0, 2),
-            (timing(&[2], &[0]), 1, 2),
-            (timing(&[1, 3], &[0, 0]), 2, 3),
-            (timing(&[3003], &[0]), 1, 3),
-            (timing(&[3003], &[0]), 2, 2),
-            // The picture's slot ends before the samples ahead of the copies
-            // have decoded, which is no timeline the unit can make.
-            (timing(&[10, 100], &[50, 0]), 2, 2),
-            (timing(&[u32::MAX, u32::MAX], &[0, 0]), 2, 3),
-        ];
-        for (mut case, index, copies) in cases {
-            assert!(
-                insert_recovery_copy_timing(&mut case, index, copies).is_err(),
-                "{case:?} at {index}"
-            );
-        }
-    }
-
-    /// The clone in front of a unit holds the empty slots an open group's
-    /// dropped leading pictures left. Holding the pair's first field over them
-    /// left its second field a whole hole later, which tore the pair across
-    /// two frames and put every field behind it on the wrong half of one.
-    #[test]
-    fn a_clone_holds_the_second_field_of_the_pair_it_opens_on() {
-        // Two empty leading slots in front of a group of field pairs.
-        let leading = [3, 6, 4, 5];
-        let timing =
-            mpeg2_sample_timing(&timeline(&leading, &[true; 4], true), UnitLeadIn::IdrClone);
-        let mut decode_time = 0u32;
-        let presentation_times: Vec<u32> = timing
-            .durations
-            .iter()
-            .zip(&timing.compositions)
-            .map(|(&duration, &composition)| {
-                let presentation = decode_time + composition;
-                decode_time += duration;
-                presentation
-            })
-            .collect();
-        let half = FRAME / 2;
-        // The pair opens the unit a field apart, and the clone takes the frame
-        // the pair belongs to, two frames on.
-        assert_eq!(presentation_times[0], FRAME);
-        assert_eq!(presentation_times[1], FRAME + half);
-        assert_eq!(presentation_times[2], FRAME * 3);
-        assert_eq!(timing.durations[2], FRAME);
-        // Nothing behind the clone moved, and the unit is as long as it was.
-        assert_eq!(
-            &presentation_times[3..],
-            &[
-                FRAME * 6,
-                FRAME * 6 + half,
-                FRAME * 4,
-                FRAME * 4 + half,
-                FRAME * 5,
-                FRAME * 5 + half
-            ]
-        );
-        assert_eq!(timing.durations.iter().sum::<u32>(), FRAME * 6);
     }
 
     #[test]
@@ -2467,13 +1625,6 @@ mod tests {
         let total = |timing: &SampleTiming| timing.durations.iter().map(|&d| d as u64).sum::<u64>();
         assert_eq!(total(&split), total(&whole));
         assert_eq!(split.reorder_delay, whole.reorder_delay);
-    }
-
-    #[test]
-    fn a_split_pair_counts_as_two_samples() {
-        let mixed = [true, false, true, false];
-        assert_eq!(content_sample_count(&timeline(&IPBB, &mixed, true)), 6);
-        assert_eq!(content_sample_count(&timeline(&IPBB, &mixed, false)), 4);
     }
 
     /// A passthrough unit of four pictures, alternating field pairs with

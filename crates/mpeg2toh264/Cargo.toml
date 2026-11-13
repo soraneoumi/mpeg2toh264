@@ -1,6 +1,6 @@
 [package]
 name = "mpeg2toh264"
-description = "MPEG-2 to H.264 bitstream-domain transcoder (no IDCT, no motion compensation)"
+description = "MPEG-2 transport stream packaging and software decoding for browser playback"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
