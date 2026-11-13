@@ -57,104 +57,6 @@ pub(crate) fn predict<const W: usize, const AVERAGE: bool>(
     }
 }
 
-/// [`predict`] for the two 8-wide chroma blocks of one macroblock, which
-/// share their position, vector and layout: `src` and `dst` are the Cb and
-/// Cr planes, and one offset and stride serve both.
-#[inline(never)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn predict_chroma<const AVERAGE: bool>(
-    src: [View<'_>; 2],
-    x: i32,
-    y: i32,
-    vx: i32,
-    vy: i32,
-    h: usize,
-    dst: [&mut [u8]; 2],
-    offset: usize,
-    dst_stride: usize,
-) {
-    let left = x + (vx >> 1);
-    let top = y + (vy >> 1);
-    let half_x = (vx & 1) as usize;
-    let half_y = (vy & 1) as usize;
-    let view = src[0];
-    let inside = left >= 0
-        && top >= 0
-        && left + (8 + half_x) as i32 <= view.width
-        && top + (h + half_y) as i32 <= view.height;
-    if inside {
-        let start = view.offset + top as usize * view.stride + left as usize;
-        interpolate_pair::<AVERAGE>(
-            [src[0].data, src[1].data],
-            start,
-            view.stride,
-            half_x,
-            half_y,
-            h,
-            dst,
-            offset,
-            dst_stride,
-        );
-    } else {
-        for (src, dst) in src.into_iter().zip(dst) {
-            predict_from_edge::<8, AVERAGE>(
-                src, left, top, half_x, half_y, h, dst, offset, dst_stride,
-            );
-        }
-    }
-}
-
-/// [`interpolate`] for two planes laid out alike, eight samples of each per
-/// line, worked on as one line of sixteen.
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-fn interpolate_pair<const AVERAGE: bool>(
-    src: [&[u8]; 2],
-    start: usize,
-    stride: usize,
-    half_x: usize,
-    half_y: usize,
-    h: usize,
-    dst: [&mut [u8]; 2],
-    offset: usize,
-    dst_stride: usize,
-) {
-    let line = |at: usize| -> [u8; 16] {
-        let mut both = [0u8; 16];
-        both[..8].copy_from_slice(&src[0][at..at + 8]);
-        both[8..].copy_from_slice(&src[1][at..at + 8]);
-        both
-    };
-    let [first, second] = dst;
-    for j in 0..h {
-        let at = start + j * stride;
-        let value: [u16; 16] = match (half_x, half_y) {
-            (0, 0) => line(at).map(u16::from),
-            (1, 0) => {
-                let (a, b) = (line(at), line(at + 1));
-                std::array::from_fn(|i| (a[i] as u16 + b[i] as u16 + 1) >> 1)
-            }
-            (0, _) => {
-                let (a, b) = (line(at), line(at + stride));
-                std::array::from_fn(|i| (a[i] as u16 + b[i] as u16 + 1) >> 1)
-            }
-            _ => {
-                let (a, b) = (line(at), line(at + 1));
-                let (c, d) = (line(at + stride), line(at + stride + 1));
-                std::array::from_fn(|i| {
-                    (a[i] as u16 + b[i] as u16 + c[i] as u16 + d[i] as u16 + 2) >> 2
-                })
-            }
-        };
-        let out_first = &mut first[offset + j * dst_stride..][..8];
-        let out_second = &mut second[offset + j * dst_stride..][..8];
-        for i in 0..8 {
-            store::<AVERAGE>(&mut out_first[i], value[i]);
-            store::<AVERAGE>(&mut out_second[i], value[i + 8]);
-        }
-    }
-}
-
 /// [`predict`] for a block that reaches outside the picture: the samples it
 /// reads are first gathered with their coordinates clamped to the picture.
 #[cold]
@@ -193,6 +95,12 @@ fn predict_from_edge<const W: usize, const AVERAGE: bool>(
     );
 }
 
+/// The first `W` samples of a line.
+#[inline(always)]
+fn head<const W: usize>(line: &[u8]) -> &[u8; W] {
+    line.first_chunk().expect("a line of the block")
+}
+
 /// Store `value`, or average it into what is there with rounding up.
 #[inline(always)]
 fn store<const AVERAGE: bool>(slot: &mut u8, value: u16) {
@@ -203,9 +111,60 @@ fn store<const AVERAGE: bool>(slot: &mut u8, value: u16) {
     };
 }
 
+/// One line of a block as it is in the source.
+#[inline(always)]
+fn copy<const W: usize, const AVERAGE: bool>(a: &[u8; W], out: &mut [u8]) {
+    let out: &mut [u8; W] = out.first_chunk_mut().expect("a line of the block");
+    for i in 0..W {
+        store::<AVERAGE>(&mut out[i], a[i] as u16);
+    }
+}
+
+/// One line of a block half way between two lines of samples.
+#[inline(always)]
+fn mean<const W: usize, const AVERAGE: bool>(a: &[u8; W], b: &[u8; W], out: &mut [u8]) {
+    let out: &mut [u8; W] = out.first_chunk_mut().expect("a line of the block");
+    for i in 0..W {
+        store::<AVERAGE>(&mut out[i], (a[i] as u16 + b[i] as u16 + 1) >> 1);
+    }
+}
+
+/// One line of a block from the sums of [`pairs`] of the lines above and
+/// below it.
+#[inline(always)]
+fn quarter<const W: usize, const AVERAGE: bool>(
+    upper: &[u16; W],
+    lower: &[u16; W],
+    out: &mut [u8],
+) {
+    let out: &mut [u8; W] = out.first_chunk_mut().expect("a line of the block");
+    for i in 0..W {
+        store::<AVERAGE>(&mut out[i], (upper[i] + lower[i] + 2) >> 2);
+    }
+}
+
+/// The sums of each sample of a line with the one beside it. A line and its
+/// neighbour are two unaligned loads of the same samples, rather than a
+/// shuffle of the first.
+#[inline(always)]
+fn pairs<const W: usize>(line: &[u8]) -> [u16; W] {
+    let (a, b) = (head::<W>(line), head::<W>(&line[1..]));
+    std::array::from_fn(|i| a[i] as u16 + b[i] as u16)
+}
+
 /// The four cases of 7.6.4, with the source known to cover the block and
 /// the half-sample neighbours. Sums are formed in u16 so that they map onto
-/// byte-wise vector instructions.
+/// byte-wise vector instructions, and none can overflow it: the largest is
+/// four samples and a rounding term, 4 * 255 + 2.
+///
+/// The source and destination are cut once into the lines the block touches:
+/// all but the last are whole strides and come from an iterator that has
+/// nothing to check, and the last, which may end where the buffer does, is
+/// handled after the loop. A line of the picture is far longer than a block
+/// is wide, so the length test on each line never fails and costs nothing
+/// that depends on the samples. Each line is one loop over its samples that
+/// stores as it goes, which is the shape that becomes vector instructions on
+/// every target, WebAssembly included.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn interpolate<const W: usize, const AVERAGE: bool>(
@@ -219,52 +178,150 @@ fn interpolate<const W: usize, const AVERAGE: bool>(
     offset: usize,
     dst_stride: usize,
 ) {
-    // Each source line is taken as a whole array, so that the half-sample
-    // neighbour is a second unaligned load rather than a shuffle of the
-    // first.
-    let line = |at: usize| -> &[u8; W] { src[at..at + W].try_into().expect("W samples") };
+    if W == 8 {
+        return interpolate_words::<AVERAGE>(
+            src, start, stride, half_x, half_y, h, dst, offset, dst_stride,
+        );
+    }
+    let lines = h + half_y;
+    let src = &src[start..start + (lines - 1) * stride + W + half_x];
+    let dst = &mut dst[offset..offset + (h - 1) * dst_stride + W];
+    let (src, src_last) = src.split_at((lines - 1) * stride);
+    let (dst, dst_last) = dst.split_at_mut((h - 1) * dst_stride);
+    let mut src = src.chunks_exact(stride);
+    let dst = dst.chunks_exact_mut(dst_stride);
     match (half_x, half_y) {
         (0, 0) => {
-            for j in 0..h {
-                let a = line(start + j * stride);
-                let out = &mut dst[offset + j * dst_stride..][..W];
-                for i in 0..W {
-                    store::<AVERAGE>(&mut out[i], a[i] as u16);
-                }
+            for (line, out) in src.zip(dst) {
+                copy::<W, AVERAGE>(head(line), out);
             }
+            copy::<W, AVERAGE>(head(src_last), dst_last);
         }
         (1, 0) => {
-            for j in 0..h {
-                let a = line(start + j * stride);
-                let b = line(start + j * stride + 1);
-                let out = &mut dst[offset + j * dst_stride..][..W];
-                for i in 0..W {
-                    store::<AVERAGE>(&mut out[i], (a[i] as u16 + b[i] as u16 + 1) >> 1);
-                }
+            for (line, out) in src.zip(dst) {
+                mean::<W, AVERAGE>(head(line), head(&line[1..]), out);
             }
+            mean::<W, AVERAGE>(head(src_last), head(&src_last[1..]), dst_last);
         }
         (0, _) => {
-            for j in 0..h {
-                let a = line(start + j * stride);
-                let b = line(start + (j + 1) * stride);
-                let out = &mut dst[offset + j * dst_stride..][..W];
-                for i in 0..W {
-                    store::<AVERAGE>(&mut out[i], (a[i] as u16 + b[i] as u16 + 1) >> 1);
-                }
+            // Each line is read once, as the lower line of one output and
+            // the upper line of the next.
+            let mut upper: &[u8; W] = head(src.next().expect("a block has lines"));
+            for (line, out) in src.zip(dst) {
+                let lower = head(line);
+                mean::<W, AVERAGE>(upper, lower, out);
+                upper = lower;
             }
+            mean::<W, AVERAGE>(upper, head(src_last), dst_last);
         }
         _ => {
-            for j in 0..h {
-                let a = line(start + j * stride);
-                let b = line(start + j * stride + 1);
-                let c = line(start + (j + 1) * stride);
-                let d = line(start + (j + 1) * stride + 1);
-                let out = &mut dst[offset + j * dst_stride..][..W];
-                for i in 0..W {
-                    let sum = a[i] as u16 + b[i] as u16 + c[i] as u16 + d[i] as u16;
-                    store::<AVERAGE>(&mut out[i], (sum + 2) >> 2);
-                }
+            // As above, with the sums across each line kept rather than the
+            // lines.
+            let mut upper = pairs::<W>(src.next().expect("a block has lines"));
+            for (line, out) in src.zip(dst) {
+                let lower = pairs::<W>(line);
+                quarter::<W, AVERAGE>(&upper, &lower, out);
+                upper = lower;
             }
+            quarter::<W, AVERAGE>(&upper, &pairs::<W>(src_last), dst_last);
+        }
+    }
+}
+
+/// Eight samples of a line, in one integer.
+#[inline(always)]
+fn word(line: &[u8]) -> u64 {
+    u64::from_le_bytes(*head::<8>(line))
+}
+
+/// Byte-wise `(a + b + 1) >> 1`: the bits where the samples differ are
+/// halved, and the common ones kept (a + b = 2 (a | b) - (a ^ b)).
+#[inline(always)]
+fn average(a: u64, b: u64) -> u64 {
+    (a | b) - (((a ^ b) >> 1) & 0x7f7f_7f7f_7f7f_7f7f)
+}
+
+/// [`interpolate`] for eight samples a line, which WebAssembly has no
+/// vector narrowing for: the compiler leaves it in single bytes there, where
+/// eight at a time in an integer is a handful of instructions on every
+/// target.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn interpolate_words<const AVERAGE: bool>(
+    src: &[u8],
+    start: usize,
+    stride: usize,
+    half_x: usize,
+    half_y: usize,
+    h: usize,
+    dst: &mut [u8],
+    offset: usize,
+    dst_stride: usize,
+) {
+    const EVEN: u64 = 0x00ff_00ff_00ff_00ff;
+    let lines = h + half_y;
+    let src = &src[start..start + (lines - 1) * stride + 8 + half_x];
+    let dst = &mut dst[offset..offset + (h - 1) * dst_stride + 8];
+    let (src, src_last) = src.split_at((lines - 1) * stride);
+    let (dst, dst_last) = dst.split_at_mut((h - 1) * dst_stride);
+    let mut src = src.chunks_exact(stride);
+    let dst = dst.chunks_exact_mut(dst_stride);
+    let put = |out: &mut [u8], value: u64| {
+        let out: &mut [u8; 8] = out.first_chunk_mut().expect("a line of the block");
+        let value = if AVERAGE {
+            average(u64::from_le_bytes(*out), value)
+        } else {
+            value
+        };
+        *out = value.to_le_bytes();
+    };
+    // The sums of a line with the one beside it, the even and the odd
+    // samples apart in sixteen-bit lanes: at most 2 * 255 in each.
+    let sums = |line: &[u8]| -> (u64, u64) {
+        let (a, b) = (word(line), word(&line[1..]));
+        (
+            (a & EVEN) + (b & EVEN),
+            ((a >> 8) & EVEN) + ((b >> 8) & EVEN),
+        )
+    };
+    // Four samples and a rounding term, 4 * 255 + 2, fit a lane. The shift
+    // moves the two low bits of each lane into the lane below, and the mask
+    // drops them.
+    let quarter = |upper: (u64, u64), lower: (u64, u64)| -> u64 {
+        let even = ((upper.0 + lower.0 + 0x0002_0002_0002_0002) >> 2) & EVEN;
+        let odd = ((upper.1 + lower.1 + 0x0002_0002_0002_0002) >> 2) & EVEN;
+        even | (odd << 8)
+    };
+    match (half_x, half_y) {
+        (0, 0) => {
+            for (line, out) in src.zip(dst) {
+                put(out, word(line));
+            }
+            put(dst_last, word(src_last));
+        }
+        (1, 0) => {
+            for (line, out) in src.zip(dst) {
+                put(out, average(word(line), word(&line[1..])));
+            }
+            put(dst_last, average(word(src_last), word(&src_last[1..])));
+        }
+        (0, _) => {
+            let mut upper = word(src.next().expect("a block has lines"));
+            for (line, out) in src.zip(dst) {
+                let lower = word(line);
+                put(out, average(upper, lower));
+                upper = lower;
+            }
+            put(dst_last, average(upper, word(src_last)));
+        }
+        _ => {
+            let mut upper = sums(src.next().expect("a block has lines"));
+            for (line, out) in src.zip(dst) {
+                let lower = sums(line);
+                put(out, quarter(upper, lower));
+                upper = lower;
+            }
+            put(dst_last, quarter(upper, sums(src_last)));
         }
     }
 }

@@ -23,11 +23,11 @@
 //! function large enough that WebAssembly engines compile it markedly worse.
 
 mod frame;
-mod idct;
+pub(crate) mod idct;
 mod motion;
 mod order;
 mod picture;
-mod quant;
+pub(crate) mod quant;
 mod stream;
 mod unit;
 

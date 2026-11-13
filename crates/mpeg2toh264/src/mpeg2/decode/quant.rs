@@ -1,76 +1,47 @@
-//! Inverse quantisation of one block (H.262 7.4).
+//! Inverse quantisation of coefficients as they are decoded (H.262 7.4).
 
-use crate::mpeg2::decode::idct::Block;
-
-/// Fill `block` from the quantised levels the parser left in raster order.
-/// Only the positions `mask` names are read; `block` must be clear on entry
-/// (see [`Block::clear`]).
+/// The parameters of 7.4 for one macroblock.
 ///
-/// `intra_dc_mult` is used for position 0 of intra blocks only (7.4.1).
-/// `matrix` is the weighting matrix in raster order and `quantiser_scale`
-/// the value from Table 7-6. Every result is saturated to [-2048, 2047]
-/// (7.4.3), then mismatch control (7.4.4) toggles the least significant bit
-/// of F[7][7] when the sum of all coefficients is even.
-#[inline(never)]
-pub(crate) fn dequantise(
-    levels: &[i16; 64],
-    mask: u64,
-    intra: bool,
-    intra_dc_mult: i32,
-    matrix: &[i32; 64],
-    quantiser_scale: i32,
-    block: &mut Block,
-) {
-    let mut parity = 0i32;
-    let mut rows = 0u8;
-    let mut columns = 0u8;
-    let mut last = 0i32;
-    let mut remaining = mask;
-    while remaining != 0 {
-        let p = remaining.trailing_zeros() as usize;
-        remaining &= remaining - 1;
-        let level = levels[p] as i32;
-        // The widest product is (2 * 32767 + 1) * 255 * 112, inside i32.
-        let value = if intra {
-            if p == 0 {
-                intra_dc_mult * level
-            } else {
-                level * 2 * matrix[p] * quantiser_scale / 32
-            }
-        } else {
-            (level * 2 + level.signum()) * matrix[p] * quantiser_scale / 32
-        }
-        .clamp(-2048, 2047);
-        parity ^= value;
-        if p == 63 {
-            last = value;
-        } else {
-            block.values[p] = value;
-            rows |= 1 << (p >> 3);
-            columns |= 1 << (p & 7);
-        }
+/// `matrix` is the weighting matrix in raster order and `scale` the
+/// `quantiser_scale` from Table 7-6. Every result is saturated to
+/// [-2048, 2047] (7.4.3). The widest product is (2 * 32767 + 1) * 255 * 112,
+/// inside i32.
+#[derive(Clone, Copy)]
+pub(crate) struct Dequantiser<'a> {
+    pub matrix: &'a [i32; 64],
+    pub scale: i32,
+    /// Multiplier of the DC level of intra blocks (7.4.1).
+    pub dc_mult: i32,
+}
+
+impl Dequantiser<'_> {
+    /// F[0][0] of an intra block.
+    #[inline(always)]
+    pub fn intra_dc(&self, level: i32) -> i32 {
+        (self.dc_mult * level).clamp(-2048, 2047)
     }
-    if parity & 1 == 0 {
-        last ^= 1;
+
+    /// A coefficient other than the DC of an intra block, at raster position
+    /// `p`: `factor` is `2 * level` in an intra block and
+    /// `2 * level + sign(level)` in the others (7.4.2.3).
+    #[inline(always)]
+    pub fn weigh(&self, p: usize, factor: i32) -> i32 {
+        (factor * self.matrix[p] * self.scale / 32).clamp(-2048, 2047)
     }
-    block.rows = rows;
-    block.columns = columns;
-    block.last = last;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mpeg2::constants::{DEFAULT_INTRA_QUANT, QUANTISER_SCALE};
+    use crate::mpeg2::decode::idct::Block;
 
-    fn levels_at(entries: &[(usize, i16)]) -> ([i16; 64], u64) {
+    fn levels_at(entries: &[(usize, i16)]) -> [i16; 64] {
         let mut levels = [0i16; 64];
-        let mut mask = 0u64;
         for &(p, level) in entries {
             levels[p] = level;
-            mask |= 1 << p;
         }
-        (levels, mask)
+        levels
     }
 
     fn run(
@@ -80,9 +51,27 @@ mod tests {
         matrix: &[i32; 64],
         qs: i32,
     ) -> ([i32; 64], u8, u8) {
-        let (levels, mask) = levels_at(entries);
+        let dequantiser = Dequantiser {
+            matrix,
+            scale: qs,
+            dc_mult,
+        };
         let mut block = Block::new();
-        dequantise(&levels, mask, intra, dc_mult, matrix, qs, &mut block);
+        let (mut written, mut parity) = (0u64, 0i32);
+        for &(p, level) in entries {
+            let level = level as i32;
+            let value = if !intra {
+                dequantiser.weigh(p, 2 * level + level.signum())
+            } else if p == 0 {
+                dequantiser.intra_dc(level)
+            } else {
+                dequantiser.weigh(p, 2 * level)
+            };
+            block.values[p] = value;
+            written |= 1 << p;
+            parity ^= value;
+        }
+        block.seal(written, parity);
         let mut out = block.values;
         out[63] = block.last;
         (out, block.rows, block.columns)
@@ -96,7 +85,7 @@ mod tests {
         matrix: &[i32; 64],
         qs: i32,
     ) -> [i32; 64] {
-        let (levels, _) = levels_at(entries);
+        let levels = levels_at(entries);
         let mut f = [0i32; 64];
         let mut sum = 0i32;
         for p in 0..64 {

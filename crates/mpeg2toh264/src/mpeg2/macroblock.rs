@@ -11,8 +11,10 @@ use crate::error::{bail, Result};
 use crate::mpeg2::constants::{
     mb_flag, PictureStructure, PictureType, ALTERNATE_SCAN, ZIGZAG_SCAN,
 };
+use crate::mpeg2::decode::idct::Block;
+use crate::mpeg2::decode::quant::Dequantiser;
 use crate::mpeg2::headers::{Picture, Slice};
-use crate::mpeg2::vlc::VlcTable;
+use crate::mpeg2::vlc::{Decoder, VlcTable, WideDecoder, WIDE_BITS};
 use crate::mpeg2::vlc_tables::{
     CODED_BLOCK_PATTERN, DCT_COEFF_TABLE0, DCT_COEFF_TABLE1, DCT_DC_SIZE_CHROMA, DCT_DC_SIZE_LUMA,
     DMVECTOR, EOB, ESCAPE, MB_ADDR_ESCAPE, MB_ADDR_INCREMENT, MB_TYPE_B, MB_TYPE_I, MB_TYPE_P,
@@ -36,22 +38,27 @@ static V_DC_LUMA: LazyLock<VlcTable> =
 static V_DC_CHROMA: LazyLock<VlcTable> =
     LazyLock::new(|| VlcTable::new("dct_dc_size_chrominance", DCT_DC_SIZE_CHROMA));
 static V_COEFF0: LazyLock<VlcTable> =
-    LazyLock::new(|| signed_coefficient_table("dct_coefficients_0", DCT_COEFF_TABLE0));
-static V_COEFF1: LazyLock<VlcTable> =
-    LazyLock::new(|| signed_coefficient_table("dct_coefficients_1", DCT_COEFF_TABLE1));
+    LazyLock::new(|| coefficient_table("dct_coefficients_0", DCT_COEFF_TABLE0, true));
+static V_COEFF0_INTRA: LazyLock<VlcTable> =
+    LazyLock::new(|| coefficient_table("dct_coefficients_0(intra)", DCT_COEFF_TABLE0, false));
+static V_COEFF1_INTRA: LazyLock<VlcTable> =
+    LazyLock::new(|| coefficient_table("dct_coefficients_1", DCT_COEFF_TABLE1, false));
 
-/// How a coefficient comes out of [`signed_coefficient_table`]: the run in
-/// the high bits and the level, offset so that it is never negative, in the
-/// low twelve.
-const COEFFICIENT_RUN_SHIFT: u32 = 12;
-const COEFFICIENT_LEVEL_BIAS: i32 = 2048;
+/// How a coefficient comes out of [`coefficient_table`]: the run in the high
+/// bits and the factor its level contributes to 7.4.2.3, offset so that it is
+/// never negative, in the low eight. The largest level of the tables is 40.
+const COEFFICIENT_RUN_SHIFT: u32 = 8;
+const COEFFICIENT_FACTOR_BIAS: i32 = 128;
 
 /// Table B.14 or B.15 with the sign bit that follows every run/level code
 /// folded into the code itself, so a coefficient is one lookup rather than a
-/// lookup and a bit. End of block and escape carry no sign and stay as they
-/// are. The first lookup covers ten bits: the codes a broadcast spends most
-/// of its time in are six to nine bits before their sign.
-fn signed_coefficient_table(name: &'static str, entries: &[(&str, i32)]) -> VlcTable {
+/// lookup and a bit, and with the level already turned into what inverse
+/// quantisation multiplies by: `2 * level` for an intra block and
+/// `2 * level + sign(level)` for the others (`odd`). End of block and escape
+/// carry no sign and stay as they are. The first lookup covers ten bits: the
+/// codes a broadcast spends most of its time in are six to nine bits before
+/// their sign.
+fn coefficient_table(name: &'static str, entries: &[(&str, i32)], odd: bool) -> VlcTable {
     let mut signed: Vec<(String, i32)> = Vec::with_capacity(entries.len() * 2);
     for &(code, value) in entries {
         if value == EOB || value == ESCAPE {
@@ -61,9 +68,10 @@ fn signed_coefficient_table(name: &'static str, entries: &[(&str, i32)]) -> VlcT
         let run = value >> 8;
         let level = value & 0xff;
         for (sign, level) in [("0", level), ("1", -level)] {
+            let factor = 2 * level + if odd { level.signum() } else { 0 };
             signed.push((
                 format!("{code}{sign}"),
-                (run << COEFFICIENT_RUN_SHIFT) | (level + COEFFICIENT_LEVEL_BIAS),
+                (run << COEFFICIENT_RUN_SHIFT) | (factor + COEFFICIENT_FACTOR_BIAS),
             ));
         }
     }
@@ -71,7 +79,53 @@ fn signed_coefficient_table(name: &'static str, entries: &[(&str, i32)]) -> VlcT
         .iter()
         .map(|(code, value)| (code.as_str(), *value))
         .collect();
-    VlcTable::with_primary_bits(name, &entries, 10)
+    VlcTable::with_primary_bits(name, &entries, WIDE_BITS)
+}
+
+/// What reading a macroblock needs that is the same for every macroblock of
+/// a picture, looked up once rather than each time it is used.
+pub(crate) struct Syntax {
+    address: Decoder<'static>,
+    macroblock_type: Decoder<'static>,
+    pattern: Decoder<'static>,
+    motion: Decoder<'static>,
+    dmvector: Decoder<'static>,
+    scan: &'static [usize; 64],
+    /// Table B.14 for the blocks that are not intra.
+    coefficients: WideDecoder<'static>,
+    /// Table B.14 or, with `intra_vlc_format`, B.15, for intra blocks.
+    intra_coefficients: WideDecoder<'static>,
+    dc_luma: Decoder<'static>,
+    dc_chroma: Decoder<'static>,
+}
+
+impl Syntax {
+    pub(crate) fn new(pic: &Picture) -> Self {
+        Self {
+            address: V_MB_ADDR.decoder(),
+            macroblock_type: match pic.header.picture_coding_type {
+                PictureType::I => V_MB_TYPE_I.decoder(),
+                PictureType::P => V_MB_TYPE_P.decoder(),
+                _ => V_MB_TYPE_B.decoder(),
+            },
+            pattern: V_CBP.decoder(),
+            motion: V_MOTION.decoder(),
+            dmvector: V_DMV.decoder(),
+            scan: if pic.coding.alternate_scan {
+                &ALTERNATE_SCAN
+            } else {
+                &ZIGZAG_SCAN
+            },
+            coefficients: V_COEFF0.wide(),
+            intra_coefficients: if pic.coding.intra_vlc_format == 1 {
+                V_COEFF1_INTRA.wide()
+            } else {
+                V_COEFF0_INTRA.wide()
+            },
+            dc_luma: V_DC_LUMA.decoder(),
+            dc_chroma: V_DC_CHROMA.decoder(),
+        }
+    }
 }
 
 /// `frame_motion_type` / `field_motion_type` values (Tables 6-17, 6-18).
@@ -83,6 +137,8 @@ pub mod motion_type {
     pub const DUAL_PRIME: i32 = 3;
 }
 
+/// The header of one macroblock: everything that decides how it is
+/// predicted. Its coefficients are read block by block after it.
 #[derive(Clone)]
 pub struct Macroblock {
     /// Macroblock address within the picture, in raster order.
@@ -109,30 +165,13 @@ pub struct Macroblock {
     pub field_select: [u8; 4],
     /// How many of the two vector slots are in use.
     pub mv_count: usize,
-    /// Six 8x8 blocks of quantised levels in raster order. Only the positions
-    /// `nonzero` names were written for this picture; the rest hold whatever
-    /// an earlier picture left there, and nothing reads them.
-    blocks: [[i16; 64]; 6],
-    /// Which positions of each block the stream coded, bit `p` for raster
-    /// position `p`. A block carries five non-zero levels in sixty-four on a
-    /// broadcast, so what reads the block walks these bits rather than the
-    /// whole of it -- and the decoder need not clear the other fifty-nine.
-    nonzero: [u64; 6],
-    /// Bit `i` is set when block `i` carries decoded levels.
-    coded_blocks: u8,
 }
 
 impl Macroblock {
-    /// Levels of one 8x8 block and the positions the source coded, or `None`
-    /// where it did not code the block. Positions outside the mask are not
-    /// zero, they are unwritten; read the mask, not the block.
+    /// Whether block `index` (0 to 3 luma, 4 Cb, 5 Cr) is coded.
     #[inline]
-    pub fn coded_block(&self, index: usize) -> Option<(&[i16; 64], u64)> {
-        if self.coded_blocks & (1 << index) != 0 {
-            Some((&self.blocks[index], self.nonzero[index]))
-        } else {
-            None
-        }
+    pub fn is_coded(&self, index: usize) -> bool {
+        self.cbp & (1 << (5 - index)) != 0
     }
 
     #[inline]
@@ -140,12 +179,13 @@ impl Macroblock {
         self.flags & mb_flag::INTRA != 0
     }
 
-    fn empty() -> Self {
+    /// A macroblock with no motion and no coded blocks.
+    pub fn empty(address: usize, quantiser_scale_code: u32) -> Self {
         Self {
-            address: 0,
+            address,
             skipped: false,
             flags: 0,
-            quantiser_scale_code: 0,
+            quantiser_scale_code,
             motion_type: motion_type::NONE,
             dct_type: 0,
             cbp: 0,
@@ -153,101 +193,12 @@ impl Macroblock {
             dmvector: [0; 2],
             field_select: [0; 4],
             mv_count: 1,
-            blocks: [[0; 64]; 6],
-            nonzero: [0; 6],
-            coded_blocks: 0,
         }
-    }
-
-    /// Reset the header fields to decode a fresh macroblock into this cell.
-    ///
-    /// The six blocks keep whatever the previous picture left in them. Nothing
-    /// reads a block `coded_blocks` does not name, and clearing all six is 768
-    /// bytes the browser build writes by hand.
-    fn begin(&mut self, address: usize, quantiser_scale_code: u32) {
-        self.address = address;
-        self.skipped = false;
-        self.flags = 0;
-        self.quantiser_scale_code = quantiser_scale_code;
-        self.motion_type = motion_type::NONE;
-        self.dct_type = 0;
-        self.cbp = 0;
-        self.mv = [0; 8];
-        self.dmvector = [0; 2];
-        self.field_select = [0; 4];
-        self.mv_count = 1;
-        self.coded_blocks = 0;
-    }
-}
-
-/// One picture's macroblocks, indexed by raster macroblock address.
-///
-/// The cells outlive the picture they were decoded for. A macroblock is 848
-/// bytes and an HD picture has six thousand of them, so both handing the array
-/// back to the allocator and emptying it cell by cell cost more than the
-/// decoding does -- in the browser build, where a move is a library call, far
-/// more. Instead the grid keeps its storage, marks every cell absent, and hands
-/// out `&mut` cells for the decoder to write through.
-pub struct MacroblockGrid {
-    cells: Vec<Macroblock>,
-    /// Whether the cell at the same index was decoded for the current picture.
-    present: Vec<bool>,
-    /// Where a macroblock whose address falls outside the picture is decoded.
-    /// Its contents are never read.
-    outside: Macroblock,
-}
-
-impl MacroblockGrid {
-    pub fn new() -> Self {
-        Self {
-            cells: Vec::new(),
-            present: Vec::new(),
-            outside: Macroblock::empty(),
-        }
-    }
-
-    /// Start a picture of `cells` macroblocks, all of them absent.
-    pub fn reset(&mut self, cells: usize) {
-        if self.cells.len() != cells {
-            self.cells.resize_with(cells, Macroblock::empty);
-            self.present.resize(cells, false);
-        }
-        self.present.fill(false);
-    }
-
-    /// The macroblock at `address`, or `None` where this picture did not code one.
-    #[inline]
-    pub fn get(&self, address: usize) -> Option<&Macroblock> {
-        if *self.present.get(address)? {
-            Some(&self.cells[address])
-        } else {
-            None
-        }
-    }
-
-    /// The cell to decode `address` into.
-    #[inline]
-    fn slot(&mut self, address: usize) -> &mut Macroblock {
-        self.cells.get_mut(address).unwrap_or(&mut self.outside)
-    }
-
-    /// Publish a cell `slot` has just been decoded into.
-    #[inline]
-    fn mark(&mut self, address: usize) {
-        if let Some(present) = self.present.get_mut(address) {
-            *present = true;
-        }
-    }
-}
-
-impl Default for MacroblockGrid {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
 /// Per-slice decoder state that persists across macroblocks.
-struct SliceState {
+pub(crate) struct SliceState {
     quantiser_scale_code: u32,
     /// DC predictors for Y, Cb, Cr.
     dc_pred: [i32; 3],
@@ -257,6 +208,29 @@ struct SliceState {
     pmv: [i32; 8],
     /// Previous macroblock's direction flags, which skipped B macroblocks reuse.
     prev_flags: Option<i32>,
+}
+
+impl SliceState {
+    pub(crate) fn new(pic: &Picture, slice: &Slice) -> Self {
+        // DC predictors reset to the midpoint for the picture's DC precision.
+        let dc_pred_reset = 1 << (7 + pic.coding.intra_dc_precision);
+        Self {
+            quantiser_scale_code: slice.quantiser_scale_code,
+            dc_pred: [dc_pred_reset; 3],
+            dc_pred_reset,
+            pmv: [0; 8],
+            prev_flags: None,
+        }
+    }
+
+    /// Note a coded macroblock whose blocks have all been read.
+    pub(crate) fn finish(&mut self, mb: &Macroblock) {
+        if !mb.is_intra() {
+            // Non-intra macroblocks reset the DC predictors (clause 7.2.1).
+            self.dc_pred = [self.dc_pred_reset; 3];
+        }
+        self.prev_flags = Some(mb.flags);
+    }
 }
 
 fn signed_dc_differential(r: &mut BitReader<'_>, size: u32) -> i32 {
@@ -330,12 +304,13 @@ fn motion_spec(picture_structure: PictureStructure, motion: i32) -> MotionSpec {
 /// in and doubled on the way out.
 fn decode_motion_component(
     r: &mut BitReader<'_>,
+    motion: &Decoder<'_>,
     f_code: u32,
     pmv: &mut [i32; 8],
     pmv_index: usize,
     field_vertical_in_frame: bool,
 ) -> Result<i32> {
-    let code = V_MOTION.decode(r)?;
+    let code = motion.decode(r)?;
     let r_size = f_code.saturating_sub(1);
     let f = 1i32 << r_size;
     let delta = if f == 1 || code == 0 {
@@ -384,44 +359,101 @@ fn mirror_single_vector_predictors(pmv: &mut [i32; 8], forward: bool, backward: 
     }
 }
 
-/// Decode the block layer: run/level pairs into an 8x8 array of levels.
-fn decode_block(
+/// Decode the block layer: run/level pairs, dequantised with `dq` as they
+/// come, into `block`. On failure the coefficients read so far are in `block`
+/// all the same, for the caller to clear.
+///
+/// The reader is worked on as a copy and handed back whole: with it in
+/// registers, a coefficient costs no loads and stores beyond the value it
+/// writes.
+pub(crate) fn decode_block(
     r: &mut BitReader<'_>,
-    pic: &Picture,
+    syntax: &Syntax,
     state: &mut SliceState,
     block_index: usize,
     intra: bool,
-    out: &mut [i16; 64],
-    nonzero: &mut u64,
+    dq: &Dequantiser<'_>,
+    block: &mut Block,
 ) -> Result<()> {
-    // `out` is not cleared: `nonzero` says which of it was written, and that
-    // is all any reader looks at.
-    *nonzero = 0;
-    let scan: &[usize; 64] = if pic.coding.alternate_scan {
-        &ALTERNATE_SCAN
+    let mut bits = r.snapshot();
+    let mut stored = Stored::default();
+    let values = &mut block.values;
+    let result = if intra {
+        block_levels::<true>(
+            &mut bits,
+            syntax,
+            state,
+            block_index,
+            dq,
+            values,
+            &mut stored,
+        )
     } else {
-        &ZIGZAG_SCAN
+        block_levels::<false>(
+            &mut bits,
+            syntax,
+            state,
+            block_index,
+            dq,
+            values,
+            &mut stored,
+        )
     };
-    // Intra blocks use Table B.15 when intra_vlc_format is set; everything else
-    // uses Table B.14.
-    let table: &VlcTable = if intra && pic.coding.intra_vlc_format == 1 {
-        &V_COEFF1
+    *r = bits;
+    block.seal(stored.positions, stored.parity);
+    result
+}
+
+/// Which raster positions of a block have been stored and what their values
+/// XOR to, which is all [`Block::seal`] needs of them.
+#[derive(Default)]
+struct Stored {
+    positions: u64,
+    parity: i32,
+}
+
+impl Stored {
+    /// Store the dequantised `value` of raster position `p`, which no earlier
+    /// call named.
+    #[inline(always)]
+    fn put(&mut self, values: &mut [i32; 64], p: usize, value: i32) {
+        values[p] = value;
+        self.positions |= 1 << p;
+        self.parity ^= value;
+    }
+}
+
+#[inline(always)]
+fn block_levels<const INTRA: bool>(
+    r: &mut BitReader<'_>,
+    syntax: &Syntax,
+    state: &mut SliceState,
+    block_index: usize,
+    dq: &Dequantiser<'_>,
+    values: &mut [i32; 64],
+    stored: &mut Stored,
+) -> Result<()> {
+    let scan = syntax.scan;
+    let table = if INTRA {
+        syntax.intra_coefficients
     } else {
-        &V_COEFF0
+        syntax.coefficients
     };
     let mut n: usize;
 
-    if intra {
+    if INTRA {
         let is_luma = block_index < 4;
         let size = if is_luma {
-            V_DC_LUMA.decode(r)?
+            syntax.dc_luma.decode(r)?
         } else {
-            V_DC_CHROMA.decode(r)?
+            syntax.dc_chroma.decode(r)?
         } as u32;
         let component = if is_luma { 0 } else { block_index - 3 }; // 0 = Y, 1 = Cb, 2 = Cr
         state.dc_pred[component] += signed_dc_differential(r, size);
-        out[0] = state.dc_pred[component] as i16;
-        *nonzero = 1;
+        // A predictor that has drifted out of sixteen bits, which only a
+        // damaged stream can make it do, wraps.
+        let level = state.dc_pred[component] as i16 as i32;
+        stored.put(values, 0, dq.intra_dc(level));
         n = 1;
     } else {
         // The first coefficient of a non-intra block uses the one-bit code '1'
@@ -429,8 +461,8 @@ fn decode_block(
         // second coefficient onwards.
         if r.peek(1) == 1 {
             r.skip(1);
-            out[scan[0]] = if r.flag() { -1 } else { 1 };
-            *nonzero = 1 << scan[0];
+            let factor = if r.flag() { -3 } else { 3 };
+            stored.put(values, scan[0] & 63, dq.weigh(scan[0] & 63, factor));
             n = 1;
         } else {
             n = 0;
@@ -438,105 +470,76 @@ fn decode_block(
     }
 
     loop {
-        let sym = table.decode(r)?;
-        if sym == EOB {
-            break;
+        // The longest code is 17 bits with its sign, and an escape is
+        // followed by 18 more: one top-up covers a whole coefficient.
+        r.ensure(35);
+        let entry = table.entry(r.window());
+        let len = entry & 31;
+        if len == 0 {
+            return Err(table.invalid(r.window(), r.bit_pos()));
         }
-        let (run, level) = if sym == ESCAPE {
-            let run = r.u(6) as usize;
-            let raw = r.u(12) as i32;
-            (run, if raw >= 2048 { raw - 4096 } else { raw })
-        } else {
+        r.consume(len);
+        let sym = (entry as i32) >> 5;
+        let (run, factor) = if sym >= 0 {
             (
                 (sym >> COEFFICIENT_RUN_SHIFT) as usize,
-                (sym & ((1 << COEFFICIENT_RUN_SHIFT) - 1)) - COEFFICIENT_LEVEL_BIAS,
+                (sym & ((1 << COEFFICIENT_RUN_SHIFT) - 1)) - COEFFICIENT_FACTOR_BIAS,
             )
+        } else if sym == EOB {
+            return Ok(());
+        } else {
+            let escape = r.window();
+            r.consume(18);
+            let run = (escape >> 58) as usize;
+            let raw = ((escape >> 46) & 0xfff) as i32;
+            let level = if raw >= 2048 { raw - 4096 } else { raw };
+            (run, level * 2 + if INTRA { 0 } else { level.signum() })
         };
         n += run;
         if n > 63 {
             bail!("coefficient index {n} out of range at bit {}", r.bit_pos());
         }
-        out[scan[n]] = level as i16;
-        *nonzero |= 1 << scan[n];
+        // Every entry of a scan table is a position of the block; the mask
+        // says so where the two stores below would otherwise check it.
+        let p = scan[n] & 63;
+        stored.put(values, p, dq.weigh(p, factor));
         n += 1;
     }
-    Ok(())
 }
 
-/// Decode every macroblock of one slice into `grid`, which is indexed by raster
-/// macroblock address across the whole picture.
-pub fn decode_slice(
-    r: &mut BitReader<'_>,
-    pic: &Picture,
-    slice: &Slice,
-    mb_width: usize,
-    grid: &mut MacroblockGrid,
-) -> Result<()> {
-    r.set_bit_pos(slice.data_start_bit);
-
-    // DC predictors reset to the midpoint for the picture's DC precision.
-    let dc_pred_reset = 1 << (7 + pic.coding.intra_dc_precision);
-    let mut state = SliceState {
-        quantiser_scale_code: slice.quantiser_scale_code,
-        dc_pred: [dc_pred_reset; 3],
-        dc_pred_reset,
-        pmv: [0; 8],
-        prev_flags: None,
+/// The `macroblock_address_increment` that opens the next macroblock of a
+/// slice, or `None` where the slice ends.
+///
+/// Clause 6.2.4: macroblocks continue until 23 zero bits appear at the
+/// current position. decode_or_zero_stuffing folds that check into the first
+/// address VLC lookup, avoiding two reads from every normal boundary.
+pub(crate) fn address_increment(r: &mut BitReader<'_>, syntax: &Syntax) -> Result<Option<i32>> {
+    let Some(mut sym) = syntax.address.decode_or_zero_stuffing(r)? else {
+        return Ok(None);
     };
-
-    let picture_type = pic.header.picture_coding_type;
-    let frame = pic.coding.picture_structure == PictureStructure::Frame;
-    // slice_vertical_position is 1-based and names the macroblock row.
-    let mut address = (slice.vertical_position as isize - 1) * mb_width as isize - 1;
-
-    // Clause 6.2.4: macroblocks continue until 23 zero bits appear at the
-    // current position. decode_or_zero_stuffing folds that check into the first
-    // address VLC lookup, avoiding two reads from every normal boundary.
+    let mut increment = 0i32;
     loop {
-        let mut increment = 0i32;
-        let Some(mut sym) = V_MB_ADDR.decode_or_zero_stuffing(r)? else {
-            break;
-        };
-        loop {
-            if sym == MB_ADDR_ESCAPE {
-                increment += 33;
-                sym = V_MB_ADDR.decode(r)?;
-                continue;
-            }
-            increment += sym;
-            break;
+        if sym == MB_ADDR_ESCAPE {
+            increment += 33;
+            sym = syntax.address.decode(r)?;
+            continue;
         }
-
-        // Everything between the previous macroblock and this one is skipped.
-        for _ in 1..increment {
-            address += 1;
-            let at = address as usize;
-            make_skipped(grid.slot(at), at, &mut state, picture_type, frame);
-            grid.mark(at);
-        }
-        address += 1;
-
-        let at = address as usize;
-        let mb = grid.slot(at);
-        decode_macroblock(r, pic, &mut state, at, frame, mb)?;
-        state.prev_flags = Some(mb.flags);
-        grid.mark(at);
+        increment += sym;
+        break;
     }
-
-    Ok(())
+    Ok(Some(increment))
 }
 
 /// A skipped macroblock. In P pictures it is a zero-vector copy and resets the
 /// predictors; in B pictures it repeats the previous macroblock's prediction, so
 /// the predictors carry over untouched (clause 7.6.6).
-fn make_skipped(
-    skipped: &mut Macroblock,
-    address: usize,
+pub(crate) fn skipped_macroblock(
     state: &mut SliceState,
+    address: usize,
     picture_type: PictureType,
     frame_picture: bool,
-) {
-    skipped.begin(address, state.quantiser_scale_code);
+) -> Macroblock {
+    let mut skipped = Macroblock::empty(address, state.quantiser_scale_code);
     skipped.skipped = true;
 
     if picture_type == PictureType::P {
@@ -571,23 +574,20 @@ fn make_skipped(
     }
     // A skipped macroblock has no coded blocks, so the DC predictors reset.
     state.dc_pred = [state.dc_pred_reset; 3];
+    skipped
 }
 
-fn decode_macroblock(
+/// The macroblock layer up to its blocks.
+pub(crate) fn macroblock_header(
     r: &mut BitReader<'_>,
     pic: &Picture,
+    syntax: &Syntax,
     state: &mut SliceState,
     address: usize,
     frame: bool,
-    mb: &mut Macroblock,
-) -> Result<()> {
+) -> Result<Macroblock> {
     let picture_type = pic.header.picture_coding_type;
-    let type_table: &VlcTable = match picture_type {
-        PictureType::I => &V_MB_TYPE_I,
-        PictureType::P => &V_MB_TYPE_P,
-        _ => &V_MB_TYPE_B,
-    };
-    let flags = type_table.decode(r)?;
+    let flags = syntax.macroblock_type.decode(r)?;
     let intra = flags & mb_flag::INTRA != 0;
     let has_motion = flags & (mb_flag::MOTION_FORWARD | mb_flag::MOTION_BACKWARD) != 0;
     let conceal = pic.coding.concealment_motion_vectors;
@@ -648,19 +648,21 @@ fn decode_macroblock(
             }
             let base = vec * 4 + s * 2;
             let field_vertical_in_frame = spec.field_format && frame;
-            mv[base] = decode_motion_component(r, f_code_h, &mut state.pmv, base, false)?;
+            mv[base] =
+                decode_motion_component(r, &syntax.motion, f_code_h, &mut state.pmv, base, false)?;
             if spec.dmv {
-                dmvector[0] = V_DMV.decode(r)?;
+                dmvector[0] = syntax.dmvector.decode(r)?;
             }
             mv[base + 1] = decode_motion_component(
                 r,
+                &syntax.motion,
                 f_code_v,
                 &mut state.pmv,
                 base + 1,
                 field_vertical_in_frame,
             )?;
             if spec.dmv {
-                dmvector[1] = V_DMV.decode(r)?;
+                dmvector[1] = syntax.dmvector.decode(r)?;
             }
         }
     }
@@ -678,10 +680,10 @@ fn decode_macroblock(
 
     let mut cbp = 0;
     if flags & mb_flag::PATTERN != 0 {
-        cbp = V_CBP.decode(r)?;
+        cbp = syntax.pattern.decode(r)?;
     }
 
-    mb.begin(address, state.quantiser_scale_code);
+    let mut mb = Macroblock::empty(address, state.quantiser_scale_code);
     mb.flags = flags;
     mb.motion_type = motion;
     mb.dct_type = dct_type;
@@ -690,32 +692,7 @@ fn decode_macroblock(
     mb.dmvector = dmvector;
     mb.field_select = field_select;
     mb.mv_count = mv_count;
-
-    for i in 0..6 {
-        let coded = intra || cbp & (1 << (5 - i)) != 0;
-        if coded {
-            // Straight into the macroblock: a block built on the stack and
-            // assigned in is another hundred and twenty-eight bytes copied per
-            // coded block, which the browser build pays for in memcpy.
-            decode_block(
-                r,
-                pic,
-                state,
-                i,
-                intra,
-                &mut mb.blocks[i],
-                &mut mb.nonzero[i],
-            )?;
-            mb.coded_blocks |= 1 << i;
-        }
-    }
-
-    if !intra {
-        // Non-intra macroblocks reset the DC predictors (clause 7.2.1).
-        state.dc_pred = [state.dc_pred_reset; 3];
-    }
-
-    Ok(())
+    Ok(mb)
 }
 
 #[cfg(test)]
