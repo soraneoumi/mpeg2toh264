@@ -98,6 +98,7 @@ export interface PlayerDeinterlacer {
    * `Mpeg2TsPlayerOptions.softwareDecode`.
    */
   readonly decodedVideo?: PlayerDecodedVideo | null;
+  /** Whether the deinterlacer, rather than the element, is showing the picture. */
   readonly running: boolean;
   /** Field information selected for the picture most recently presented. */
   readonly scan: Scan | null;
@@ -511,7 +512,14 @@ export class Mpeg2TsPlayer extends EventTarget {
    * frame; a browser that cannot run it stays false.
    */
   get deinterlace(): boolean {
-    return this.#deinterlacer?.running ?? false;
+    const deinterlacer = this.#deinterlacer;
+    if (!deinterlacer?.running) return false;
+    // Decoded pictures are on the deinterlacer's canvas filtered or not, so
+    // there it says only that they are shown.
+    return (
+      !this.#decoding ||
+      (deinterlacer.enabled && (deinterlacer.scan?.interlaced ?? true))
+    );
   }
 
   /** Whether deinterlacing was asked for, whatever the source turned out to be. */

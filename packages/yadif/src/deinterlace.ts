@@ -810,6 +810,12 @@ export class Deinterlacer extends EventTarget {
   #displayHeight = 0;
   /** The element's own inline aspect ratio, from before decoded pictures gave it theirs. */
   #elementAspectRatio: string | null = null;
+  /** Whether the element answers for the decoded pictures; see `#standInForElement`. */
+  #elementStandsIn = false;
+  /** Decoded pictures pushed since the counts were last reset. */
+  #picturesPushed = 0;
+  /** Pictures a Worker renderer dropped unshown, as of its last report. */
+  #workerPictureDrops = 0;
   /**
    * Buffers transferred to the Worker and not yet back, by the id they went
    * with. A Worker that goes away takes them with it, and what is handed
@@ -944,13 +950,15 @@ export class Deinterlacer extends EventTarget {
     video.addEventListener("waiting", this.#onWaiting);
   }
 
+  /**
+   * Whether the canvas, rather than the element, is what shows the picture.
+   * A page uses this to decide which of the two to capture or transform.
+   * Filtering an element's own picture that is the same as filtering it at
+   * all, since a progressive source is left to the element. Decoded pictures
+   * are on the canvas filtered or not, because the element has none.
+   */
   get running(): boolean {
-    if (this.#decoded)
-      return (
-        this.#running &&
-        this.#enabled &&
-        (this.#shownOutput?.scan.interlaced ?? true)
-      );
+    if (this.#decoded) return this.#running;
     return this.#running && (this.#scan?.interlaced ?? true);
   }
 
@@ -1313,6 +1321,9 @@ export class Deinterlacer extends EventTarget {
           : "hidden";
         break;
       case "stats": {
+        if (this.#decoded)
+          this.#workerPictureDrops =
+            notification.stats.missed + notification.stats.queueResetted;
         const stats: DeinterlaceStats = {
           ...notification.stats,
           dropped:
@@ -1579,6 +1590,7 @@ export class Deinterlacer extends EventTarget {
     this.#video.removeEventListener("waiting", this.#onWaiting);
     if (this.#elementAspectRatio !== null)
       this.#video.style.aspectRatio = this.#elementAspectRatio;
+    this.#stopStandingIn();
     this.#unmount();
     for (const texture of this.#textures) this.#gl.deleteTexture(texture);
     this.#textures = [];
@@ -2073,6 +2085,7 @@ export class Deinterlacer extends EventTarget {
       this.#release(picture.data);
       throw error;
     }
+    this.#picturesPushed++;
     this.#setDisplaySize(picture.displayWidth, picture.displayHeight);
     // Stopped, destroyed or without a context: nothing will show it.
     if (!this.#running) {
@@ -2122,11 +2135,64 @@ export class Deinterlacer extends EventTarget {
     if (width === this.#displayWidth && height === this.#displayHeight) return;
     this.#displayWidth = width;
     this.#displayHeight = height;
-    if (!this.#externalHost) {
-      this.#elementAspectRatio ??= this.#video.style.aspectRatio;
-      this.#video.style.aspectRatio = `${width} / ${height}`;
+    // A Worker's renderer has no element, and one that has been destroyed
+    // has given the element back.
+    if (this.#externalHost || this.#destroyed) {
+      this.#layout();
+      return;
     }
-    this.#layout();
+    this.#elementAspectRatio ??= this.#video.style.aspectRatio;
+    this.#video.style.aspectRatio = `${width} / ${height}`;
+    this.#standInForElement();
+    // An element says its picture changed size with this event, and what it
+    // now reports has. The layout follows from it as from any other.
+    this.#video.dispatchEvent(new Event("resize"));
+  }
+
+  /**
+   * Let the element answer for the pictures it does not carry. A page reads
+   * a video's size and frame counts from the element -- to refuse a capture
+   * of nothing, to shape a picture-in-picture placeholder, to show them --
+   * and an element playing only the sound says 0 by 0 and no frames. So it
+   * is given the decoded pictures' answers as properties of its own, which
+   * hide the built-in ones until `destroy` takes them away again.
+   */
+  #standInForElement(): void {
+    if (this.#elementStandsIn) return;
+    this.#elementStandsIn = true;
+    const video = this.#video;
+    Object.defineProperty(video, "videoWidth", {
+      configurable: true,
+      get: () => this.#displayWidth,
+    });
+    Object.defineProperty(video, "videoHeight", {
+      configurable: true,
+      get: () => this.#displayHeight,
+    });
+    Object.defineProperty(video, "getVideoPlaybackQuality", {
+      configurable: true,
+      value: (): VideoPlaybackQuality => ({
+        creationTime: performance.now(),
+        totalVideoFrames: this.#picturesPushed,
+        // Whole pictures that were never shown: too late to be taken in, or
+        // more than are held. A Worker renderer keeps its own count.
+        droppedVideoFrames:
+          this.#stats.missed +
+          this.#stats.queueResetted +
+          this.#workerPictureDrops,
+        corruptedVideoFrames: 0,
+      }),
+    });
+  }
+
+  /** Give the element's own size and frame counts back. */
+  #stopStandingIn(): void {
+    if (!this.#elementStandsIn) return;
+    this.#elementStandsIn = false;
+    const video = this.#video as unknown as Record<string, unknown>;
+    delete video.videoWidth;
+    delete video.videoHeight;
+    delete video.getVideoPlaybackQuality;
   }
 
   /** Transfer a picture to the Worker, which sends its buffer back when done. */
@@ -4144,6 +4210,8 @@ export class Deinterlacer extends EventTarget {
       queueResetted: 0,
       matched: 0,
     };
+    this.#picturesPushed = 0;
+    this.#workerPictureDrops = 0;
     this.#phaseCounts.fill(0);
     this.#filmDropped = 0;
     this.#lastPresented = 0;

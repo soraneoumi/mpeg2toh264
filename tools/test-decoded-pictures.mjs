@@ -1139,13 +1139,28 @@ for (const rate of [1.5, 2])
   const pictures = stream({ count: 400 });
   const media = playing();
   const producer = new Producer(pictures, { window: 10 });
+  const counts = {};
   const { result, refreshMs } = await play({
     seconds: 1.5,
     media,
     pictures,
     producer,
+    script: (vsync, control) => {
+      if (vsync !== 80) return;
+      counts.quality = control.video.getVideoPlaybackQuality();
+      counts.pushed = producer.pushed;
+      counts.held = producer.outstanding.size;
+    },
   });
   assert.ok(producer.mostHeld <= 24, `${producer.mostHeld} held`);
+  // The element counts every picture pushed, and as dropped the ones that
+  // came back without having been shown.
+  assert.equal(counts.quality.totalVideoFrames, counts.pushed);
+  assert.ok(counts.quality.droppedVideoFrames > 100);
+  assert.ok(
+    counts.quality.droppedVideoFrames <= counts.pushed - counts.held,
+    JSON.stringify(counts),
+  );
   const kept = producer.pushed - producer.outstanding.size;
   const list = outputs(pictures);
   const shown = appearances(result, list, refreshMs);
@@ -1190,25 +1205,38 @@ for (const rate of [1.5, 2])
     toleranceMs: 1.5,
   });
   assert.equal(marks.visibility, "visible");
-  assert.equal(marks.running, false);
+  // The canvas is still what shows the picture, which is what running says.
+  assert.equal(marks.running, true);
   console.log("ok filtering off: woven pictures on time, canvas kept");
 }
 
 // A new size between pictures: textures, canvas and its box follow, the
-// planes are uploaded as laid out, and capture() is of the display size.
+// planes are uploaded as laid out, and capture() is of the display size. The
+// element reports the size the pictures are shown at and says when it changes.
 {
   const pictures = stream({ count: 300 });
   const media = playing();
   const producer = new Producer(pictures);
   const uploads = [];
-  const marks = {};
-  const { result, refreshMs } = await play({
+  const marks = { resized: [] };
+  const {
+    result,
+    refreshMs,
+    control: page,
+  } = await play({
     seconds: 4,
     media,
     pictures,
     producer,
     script: (vsync, control, context) => {
       context.uploads = uploads;
+      if (vsync === 0)
+        control.video.addEventListener("resize", () =>
+          marks.resized.push([
+            control.video.videoWidth,
+            control.video.videoHeight,
+          ]),
+        );
       // Pictures go 0.3 s ahead, so this is the size from about 2 s.
       if (control.now() >= BASE_MS + 1700) {
         producer.width = 17;
@@ -1223,6 +1251,9 @@ for (const rate of [1.5, 2])
           canvas.style.height,
         ];
         marks.aspect = control.video.style.aspectRatio;
+        marks.element = [control.video.videoWidth, control.video.videoHeight];
+        marks.quality = control.video.getVideoPlaybackQuality();
+        marks.pushed = producer.pushed;
         const images = [];
         control.pageContext.createImageBitmap = (...args) => {
           images.push(args);
@@ -1239,6 +1270,21 @@ for (const rate of [1.5, 2])
   assert.equal(marks.size[3], `${(9 * 1920) / 34}px`);
   // The element has no picture of its own to take its proportions from.
   assert.equal(marks.aspect, "34 / 9");
+  // Nor a size or frame counts, so it reports the decoded pictures'.
+  assert.deepEqual(marks.element, [34, 9]);
+  assert.deepEqual(marks.resized, [
+    [26, 11],
+    [34, 9],
+  ]);
+  assert.equal(marks.quality.totalVideoFrames, marks.pushed);
+  assert.equal(marks.quality.droppedVideoFrames, 0);
+  // Destroying the deinterlacer gives the element's own answers back.
+  for (const name of ["videoWidth", "videoHeight", "getVideoPlaybackQuality"])
+    assert.equal(
+      Object.getOwnPropertyDescriptor(page.video, name),
+      undefined,
+      `${name} is still overridden`,
+    );
   assert.equal(marks.images.length, 1);
   assert.equal(marks.images[0][1].resizeWidth, 34);
   assert.equal(marks.images[0][1].resizeHeight, 9);
