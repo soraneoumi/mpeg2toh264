@@ -3,13 +3,18 @@
 //! concealment of what could not be decoded.
 
 use crate::bitreader::BitReader;
+use crate::error::Result;
+use crate::mpeg2::constants::PictureStructure;
 use crate::mpeg2::constants::{mb_flag, PictureType};
 use crate::mpeg2::decode::frame::FrameBuffer;
 use crate::mpeg2::decode::idct::{idct_add, idct_put, Block};
-use crate::mpeg2::decode::motion::{self, predict_chroma};
-use crate::mpeg2::decode::quant::dequantise;
-use crate::mpeg2::headers::Picture;
-use crate::mpeg2::macroblock::{decode_slice, motion_type, Macroblock, MacroblockGrid};
+use crate::mpeg2::decode::motion;
+use crate::mpeg2::decode::quant::Dequantiser;
+use crate::mpeg2::headers::{Picture, Slice};
+use crate::mpeg2::macroblock::{
+    address_increment, decode_block, macroblock_header, motion_type, skipped_macroblock,
+    Macroblock, SliceState, Syntax,
+};
 
 /// What a picture is decoded as, derived and checked by the caller.
 pub(crate) struct Params<'a> {
@@ -110,11 +115,36 @@ impl Motion {
     }
 }
 
+/// A macroblock parsed where it cannot be reconstructed at once: below the
+/// row of its slice, which only a damaged stream codes. It waits, whole, for a
+/// slice of its own row to reach it or for the sweep at the end of the picture;
+/// a macroblock coded at the same address again replaces it.
+struct Deferred {
+    mb: Macroblock,
+    /// Bit `i` set when `blocks[i]` holds the coefficients of block `i`.
+    coded: u8,
+    blocks: [Block; 6],
+    /// Whether the macroblock was read to its end.
+    complete: bool,
+}
+
+const STORED: &str = "stored coefficients cannot fail to be read";
+
+/// Where a macroblock goes once parsed.
+enum Placement {
+    /// Already reconstructed, or outside the picture: read and dropped.
+    Discard,
+    /// Reconstructed as it is read.
+    Now,
+    /// Kept for later.
+    Later,
+}
+
 /// Reusable state for decoding pictures, sized for the largest picture seen.
 pub(crate) struct Work {
-    grid: MacroblockGrid,
-    /// Whether the macroblock at the same address has been stored.
+    /// Whether the macroblock at the same address has been reconstructed.
     done: Vec<bool>,
+    deferred: Vec<Deferred>,
     samples: Samples,
     block: Block,
 }
@@ -122,8 +152,8 @@ pub(crate) struct Work {
 impl Work {
     pub fn new() -> Self {
         Self {
-            grid: MacroblockGrid::new(),
             done: Vec::new(),
+            deferred: Vec::new(),
             samples: Samples {
                 luma: [0; 256],
                 chroma: [[0; 64]; 2],
@@ -137,10 +167,12 @@ impl Work {
     /// prediction needs a reference that is absent. Returns how many were
     /// concealed.
     ///
-    /// Each slice is reconstructed as soon as it is parsed, while its
-    /// macroblocks are still in cache. A slice that runs past its row (only
-    /// a damaged one can) leaves macroblocks elsewhere, which the final
-    /// sweep picks up.
+    /// A macroblock is reconstructed as it is read: its prediction first,
+    /// then each block as its coefficients are decoded. A slice that runs
+    /// past its row (only a damaged one can) leaves macroblocks elsewhere,
+    /// which are kept until a slice of their own row ends or, failing that,
+    /// until the sweep at the end. A macroblock a slice fails in is not
+    /// reconstructed, and is concealed unless another slice codes it.
     pub fn decode(
         &mut self,
         data: &[u8],
@@ -150,28 +182,38 @@ impl Work {
         target: &mut FrameBuffer,
     ) -> usize {
         let cells = params.mb_width * params.mb_rows;
-        self.grid.reset(cells);
         self.done.clear();
         self.done.resize(cells, false);
+        self.deferred.clear();
         let mut reader = BitReader::new(data);
+        let syntax = Syntax::new(picture);
         let mut concealed = 0;
         for slice in &picture.slices {
             // A slice that fails part way keeps the macroblocks before the
             // failure; the rest of its row is concealed.
-            let _ = decode_slice(&mut reader, picture, slice, params.mb_width, &mut self.grid);
+            let _ = self.slice(
+                &mut reader,
+                picture,
+                &syntax,
+                slice,
+                params,
+                references,
+                target,
+                &mut concealed,
+            );
             let row = slice.vertical_position as usize - 1;
             if row < params.mb_rows {
-                for address in row * params.mb_width..(row + 1) * params.mb_width {
-                    if !self.done[address] {
-                        if let Some(mb) = self.grid.get(address) {
-                            self.done[address] = true;
-                            let samples = &mut self.samples;
-                            if !macroblock(params, mb, &mut self.block, samples, references, target)
-                            {
-                                conceal(params, address, references, target);
-                                concealed += 1;
-                            }
-                        }
+                let first = row * params.mb_width;
+                for index in 0..self.deferred.len() {
+                    let address = self.deferred[index].mb.address;
+                    if (first..first + params.mb_width).contains(&address) {
+                        self.reconstruct_deferred(
+                            index,
+                            params,
+                            references,
+                            target,
+                            &mut concealed,
+                        );
                     }
                 }
             }
@@ -180,23 +222,272 @@ impl Work {
             if self.done[address] {
                 continue;
             }
-            let decoded = match self.grid.get(address) {
-                Some(mb) => macroblock(
-                    params,
-                    mb,
-                    &mut self.block,
-                    &mut self.samples,
-                    references,
-                    target,
-                ),
-                None => false,
-            };
-            if !decoded {
-                conceal(params, address, references, target);
-                concealed += 1;
+            match self
+                .deferred
+                .iter()
+                .position(|cell| cell.mb.address == address)
+            {
+                Some(index) if self.deferred[index].complete => {
+                    self.reconstruct_deferred(index, params, references, target, &mut concealed);
+                }
+                _ => {
+                    conceal(params, address, references, target);
+                    concealed += 1;
+                }
             }
         }
         concealed
+    }
+
+    /// Read one slice, reconstructing or keeping each macroblock.
+    #[allow(clippy::too_many_arguments)]
+    fn slice(
+        &mut self,
+        r: &mut BitReader<'_>,
+        picture: &Picture,
+        syntax: &Syntax,
+        slice: &Slice,
+        params: &Params<'_>,
+        references: References<'_>,
+        target: &mut FrameBuffer,
+        concealed: &mut usize,
+    ) -> Result<()> {
+        r.set_bit_pos(slice.data_start_bit);
+        let mut state = SliceState::new(picture, slice);
+        let picture_type = picture.header.picture_coding_type;
+        let frame = picture.coding.picture_structure == PictureStructure::Frame;
+        // slice_vertical_position is 1-based and names the macroblock row.
+        let row = slice.vertical_position as usize - 1;
+        let mut address = row as isize * params.mb_width as isize - 1;
+        while let Some(increment) = address_increment(r, syntax)? {
+            // Everything between the previous macroblock and this one is skipped.
+            for _ in 1..increment {
+                address += 1;
+                let mb = skipped_macroblock(&mut state, address as usize, picture_type, frame);
+                self.place(
+                    r, syntax, &mut state, params, references, target, row, &mb, concealed,
+                )?;
+            }
+            address += 1;
+            let mb = macroblock_header(r, picture, syntax, &mut state, address as usize, frame)?;
+            self.place(
+                r, syntax, &mut state, params, references, target, row, &mb, concealed,
+            )?;
+            state.finish(&mb);
+        }
+        Ok(())
+    }
+
+    /// Read the blocks of `mb`, whose header has just been read, and see to
+    /// the macroblock as its address says: `row` is the slice's row.
+    #[allow(clippy::too_many_arguments)]
+    fn place(
+        &mut self,
+        r: &mut BitReader<'_>,
+        syntax: &Syntax,
+        state: &mut SliceState,
+        params: &Params<'_>,
+        references: References<'_>,
+        target: &mut FrameBuffer,
+        row: usize,
+        mb: &Macroblock,
+        concealed: &mut usize,
+    ) -> Result<()> {
+        let address = mb.address;
+        let placement = if address >= self.done.len() || self.done[address] {
+            Placement::Discard
+        } else if address < (row + 1) * params.mb_width
+            && !self.deferred.iter().any(|cell| cell.mb.address == address)
+        {
+            Placement::Now
+        } else {
+            Placement::Later
+        };
+        let dequantiser = Dequantiser {
+            matrix: if mb.is_intra() {
+                params.intra_matrix
+            } else {
+                params.non_intra_matrix
+            },
+            scale: params.quantiser_scale[mb.quantiser_scale_code as usize & 31],
+            dc_mult: params.intra_dc_mult,
+        };
+        match placement {
+            Placement::Discard => {
+                for index in 0..6 {
+                    if mb.is_coded(index) {
+                        let result = decode_block(
+                            r,
+                            syntax,
+                            state,
+                            index,
+                            mb.is_intra(),
+                            &dequantiser,
+                            &mut self.block,
+                        );
+                        self.block.clear();
+                        result?;
+                    }
+                }
+            }
+            Placement::Now => {
+                // A slice's addresses only go up from the start of its row, so
+                // one short of the row's end is in the row.
+                let mby = row;
+                let mbx = address - row * params.mb_width;
+                let mut reading = Reading {
+                    r,
+                    syntax,
+                    state,
+                    dequantiser,
+                    block: &mut self.block,
+                };
+                let predicted = if params.second_field
+                    && params.picture_type == PictureType::P
+                    && !mb.is_intra()
+                {
+                    // The prediction may read the first field of `target`, so
+                    // it is formed apart and stored afterwards.
+                    let mut destination = Destination::samples(&mut self.samples);
+                    let predicted = reconstruct(
+                        params,
+                        mb,
+                        mbx,
+                        mby,
+                        references,
+                        Some(target),
+                        &mut destination,
+                        &mut reading,
+                    )?;
+                    if predicted {
+                        store(&self.samples, params.parity, mbx, mby, target);
+                    }
+                    predicted
+                } else {
+                    let mut destination = Destination::frame(target, params.parity, mbx, mby);
+                    reconstruct(
+                        params,
+                        mb,
+                        mbx,
+                        mby,
+                        references,
+                        None,
+                        &mut destination,
+                        &mut reading,
+                    )?
+                };
+                self.done[address] = true;
+                if !predicted {
+                    conceal(params, address, references, target);
+                    *concealed += 1;
+                }
+            }
+            Placement::Later => {
+                let index = match self
+                    .deferred
+                    .iter()
+                    .position(|cell| cell.mb.address == address)
+                {
+                    Some(index) => index,
+                    None => {
+                        self.deferred.push(Deferred {
+                            mb: mb.clone(),
+                            coded: 0,
+                            blocks: std::array::from_fn(|_| Block::new()),
+                            complete: false,
+                        });
+                        self.deferred.len() - 1
+                    }
+                };
+                let cell = &mut self.deferred[index];
+                for (index, block) in cell.blocks.iter_mut().enumerate() {
+                    if cell.coded & (1 << index) != 0 {
+                        block.clear();
+                    }
+                }
+                cell.coded = 0;
+                cell.mb = mb.clone();
+                for index in 0..6 {
+                    if mb.is_coded(index) {
+                        let block = &mut cell.blocks[index];
+                        let result = decode_block(
+                            r,
+                            syntax,
+                            state,
+                            index,
+                            mb.is_intra(),
+                            &dequantiser,
+                            block,
+                        );
+                        if result.is_err() {
+                            block.clear();
+                        }
+                        result?;
+                        cell.coded |= 1 << index;
+                    }
+                }
+                cell.complete = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reconstruct the deferred macroblock at `index` of the list, unless its
+    /// address has been done, and conceal it if it cannot be predicted.
+    fn reconstruct_deferred(
+        &mut self,
+        index: usize,
+        params: &Params<'_>,
+        references: References<'_>,
+        target: &mut FrameBuffer,
+        concealed: &mut usize,
+    ) {
+        let cell = &self.deferred[index];
+        let address = cell.mb.address;
+        if !cell.complete || self.done[address] {
+            return;
+        }
+        self.done[address] = true;
+        let mbx = address % params.mb_width;
+        let mby = address / params.mb_width;
+        let mb = &cell.mb;
+        let mut stored = Stored(&cell.blocks);
+        let predicted =
+            if params.second_field && params.picture_type == PictureType::P && !mb.is_intra() {
+                let mut destination = Destination::samples(&mut self.samples);
+                let predicted = reconstruct(
+                    params,
+                    mb,
+                    mbx,
+                    mby,
+                    references,
+                    Some(target),
+                    &mut destination,
+                    &mut stored,
+                )
+                .expect(STORED);
+                if predicted {
+                    store(&self.samples, params.parity, mbx, mby, target);
+                }
+                predicted
+            } else {
+                let mut destination = Destination::frame(target, params.parity, mbx, mby);
+                reconstruct(
+                    params,
+                    mb,
+                    mbx,
+                    mby,
+                    references,
+                    None,
+                    &mut destination,
+                    &mut stored,
+                )
+                .expect(STORED)
+            };
+        if !predicted {
+            conceal(params, address, references, target);
+            *concealed += 1;
+        }
     }
 }
 
@@ -248,111 +539,104 @@ fn half_rounded(x: i32) -> i32 {
     }
 }
 
-/// Reconstruct one parsed macroblock into `target`. Returns false when it
-/// cannot be predicted: a reference it needs is absent or its prediction
-/// mode is invalid for the picture. What it stored then is to be concealed.
-fn macroblock(
-    params: &Params<'_>,
-    mb: &Macroblock,
-    block: &mut Block,
-    samples: &mut Samples,
-    references: References<'_>,
-    target: &mut FrameBuffer,
-) -> bool {
-    let mbx = mb.address % params.mb_width;
-    let mby = mb.address / params.mb_width;
-    if params.second_field && params.picture_type == PictureType::P && !mb.is_intra() {
-        // The prediction may read the first field of `target`, so it is
-        // formed apart and stored afterwards.
-        let mut destination = Destination::samples(samples);
-        if !reconstruct(
-            params,
-            mb,
-            mbx,
-            mby,
-            block,
-            references,
-            Some(target),
-            &mut destination,
-        ) {
-            return false;
+/// Where the dequantised coefficients of a macroblock's blocks come from.
+trait Coefficients {
+    /// Block `index` of `mb`, which is coded. It is valid until [`Self::release`].
+    fn block(&mut self, mb: &Macroblock, index: usize) -> Result<&Block>;
+    /// Done with the block last handed out.
+    fn release(&mut self);
+}
+
+/// The bit stream, a block read at a time into one scratch [`Block`].
+struct Reading<'a, 'b> {
+    r: &'a mut BitReader<'b>,
+    syntax: &'a Syntax,
+    state: &'a mut SliceState,
+    dequantiser: Dequantiser<'a>,
+    block: &'a mut Block,
+}
+
+impl Coefficients for Reading<'_, '_> {
+    fn block(&mut self, mb: &Macroblock, index: usize) -> Result<&Block> {
+        let result = decode_block(
+            self.r,
+            self.syntax,
+            self.state,
+            index,
+            mb.is_intra(),
+            &self.dequantiser,
+            self.block,
+        );
+        if result.is_err() {
+            self.block.clear();
         }
-        store(samples, params.parity, mbx, mby, target);
-        true
-    } else {
-        let mut destination = Destination::frame(target, params.parity, mbx, mby);
-        reconstruct(
-            params,
-            mb,
-            mbx,
-            mby,
-            block,
-            references,
-            None,
-            &mut destination,
-        )
+        result.map(|()| &*self.block)
+    }
+
+    fn release(&mut self) {
+        self.block.clear();
     }
 }
 
-/// Predict a non-intra macroblock, then add or store its coefficient blocks.
+/// The blocks of a [`Deferred`] macroblock.
+struct Stored<'a>(&'a [Block; 6]);
+
+impl Coefficients for Stored<'_> {
+    fn block(&mut self, _: &Macroblock, index: usize) -> Result<&Block> {
+        Ok(&self.0[index])
+    }
+
+    fn release(&mut self) {}
+}
+
+/// Predict a non-intra macroblock, then add or store its coefficient blocks as
+/// `coefficients` supplies them. Returns false when it cannot be predicted:
+/// a reference it needs is absent or its prediction mode is invalid for the
+/// picture. What it stored then is to be concealed, but its blocks are read
+/// all the same, so that the slice stays in step.
 #[allow(clippy::too_many_arguments)]
 fn reconstruct(
     params: &Params<'_>,
     mb: &Macroblock,
     mbx: usize,
     mby: usize,
-    block: &mut Block,
     references: References<'_>,
     current: Option<&FrameBuffer>,
     dst: &mut Destination<'_>,
-) -> bool {
+    coefficients: &mut impl Coefficients,
+) -> Result<bool> {
     let intra = mb.is_intra();
-    if !intra && !predict(params, &Motion::of(mb), mbx, mby, references, current, dst) {
-        return false;
-    }
-    let quantiser_scale = params.quantiser_scale[mb.quantiser_scale_code as usize & 31];
-    let matrix = if intra {
-        params.intra_matrix
-    } else {
-        params.non_intra_matrix
-    };
+    let predicted = intra || predict(params, &Motion::of(mb), mbx, mby, references, current, dst);
     // Field DCT (6.3.17.1) puts the lines of each field in their own luma
     // blocks: blocks 0 and 1 hold the top field, 2 and 3 the bottom.
     let field_dct = mb.dct_type == 1 && params.parity.is_none();
     for index in 0..6 {
-        // Every block of an intra macroblock is coded.
-        let Some((levels, mask)) = mb.coded_block(index) else {
+        if !mb.is_coded(index) {
             continue;
-        };
-        dequantise(
-            levels,
-            mask,
-            intra,
-            params.intra_dc_mult,
-            matrix,
-            quantiser_scale,
-            block,
-        );
-        let (component, offset, stride) = if index < 4 {
-            let x = (index & 1) * 8;
-            let stride = dst.stride[0];
-            if field_dct {
-                (0, (index >> 1) * stride + x, stride * 2)
-            } else {
-                (0, (index >> 1) * 8 * stride + x, stride)
-            }
-        } else {
-            (index - 3, 0, dst.stride[index - 3])
-        };
-        let at = dst.origin[component] + offset;
-        if intra {
-            idct_put(block, dst.planes[component], at, stride);
-        } else {
-            idct_add(block, dst.planes[component], at, stride);
         }
-        block.clear(mask);
+        let block = coefficients.block(mb, index)?;
+        if predicted {
+            let (component, offset, stride) = if index < 4 {
+                let x = (index & 1) * 8;
+                let stride = dst.stride[0];
+                if field_dct {
+                    (0, (index >> 1) * stride + x, stride * 2)
+                } else {
+                    (0, (index >> 1) * 8 * stride + x, stride)
+                }
+            } else {
+                (index - 3, 0, dst.stride[index - 3])
+            };
+            let at = dst.origin[component] + offset;
+            if intra {
+                idct_put(block, dst.planes[component], at, stride);
+            } else {
+                idct_add(block, dst.planes[component], at, stride);
+            }
+        }
+        coefficients.release();
     }
-    true
+    Ok(predicted)
 }
 
 /// Copy a macroblock formed in `samples` to its place in `target`.
@@ -428,24 +712,14 @@ fn predict(
         _ => return false,
     }
 
-    let mut average = false;
-    for direction in 0..2 {
-        let wanted = if direction == 0 { forward } else { backward };
-        if !wanted {
-            continue;
-        }
-        let formed = match params.parity {
-            None => frame_picture(params, mb, direction, mbx, mby, references, dst, average),
-            Some(parity) => field_picture(
-                params, mb, direction, parity, mbx, mby, references, current, dst, average,
-            ),
-        };
-        if !formed {
-            return false;
-        }
-        average = true;
-    }
-    true
+    // The second direction is averaged into the first.
+    let mut form = |direction: usize, average: bool| match params.parity {
+        None => frame_picture(params, mb, direction, mbx, mby, references, dst, average),
+        Some(parity) => field_picture(
+            params, mb, direction, parity, mbx, mby, references, current, dst, average,
+        ),
+    };
+    (!forward || form(0, false)) && (!backward || form(1, forward))
 }
 
 /// The reference frame a frame prediction in `direction` reads.
@@ -715,40 +989,46 @@ fn part(
     let luma = source.view(0, parity);
     let offset = dst.origin[0] + lines.first * dst.stride[0];
     let stride = dst.stride[0] * lines.step;
-    let chroma = [source.view(1, parity), source.view(2, parity)];
     let [luma_dst, cb_dst, cr_dst] = &mut dst.planes;
-    let chroma_dst: [&mut [u8]; 2] = [cb_dst, cr_dst];
     // Cb and Cr share their layout.
     let chroma_offset = dst.origin[1] + lines.chroma_first * dst.stride[1];
     let chroma_stride = dst.stride[1] * lines.step;
     let (cx, cy, cvx, cvy) = (x / 2, y / 2, vx / 2, vy / 2);
     let h = lines.count;
+    let chroma = [
+        (source.view(1, parity), cb_dst),
+        (source.view(2, parity), cr_dst),
+    ];
     if average {
         motion::predict::<16, true>(luma, x, y, vx, vy, h, luma_dst, offset, stride);
-        predict_chroma::<true>(
-            chroma,
-            cx,
-            cy,
-            cvx,
-            cvy,
-            h / 2,
-            chroma_dst,
-            chroma_offset,
-            chroma_stride,
-        );
+        for (view, plane) in chroma {
+            motion::predict::<8, true>(
+                view,
+                cx,
+                cy,
+                cvx,
+                cvy,
+                h / 2,
+                plane,
+                chroma_offset,
+                chroma_stride,
+            );
+        }
     } else {
         motion::predict::<16, false>(luma, x, y, vx, vy, h, luma_dst, offset, stride);
-        predict_chroma::<false>(
-            chroma,
-            cx,
-            cy,
-            cvx,
-            cvy,
-            h / 2,
-            chroma_dst,
-            chroma_offset,
-            chroma_stride,
-        );
+        for (view, plane) in chroma {
+            motion::predict::<8, false>(
+                view,
+                cx,
+                cy,
+                cvx,
+                cvy,
+                h / 2,
+                plane,
+                chroma_offset,
+                chroma_stride,
+            );
+        }
     }
 }
 
