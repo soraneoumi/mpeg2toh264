@@ -174,7 +174,7 @@ class b {
    * bytes that are no longer there.
    */
   reset() {
-    this.#c || (this.#d++, this.#h = [], this.#S = 0, this.#l = [], this.#b = !1, this.#D = !1, this.#u = !1, this.#v(), this.#t && (this.#y = !0), this.#O(!0), this.#p(), this.#E());
+    this.#c || (this.#d++, this.#h = [], this.#S = 0, this.#l = [], this.#b = !1, this.#D = !1, this.#u = !1, this.#v(), this.#t && (this.#y = !0), this.#B(!0), this.#p(), this.#E());
   }
   async finish() {
     if (this.#D = !0, this.#c || !this.#t) return;
@@ -190,7 +190,7 @@ class b {
     ), this.mediaSource.removeEventListener(
       "endstreaming",
       this.#C
-    )), this.#t?.removeEventListener("updateend", this.#L), this.#t?.removeEventListener("error", this.#W), this.#t = null, this.#h = [], this.#S = 0, this.#l = [], this.#s.abandon(), this.#O(!0));
+    )), this.#t?.removeEventListener("updateend", this.#L), this.#t?.removeEventListener("error", this.#W), this.#t = null, this.#h = [], this.#S = 0, this.#l = [], this.#s.abandon(), this.#B(!0));
   }
   /** Tell the sink where playback has got to, so it can evict what is behind. */
   setCurrentTime(e) {
@@ -215,7 +215,7 @@ class b {
     if (this.#u) return;
     const t = this.#h[0];
     if (!t) {
-      this.#O(!1);
+      this.#B(!1);
       return;
     }
     if (!(!t.init && this.#U())) {
@@ -353,7 +353,7 @@ class b {
     e !== this.#k && (this.#k = e, this.#r.onBlocked?.(e));
   }
   /** Wake `finish`, either because everything is appended or because we gave up. */
-  #O(e) {
+  #B(e) {
     if (!e && (!this.#D || this.#h.length > 0 || this.#a))
       return;
     const t = this.#R;
@@ -366,7 +366,7 @@ class b {
     );
   }
 }
-const w = "" + new URL("assets/worker-DwvtOjqV.js", import.meta.url).href, M = w, u = 0.1, f = [
+const w = "" + new URL("assets/worker-BKm2K4oM.js", import.meta.url).href, M = w, u = 0.1, f = [
   "loadedmetadata",
   "loadeddata",
   "canplay",
@@ -449,7 +449,7 @@ class I extends EventTarget {
   constructor(e, t = {}) {
     super(), this.video = e, this.#e = t;
     const i = t.mediaSource ?? "auto";
-    this.#r = i === "auto" ? m(t.preferManagedMediaSource) ? "worker" : "main" : i, this.video.addEventListener("seeking", this.#z);
+    this.#r = i === "auto" ? m(t.preferManagedMediaSource) ? "worker" : "main" : i, this.video.addEventListener("seeking", this.#q);
     for (const s of p)
       this.video.addEventListener(s, this.#v);
     for (const s of f)
@@ -679,7 +679,7 @@ class I extends EventTarget {
     });
   };
   /** Show a picture of the current run, and hand back one of an older run. */
-  #O(e, t) {
+  #B(e, t) {
     const i = this.#i?.decodedVideo;
     if (e !== this.#U || !i) {
       this.#G(t.data);
@@ -699,12 +699,12 @@ class I extends EventTarget {
   /** Abandon the current load. The player stays usable. */
   stop() {
     const e = this.#t;
-    this.#t++, this.#M = null, this.#n?.postMessage({ type: "stop", id: e }), this.#Y(), this.#x(new Error("the load was stopped")), this.#A("idle");
+    this.#t++, this.#M = null, this.#n?.postMessage({ type: "stop", id: e }), this.#Y(), this.#V(new Error("the load was stopped")), this.#A("idle");
   }
   /** Stop, and give up the worker. The player cannot be loaded again. */
   destroy() {
     if (!this.#c) {
-      this.stop(), this.#c = !0, this.video.removeEventListener("seeking", this.#z);
+      this.stop(), this.#c = !0, this.video.removeEventListener("seeking", this.#q);
       for (const e of p)
         this.video.removeEventListener(e, this.#v);
       for (const e of f)
@@ -735,7 +735,7 @@ class I extends EventTarget {
     if (t.id === this.#t)
       switch (t.type) {
         case "handle":
-          t.managed && this.#j(), this.video.srcObject = t.handle, this.#B("attached", a());
+          t.managed && this.#z(), this.video.srcObject = t.handle, this.#O("attached", a());
           break;
         case "open":
           this.#J(t.mimeCodec, t.data);
@@ -755,7 +755,7 @@ class I extends EventTarget {
           );
           break;
         case "opened":
-          this.#A("converting"), this.#x(null);
+          this.#A("converting"), this.#V(null);
           break;
         case "seekable":
           this.#k = t.duration, this.#o?.setDuration(t.duration), this.#m("seekable", { duration: t.duration });
@@ -764,7 +764,7 @@ class I extends EventTarget {
           this.#_(), this.#o?.reset(), this.#s && this.#p();
           break;
         case "picture":
-          this.#O(t.epoch, t.picture);
+          this.#B(t.epoch, t.picture);
           break;
         case "pictures-end":
           this.#s && t.epoch === this.#U && this.#i?.decodedVideo?.finish();
@@ -786,10 +786,10 @@ class I extends EventTarget {
           this.#m(t.type, t.stream);
           break;
         case "mark":
-          this.#B(t.name, t.at);
+          this.#O(t.name, t.at);
           break;
         case "seek":
-          this.#q(t.time);
+          this.#j(t.time);
           break;
         case "hold":
           this.#y = t.seconds, this.#o?.holdStart(t.seconds);
@@ -810,7 +810,7 @@ class I extends EventTarget {
           this.#te();
           break;
         case "completed":
-          this.#A("completed"), this.#r === "worker" && this.#V();
+          this.#A("completed"), this.#r === "worker" && this.#x();
           break;
         case "error":
           this.#w(new Error(t.message));
@@ -843,8 +843,8 @@ class I extends EventTarget {
       queueHighWaterMark: this.#e.queueHighWaterMark ?? 33554432,
       maxAheadSeconds: this.#e.maxAheadSeconds ?? 8,
       keepBehindSeconds: this.#e.keepBehindSeconds ?? 10,
-      seek: (i) => this.#q(i),
-      onMark: (i) => this.#B(i, a()),
+      seek: (i) => this.#j(i),
+      onMark: (i) => this.#O(i, a()),
       onReadyChange: (i) => this.#Q(e, { type: "flow", id: e, ready: i }),
       onBlocked: (i) => {
         e === this.#t && this.#A(i ? "buffer-full" : "converting");
@@ -853,7 +853,7 @@ class I extends EventTarget {
         e === this.#t && this.#w(i);
       }
     });
-    return this.#o = t, this.#h = URL.createObjectURL(t.mediaSource), t.managed ? this.#ee(this.#h) : this.video.src = this.#h, this.#B("attached", a()), this.#k !== null && t.setDuration(this.#k), t;
+    return this.#o = t, this.#h = URL.createObjectURL(t.mediaSource), t.managed ? this.#ee(this.#h) : this.video.src = this.#h, this.#O("attached", a()), this.#k !== null && t.setDuration(this.#k), t;
   }
   /**
    * Put a Managed Media Source on the element, which takes more than a `src`.
@@ -865,7 +865,7 @@ class I extends EventTarget {
    * arrives and the load waits for a stream that has not begun.
    */
   #ee(e) {
-    this.video.removeAttribute("src"), this.#j();
+    this.video.removeAttribute("src"), this.#z();
     const t = document.createElement("source");
     t.type = "video/mp4", t.src = e, this.video.append(t), this.#S = t, this.video.load();
   }
@@ -875,14 +875,14 @@ class I extends EventTarget {
    * belongs to whoever made it, so it is put back on the way out -- unless it
    * was already off, and theirs to keep.
    */
-  #j() {
+  #z() {
     this.video.disableRemotePlayback || (this.video.disableRemotePlayback = !0, this.#a = !0);
   }
   #te() {
     const e = this.#t, t = this.#o;
     t && t.finish().then(
       () => {
-        e === this.#t && this.#V();
+        e === this.#t && this.#x();
       },
       (i) => {
         e === this.#t && this.#w(o(i));
@@ -895,7 +895,7 @@ class I extends EventTarget {
    * position begin there, so the run they belong to goes on, and the sound
    * held back for them has not been let into the element any earlier.
    */
-  #q(e) {
+  #j(e) {
     this.video.currentTime >= e || (this.video.currentTime = e, this.#M = this.video.currentTime);
   }
   /**
@@ -907,7 +907,7 @@ class I extends EventTarget {
    * a real seek: the worker throws the buffer away and reads the input again
    * from where the viewer asked to be.
    */
-  #z = () => {
+  #q = () => {
     const e = this.#M === this.video.currentTime;
     if (this.#M = null, e || this.#g === "idle" || this.#g === "error" || (this.#s && this.#p(), this.#k === null)) return;
     const t = this.video.currentTime;
@@ -918,7 +918,7 @@ class I extends EventTarget {
     }));
   };
   #K = (e) => {
-    this.#g !== "idle" && (this.#B(e.type, a()), e.type === "waiting" && this.#ie());
+    this.#g !== "idle" && (this.#O(e.type, a()), e.type === "waiting" && this.#ie());
   };
   /**
    * Move the playhead over a hole in the media, where playback has stopped at
@@ -958,7 +958,7 @@ class I extends EventTarget {
    * reading the two contexts share; what a caller wants is how long it waited,
    * which is measured from here.
    */
-  #B(e, t) {
+  #O(e, t) {
     if (this.#l === 0) return;
     const i = t - this.#l, s = Math.max(0, t - this.#b);
     this.#b = Math.max(this.#b, t), this.#m("timing", { name: e, sinceLoad: i, sincePrevious: s });
@@ -992,7 +992,7 @@ class I extends EventTarget {
       200
     ));
   }
-  #V() {
+  #x() {
     this.#u !== null && (clearInterval(this.#u), this.#u = null);
   }
   /**
@@ -1019,14 +1019,14 @@ class I extends EventTarget {
     this.#f = null, this.stop(), this.#H(this.#D, !1).then(e?.resolve, (i) => e?.reject(i));
   }
   #Y() {
-    this.#V(), this.#E !== null && clearInterval(this.#E), this.#E = null;
+    this.#x(), this.#E !== null && clearInterval(this.#E), this.#E = null;
     const e = this.#s;
     this.#s = !1, e && this.#i?.decodedVideo?.reset(), this.#_(), this.#o?.close(), this.#o = null, this.#h && URL.revokeObjectURL(this.#h), this.#h = null, this.#S?.remove(), this.#S = null, this.#a && (this.video.disableRemotePlayback = !1, this.#a = !1), this.video.removeAttribute("src"), this.video.srcObject = null, this.video.load();
   }
   #w(e) {
-    this.#Y(), this.#A("error"), this.#x(e), this.#m("error", { error: e });
+    this.#Y(), this.#A("error"), this.#V(e), this.#m("error", { error: e });
   }
-  #x(e) {
+  #V(e) {
     const t = this.#f;
     t && (this.#f = null, e ? t.reject(e) : t.resolve());
   }
