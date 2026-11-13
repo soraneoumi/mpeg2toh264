@@ -67,7 +67,7 @@ export declare function supportsVideoFrames(): boolean;
  */
 export declare class VideoFrames {
     #private;
-    constructor(video: HTMLVideoElement, takeFrame?: () => VideoFrame | null | undefined, 
+    constructor(video: HTMLVideoElement, 
     /**
      * Returns the PictureWatch used to find Firefox's new pictures, or null
      * when there is none. Called on every poll because the renderer that owns
