@@ -130,7 +130,7 @@ class b {
         e !== this.#g && (this.#o = e);
       else {
         const i = this.mediaSource.addSourceBuffer(e);
-        i.mode = "segments", i.addEventListener("updateend", this.#I), i.addEventListener("error", this.#O), this.#t = i, this.#g = e;
+        i.mode = "segments", i.addEventListener("updateend", this.#I), i.addEventListener("error", this.#B), this.#t = i, this.#g = e;
       }
       this.#T({ data: t, init: !0 }), this.#N();
     }
@@ -190,7 +190,7 @@ class b {
     ), this.mediaSource.removeEventListener(
       "endstreaming",
       this.#G
-    )), this.#t?.removeEventListener("updateend", this.#I), this.#t?.removeEventListener("error", this.#O), this.#t = null, this.#h = [], this.#v = 0, this.#l = [], this.#s.abandon(), this.#C(!0));
+    )), this.#t?.removeEventListener("updateend", this.#I), this.#t?.removeEventListener("error", this.#B), this.#t = null, this.#h = [], this.#v = 0, this.#l = [], this.#s.abandon(), this.#C(!0));
   }
   /** Tell the sink where playback has got to, so it can evict what is behind. */
   setCurrentTime(e) {
@@ -265,7 +265,7 @@ class b {
   #G = () => {
     this.#p = !1, this.#f(), this.#D();
   };
-  #O = () => {
+  #B = () => {
     this.#R(new Error("the SourceBuffer rejected what was appended"));
   };
   /**
@@ -329,12 +329,12 @@ class b {
     }
   }
   /** How far past the playhead the buffer reaches, in seconds. */
-  #B() {
+  #O() {
     const e = this.#t?.buffered;
     return !e || e.length === 0 ? 0 : e.end(e.length - 1) - this.#M;
   }
   #f() {
-    const e = !this.#u && this.#p && this.#B() < this.#r.maxAheadSeconds && this.#v < this.#r.queueHighWaterMark && // The fragment limit would stop the input before a start hold fills.
+    const e = !this.#u && this.#p && this.#O() < this.#r.maxAheadSeconds && this.#v < this.#r.queueHighWaterMark && // The fragment limit would stop the input before a start hold fills.
     (this.#i > 0 || this.#h.length < 2);
     this.#s.set(e) && this.#r.onReadyChange?.(e);
   }
@@ -361,7 +361,7 @@ class b {
     );
   }
 }
-const w = "" + new URL("assets/worker-CNPFPPkn.js", import.meta.url).href, M = w, u = 0.1, f = [
+const w = "" + new URL("assets/worker-DFyyk5eB.js", import.meta.url).href, M = w, u = 0.1, f = [
   "loadedmetadata",
   "loadeddata",
   "canplay",
@@ -567,17 +567,17 @@ class I extends EventTarget {
       }
   }
   #W(e, t, i) {
-    e <= 0 || t <= 0 || this.#O({ start: i, codedSize: { width: e, height: t } });
+    e <= 0 || t <= 0 || this.#B({ start: i, codedSize: { width: e, height: t } });
   }
   /** Add source metadata now, but apply it only when its picture is shown. */
   #G(e) {
     for (const { start: t, interlaced: i, topFieldFirst: s } of e)
-      this.#O({
+      this.#B({
         start: t,
         scan: { interlaced: i, topFieldFirst: s }
       });
   }
-  #O(e) {
+  #B(e) {
     const t = this.#d.at(-1), i = {
       start: e.start,
       codedSize: e.codedSize ?? t?.codedSize,
@@ -643,7 +643,7 @@ class I extends EventTarget {
       queueHighWaterMark: this.#e.queueHighWaterMark ?? 33554432,
       maxAheadSeconds: this.#e.maxAheadSeconds ?? 8,
       keepBehindSeconds: this.#e.keepBehindSeconds ?? 10
-    }), this.#Q(), this.#s && s && (s.onrelease = this.#H, this.#B(), this.#T = setInterval(this.#f, 40)), g;
+    }), this.#Q(), this.#s && s && (s.onrelease = this.#H, this.#O(), this.#T = setInterval(this.#f, 40)), g;
   }
   /** Give a picture's buffer back to the worker that made it. */
   #H = (e) => {
@@ -653,7 +653,7 @@ class I extends EventTarget {
     );
   };
   /** Forget the pictures held and ask for the ones at the playhead. */
-  #B() {
+  #O() {
     this.#P++, this.#i?.decodedVideo?.reset(), this.#f();
   }
   /** Ask for the pictures from the playhead to a little past it. */
@@ -751,7 +751,7 @@ class I extends EventTarget {
           this.#S = t.duration, this.#o?.setDuration(t.duration), this.#m("seekable", { duration: t.duration });
           break;
         case "reset":
-          this.#U(), this.#o?.reset(), this.#s && this.#B();
+          this.#U(), this.#o?.reset(), this.#s && this.#O();
           break;
         case "picture":
           this.#D(t.epoch, t.picture);
@@ -890,7 +890,7 @@ class I extends EventTarget {
    * the input again from where the viewer asked to be.
    */
   #j = () => {
-    if (this.#g === "idle" || this.#g === "error" || (this.#s && this.#B(), this.#S === null)) return;
+    if (this.#g === "idle" || this.#g === "error" || (this.#s && this.#O(), this.#S === null)) return;
     const e = this.video.currentTime;
     this.#te(e) || (this.#w("seeking"), this.#U(), this.#Q(), this.#n?.postMessage({
       type: "seek",
