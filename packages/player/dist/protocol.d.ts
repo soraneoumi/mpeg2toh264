@@ -67,7 +67,7 @@ export declare const TAIL_PROBE_BYTES: number;
  * A transport stream carries a PES header every picture, so the answer is in
  * the first few kilobytes; this is sized for the gap between them in a stream
  * whose video has stopped for a moment, and it is small enough that spending
- * several of them still costs less than transcoding a second of video.
+ * several of them still costs less than packaging a second of video.
  */
 export declare const SEEK_PROBE_BYTES: number;
 /** How many of those a seek may read before it takes the best offset it has. */
@@ -83,14 +83,59 @@ export declare const SEEK_PROBE_TOLERANCE_SECONDS = 0.5;
  * itself up to a group later.
  */
 export declare const SEEK_LEAD_SECONDS = 1;
+/**
+ * How often the page asks for decoded pictures, in milliseconds, and how far
+ * ahead of the playhead at normal speed. See the `need` command.
+ */
+export declare const PICTURE_NEED_INTERVAL_MS = 40;
+export declare const PICTURE_NEED_AHEAD_SECONDS = 0.3;
 /** Which side of the wire owns the `MediaSource`. */
 export type SinkKind = "worker" | "main";
 /**
+ * What becomes of the pictures. `passthrough` carries the MPEG-2 into the MP4
+ * for the browser to decode; `decode` decodes them in the worker for a
+ * deinterlacer that takes decoded pictures, and the MP4 carries the sound
+ * alone.
+ */
+export type VideoMode = "passthrough" | "decode";
+/**
+ * One decoded picture, as a deinterlacer's `decodedVideo.push` takes it.
+ * Times are seconds on the media element's timeline; the planes are 4:2:0,
+ * 8-bit, limited range, each starting at its offset in `data` with its own
+ * row stride.
+ */
+export interface DecodedPicture {
+    timestamp: number;
+    duration: number;
+    width: number;
+    height: number;
+    displayWidth: number;
+    displayHeight: number;
+    data: ArrayBuffer;
+    planes: readonly [
+        {
+            offset: number;
+            stride: number;
+        },
+        {
+            offset: number;
+            stride: number;
+        },
+        {
+            offset: number;
+            stride: number;
+        }
+    ];
+    interlaced: boolean;
+    topFieldFirst: boolean;
+    repeatFirstField: boolean;
+    matrix: "bt709" | "bt601";
+}
+/**
  * How the source pictures were captured, as the MPEG-2 headers said.
  *
- * This is the one thing about the picture that the conversion cannot carry:
- * H.264 is decoded into frames, and a frame holding two moments is not
- * distinguishable from one holding a single moment once it has been decoded.
+ * A picture does not say this once it has been decoded into a frame: a frame
+ * holding two moments is not distinguishable from one holding a single moment.
  * A player that deinterlaces has to be told, and this is the telling -- which
  * lines to keep, and whether to filter at all.
  *
@@ -137,10 +182,9 @@ export interface LoadCommand {
     url: string;
     /** Where the `.wasm` is, or null to take the copy next to the worker. */
     wasmUrl: string | null;
-    oversample: number | undefined;
     recoveryInterval: number | undefined;
-    openGopRecovery: "idr" | "recovery-point" | "discard" | undefined;
-    /** Give each field of a complementary pair its own MP4 sample. */
+    openGopRecovery: "recovery-point" | "discard" | undefined;
+    /** Give each field of a complementary pair its own MP4 sample. Passthrough only. */
     splitFieldSamples: boolean | undefined;
     /**
      * Steps of 2^(1/4) to raise the sound by, for up to two channels and for
@@ -148,24 +192,7 @@ export interface LoadCommand {
      */
     audioGainSteps: number;
     surroundAudioGainSteps: number;
-    /**
-     * Whether to carry the MPEG-2 video through as it stands rather than
-     * converting it, for a browser whose decoder takes MPEG-2.
-     */
-    passthrough: boolean;
-    /**
-     * How many workers convert pictures alongside the one that owns the session.
-     *
-     * A group of pictures divides into frames that have nothing to say to each
-     * other, so they can be converted at once; what cannot be divided is under a
-     * tenth of the work. Undefined sizes it from `hardwareConcurrency`, and 1
-     * converts them in the session's own worker as it always did.
-     *
-     * The output does not depend on this. Where a worker cannot spawn workers
-     * the pool is quietly not there, and the `workers` notification says what
-     * was settled on.
-     */
-    pictureWorkers: number | undefined;
+    video: VideoMode;
     /**
      * Which service to convert, out of a transport stream that carries more than
      * one. Null takes the first that turns up with a picture in it, which is
@@ -173,8 +200,6 @@ export interface LoadCommand {
      */
     serviceId: number | null;
     sink: SinkKind;
-    /** Also forward compressed video to a filter that decodes its own input before presentation. */
-    encodedVideo: boolean;
     /**
      * Open a Managed Media Source where the browser has both. It reaches the
      * worker because either side may be the one holding the source.
@@ -217,6 +242,24 @@ export type Command = LoadCommand
     id: number;
     pid: number | null;
     dualMonoSub: boolean | null;
+}
+/**
+ * Decode mode: the pictures from `from` to `until`, in media seconds, are
+ * wanted. A request of a new epoch, or one that jumps, starts decoding
+ * again; one of an epoch older than the last `reset` is ignored.
+ */
+ | {
+    type: "need";
+    id: number;
+    epoch: number;
+    from: number;
+    until: number;
+}
+/** A picture's buffer back from the renderer, to be used again. */
+ | {
+    type: "recycle";
+    id: number;
+    data: ArrayBuffer;
 } | {
     type: "stop";
     id: number;
@@ -238,10 +281,6 @@ export type Notification = {
     id: number;
     mimeCodec: string;
     data: ArrayBuffer;
-} | {
-    type: "video-data";
-    id: number;
-    data: ArrayBuffer | null;
 } | {
     type: "video-config";
     id: number;
@@ -272,9 +311,34 @@ export type Notification = {
     id: number;
     duration: number;
 }
-/** Throw away everything buffered; a seek is about to refill it. */
+/**
+ * Throw away everything buffered; a seek is about to refill it. In decode
+ * mode this comes whichever side holds the MediaSource, and requests of the
+ * epochs before it are ignored from here on.
+ */
  | {
     type: "reset";
+    id: number;
+}
+/** Decode mode: a picture decoded for a request of `epoch`. */
+ | {
+    type: "picture";
+    id: number;
+    epoch: number;
+    picture: DecodedPicture;
+}
+/** Decode mode: every picture after the request of `epoch` has been sent. */
+ | {
+    type: "pictures-end";
+    id: number;
+    epoch: number;
+}
+/**
+ * Decode mode cannot play this stream: it has no AAC sound to keep the
+ * clock. No media went out before this, and the load has ended.
+ */
+ | {
+    type: "no-aac-audio";
     id: number;
 }
 /**
@@ -319,15 +383,6 @@ export type Notification = {
     type: "services";
     id: number;
     services: Services;
-}
-/**
- * How many picture workers came up, which is zero where this browser would
- * not have them and the conversion runs in one worker as before.
- */
- | {
-    type: "workers";
-    id: number;
-    pictureWorkers: number;
 }
 /**
  * What sound the programme is carrying and which of it is being taken. Sent
@@ -387,7 +442,7 @@ export type TimingMark = "load"
  | "response"
 /** The first slice of the input has been read. */
  | "first-byte"
-/** The transcoder has produced a fragment: the first picture is converted. */
+/** The session has produced a fragment: the first picture is packaged. */
  | "first-fragment"
 /** The initialization segment has reached the sink; the stream is open. */
  | "opened"
@@ -419,6 +474,11 @@ export interface Timing {
     /** Milliseconds since the step before it, whatever that was. */
     sincePrevious: number;
 }
+/**
+ * In decode mode the rates and `videoFrames` describe the pictures decoded,
+ * `convertingMs` is the decoding and the session's own work together, and
+ * `errors` counts units that failed to decode as well.
+ */
 export interface Stats {
     dropped: number;
     scrambled: number;
@@ -432,7 +492,7 @@ export interface Stats {
     /**
      * Where the read loop's wall time went since the last report, in
      * milliseconds. The three cover everything it does, so which one is large
-     * says which machine is the slow one: `converting` is this transcoder,
+     * says which machine is the slow one: `converting` is this packager,
      * `reading` is the network or the disk behind the URL, and `waiting` is Media
      * Source Extensions refusing more until it has appended what it has.
      *

@@ -1,4 +1,4 @@
-import { EncodedVideoFrames } from "./encoded-video.js";
+import { type DecodedVideoInput } from "./decoded-video.js";
 /**
  * How the filter is getting on, and where it is being let down.
  *
@@ -24,6 +24,11 @@ export interface DeinterlaceStats {
      * the previous frame's cannot be told apart from a missed one, so a still
      * scene raises this count although nothing is wrong. With Worker rendering
      * the gaps are those in `mozPaintedFrames`.
+     *
+     * With decoded pictures, the pictures dropped because their time had
+     * passed before they could be taken in, none of them shown. Pictures that
+     * ended before the place playback last started from are not counted: they
+     * were never due.
      */
     missed: number;
     /**
@@ -45,17 +50,28 @@ export interface DeinterlaceStats {
      * Times the schedule was restarted from the clock instead of following on
      * from the last picture: a seek, a stall, a cadence change, or a missed
      * frame. Climbing during steady playback means the cadence is not holding.
-     * (otya)
+     * (otya) With decoded pictures, times the media clock started again from
+     * `currentTime`: after a seek, a pause, a rate change or a stall, or on a
+     * reading too far from it.
      */
     resynced: number;
-    /** Fields skipped because their display time passed or disagreed with the presentation clock. */
+    /**
+     * Fields skipped because their display time passed or disagreed with the
+     * presentation clock. With decoded pictures, every field or frame filtered
+     * or due and never shown, including those a rate above the refresh skips,
+     * but not those from before the place playback last started from.
+     */
     late: number;
     /**
      * Times the presentation queue was reset because its scheduled lead exceeded
-     * the useful display window.
+     * the useful display window. With decoded pictures, pictures dropped
+     * because more were pushed than are held.
      */
     queueResetted: number;
-    /** Frames presented per second over the last report. */
+    /**
+     * Frames presented per second over the last report. With decoded pictures,
+     * pictures taken in per second.
+     */
     fps: number;
     /**
      * Average rendering-thread time per input frame spent uploading, filtering
@@ -67,10 +83,14 @@ export interface DeinterlaceStats {
     frameMs: number;
     /**
      * The largest number of pictures queued during the last reporting interval,
-     * across both the field-rate and film scheduling paths.
+     * across both the field-rate and film scheduling paths. With decoded
+     * pictures, the largest number pushed and not yet taken in.
      */
     maxQueuedFields: number;
-    /** Pictures actually copied to the canvas per second. */
+    /**
+     * Pictures actually copied to the canvas per second: with decoded pictures,
+     * fields, film frames or frames, as the mode shows them.
+     */
     outputFps: number;
     /**
      * GPU processing time, supported only in Chrome. On ANGLE's Metal backend
@@ -202,9 +222,20 @@ export declare function supportsDeinterlace(): boolean;
  */
 export declare class Deinterlacer extends EventTarget {
     #private;
-    /** Receive fMP4 from the player and decode supplemental input only above 1.25x playback speed. */
-    readonly encodedVideo: EncodedVideoFrames | null;
+    /**
+     * Receive decoded pictures with their presentation times. From the first
+     * push on they are the only pictures shown, and the element is only the
+     * clock they are shown by.
+     */
+    readonly decodedVideo: DecodedVideoInput;
     constructor(video: HTMLVideoElement, options?: DeinterlacerOptions);
+    /**
+     * Whether the canvas, rather than the element, is what shows the picture.
+     * A page uses this to decide which of the two to capture or transform.
+     * Filtering an element's own picture that is the same as filtering it at
+     * all, since a progressive source is left to the element. Decoded pictures
+     * are on the canvas filtered or not, because the element has none.
+     */
     get running(): boolean;
     /** The HTML canvas currently placed over the media element. */
     get canvas(): HTMLCanvasElement;
@@ -233,7 +264,11 @@ export declare class Deinterlacer extends EventTarget {
     get debug(): boolean;
     set debug(debug: boolean);
     start(): void;
-    /** Take the deinterlaced picture away, leaving the element's own showing. */
+    /**
+     * Take the deinterlaced picture away, leaving the element's own showing.
+     * Decoded pictures held are released, and those pushed until the next
+     * start() are released at once.
+     */
     stop(): void;
     destroy(): void;
     /**

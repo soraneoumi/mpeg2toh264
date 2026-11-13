@@ -17,6 +17,6 @@
  */
 export { Mpeg2TsPlayer, supportsPassthrough, supportsWorkerMediaSource, } from "./player.js";
 export { requiresManagedMediaSource, supportsManagedMediaSource, } from "./mse.js";
-export type { Mpeg2TsPlayerEventMap, Mpeg2TsPlayerOptions, PlayerDeinterlacer, PlayerDeinterlacerFactory, } from "./player.js";
-export { DEFAULT_KEEP_BEHIND_SECONDS, DEFAULT_MAX_AHEAD_SECONDS, DEFAULT_QUEUE_HIGH_WATER_MARK, type AudioStream, type AudioTracks, type PlayerState, type PrivateStream, type Progress, type Scan, type Services, type SinkKind, type Stats, type Timing, type TimingMark, } from "./protocol.js";
+export type { Mpeg2TsPlayerEventMap, Mpeg2TsPlayerOptions, PlayerDecodedVideo, PlayerDeinterlacer, PlayerDeinterlacerFactory, } from "./player.js";
+export { DEFAULT_KEEP_BEHIND_SECONDS, DEFAULT_MAX_AHEAD_SECONDS, DEFAULT_QUEUE_HIGH_WATER_MARK, type AudioStream, type AudioTracks, type DecodedPicture, type PlayerState, type PrivateStream, type Progress, type Scan, type Services, type SinkKind, type Stats, type Timing, type TimingMark, } from "./protocol.js";
 //# sourceMappingURL=index.d.ts.map
