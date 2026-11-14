@@ -88,6 +88,8 @@ export type WorkerCommand =
       at: number;
       timeOrigin: number;
     }
+  /** Whether the page showing the canvas is hidden, which a Worker cannot see. */
+  | { type: "pageVisibility"; hidden: boolean }
   | {
       type: "event";
       name:
