@@ -101,6 +101,11 @@ export type WorkerCommand = {
     video: WorkerVideoState;
     at: number;
     timeOrigin: number;
+}
+/** Whether the page showing the canvas is hidden, which a Worker cannot see. */
+ | {
+    type: "pageVisibility";
+    hidden: boolean;
 } | {
     type: "event";
     name: "emptied" | "pause" | "ended" | "seeking" | "seeked" | "ratechange" | "waiting";
