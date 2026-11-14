@@ -116,6 +116,7 @@ declare var MutationObserver: {
 
 interface Document {
   readonly defaultView: WindowLike | null;
+  readonly hidden: boolean;
   addEventListener(type: "visibilitychange", listener: () => void): void;
   removeEventListener(type: "visibilitychange", listener: () => void): void;
   createElement(tagName: "canvas"): HTMLCanvasElement;

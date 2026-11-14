@@ -821,6 +821,15 @@ export class Deinterlacer extends EventTarget {
   #picturesPushed = 0;
   /** Pictures a Worker renderer dropped unshown, as of its last report. */
   #workerPictureDrops = 0;
+  /** Whether the page showing the canvas is hidden; it is then given no refreshes. */
+  #pageHidden = false;
+  /**
+   * The position when the page last became visible again, and the clock's
+   * origin then. The position bounds what passed while it was hidden only for
+   * as long as playback has been continuous since, which the origin tells.
+   */
+  #unseenUntil = Number.NaN;
+  #unseenOrigin = Number.NaN;
   /**
    * Buffers transferred to the Worker and not yet back, by the id they went
    * with. A Worker that goes away takes them with it, and what is handed
@@ -1291,6 +1300,11 @@ export class Deinterlacer extends EventTarget {
       } satisfies WorkerCommand,
       [offscreen],
     );
+    if (this.#pageHidden)
+      worker.postMessage({
+        type: "pageVisibility",
+        hidden: true,
+      } satisfies WorkerCommand);
   }
 
   /** Apply Worker notifications and release the wait for the next input frame. */
@@ -2294,9 +2308,45 @@ export class Deinterlacer extends EventTarget {
     return !(end <= this.#clock.origin + TIMESTAMP_TOLERANCE);
   }
 
+  /**
+   * Whether something ending at `end` that goes unshown counts against the
+   * renderer. A hidden page is given no refreshes, so nothing goes up while it
+   * is hidden, and what ended before the position it came back at passed
+   * while it was. Neither was dropped for being late, and counting them would
+   * report a background tab as thousands of dropped frames.
+   */
+  #countable(end: number): boolean {
+    if (this.#pageHidden || !this.#wasDue(end)) return false;
+    return !(
+      this.#clock.origin === this.#unseenOrigin &&
+      end <= this.#unseenUntil + TIMESTAMP_TOLERANCE
+    );
+  }
+
+  /** Note whether the page showing the canvas is hidden. */
+  #setPageHidden(hidden: boolean): void {
+    if (hidden === this.#pageHidden) return;
+    this.#pageHidden = hidden;
+    this.#worker?.postMessage({
+      type: "pageVisibility",
+      hidden,
+    } satisfies WorkerCommand);
+    if (hidden) return;
+    this.#unseenUntil = this.#clock.at(performance.now());
+    this.#unseenOrigin = this.#clock.origin;
+  }
+
+  /**
+   * @internal Tell a Worker renderer whether the page showing its canvas is
+   * hidden. It has no document of its own to ask.
+   */
+  observePageVisibility(hidden: boolean): void {
+    this.#setPageHidden(hidden);
+  }
+
   /** Count a decoded picture ending at `end` that was dropped unshown. */
   #countMissed(end: number): void {
-    if (this.#wasDue(end)) this.#stats.missed++;
+    if (this.#countable(end)) this.#stats.missed++;
   }
 
   /** Read the element's clock, as it was at `wall` on this realm's clock. */
@@ -2684,7 +2734,7 @@ export class Deinterlacer extends EventTarget {
     rate: number,
   ): number | null {
     if (!this.#useful(at, until, pictureUntil, time, rate)) {
-      if (this.#wasDue(until)) this.#stats.late++;
+      if (this.#countable(until)) this.#stats.late++;
       return null;
     }
     if (slot === null) {
@@ -2799,7 +2849,7 @@ export class Deinterlacer extends EventTarget {
       index = replaced + count - 1;
       // Each output passed over was due until the one after it.
       for (let i = replaced; i < index; i++)
-        if (this.#wasDue(queue[i + 1]!.time)) this.#stats.late++;
+        if (this.#countable(queue[i + 1]!.time)) this.#stats.late++;
     }
     const entry = queue[index]!;
     queue.splice(0, index + 1);
@@ -3563,6 +3613,7 @@ export class Deinterlacer extends EventTarget {
   #followOwner(): void {
     if (this.#externalHost) return;
     this.#watchOwnerDocument();
+    if (this.#ownerDocument) this.#setPageHidden(this.#ownerDocument.hidden);
     const { frames } = this.#animationSource();
     const loopMoved =
       this.#loopRequest !== null && this.#loopRequest.frames !== frames;
