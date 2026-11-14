@@ -2127,8 +2127,12 @@ export class Deinterlacer extends EventTarget {
       PICTURE_QUEUE * Math.max(1, this.#video.playbackRate),
     );
     while (pending.length > limit) {
-      this.#stats.queueResetted++;
-      this.#release(pending.pop()!.data);
+      const dropped = pending.pop()!;
+      // A hidden page draws nothing, so its queue fills up whenever the clock
+      // is not running to drop what has passed; that is not the renderer's.
+      if (this.#countable(dropped.timestamp + dropped.duration))
+        this.#stats.queueResetted++;
+      this.#release(dropped.data);
     }
     this.#reportMaxQueuedFields = Math.max(
       this.#reportMaxQueuedFields,
