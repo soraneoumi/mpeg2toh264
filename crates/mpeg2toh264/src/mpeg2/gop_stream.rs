@@ -96,6 +96,10 @@ pub struct Mpeg2GopStream {
     /// Whether the buffer begins part way through a group, after the units
     /// that went out ahead of it.
     continuing: bool,
+    /// Whether a gap cut the group under way and no group header has come
+    /// since: what arrives until one does followed what was lost, and nothing
+    /// can decode it.
+    awaiting_group: bool,
     /// How many of the pictures at the front of `pictures` have been looked at
     /// as the start of an anchor unit.
     examined: usize,
@@ -213,6 +217,7 @@ impl Mpeg2GopStream {
         self.pictures.clear();
         self.scan_pos = 0;
         self.continuing = false;
+        self.awaiting_group = true;
         self.examined = 0;
         self.group_matrices.clear();
     }
@@ -485,6 +490,7 @@ impl Mpeg2GopStream {
                     }
                     break;
                 };
+                self.awaiting_group = false;
                 // Everything the offsets above name moves down by this much
                 // once the bytes ahead of the sequence header are dropped.
                 let mut dropped = 0;
@@ -552,7 +558,9 @@ impl Mpeg2GopStream {
                 self.reinject_headers();
             }
         }
-        if final_flush && !self.pictures.is_empty() {
+        // Pictures after a gap with no group header behind them are dropped at
+        // the end as they are anywhere else.
+        if final_flush && !self.pictures.is_empty() && !self.awaiting_group {
             let unit = self.unit_before(self.buffer.len());
             output.push(unit);
             self.buffer.clear();

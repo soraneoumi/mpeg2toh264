@@ -3063,6 +3063,59 @@ fn does_not_cut_in_the_rest_of_a_group_after_a_gap() {
     assert!(!units[2].continues_group);
 }
 
+#[test]
+fn drops_the_rest_of_a_group_after_a_gap_at_the_end() {
+    use PictureType::{B, I, P};
+    let one = read_fixture("ibbp.m2v");
+    let starts = picture_starts(&one);
+    for split_groups in [false, true] {
+        let mut splitter = Mpeg2GopStream::with_split_groups(split_groups);
+        let mut units = splitter.push(&one[..starts[8]], None);
+        splitter.discard_pending();
+        // The input ends in the tail of the group the gap cut into.
+        units.extend(splitter.push(&one[starts[8]..], None));
+        units.extend(splitter.finish());
+
+        let types: Vec<Vec<PictureType>> = units.iter().map(picture_types).collect();
+        // A whole group is held back until the next one starts, so the gap
+        // takes the part before it as well.
+        let before_the_gap = if split_groups {
+            vec![vec![I, P, B, B], vec![P, B, B]]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(types, before_the_gap, "split_groups {split_groups}");
+    }
+}
+
+#[test]
+fn keeps_a_stream_without_group_headers_to_the_end() {
+    let one = read_fixture("ibbp.m2v");
+    // A group header is optional; take the one this stream has out.
+    let header = one
+        .windows(4)
+        .position(|code| code == [0, 0, 1, 0xb8])
+        .expect("a group header");
+    let next = header
+        + 4
+        + one[header + 4..]
+            .windows(3)
+            .position(|code| code == [0, 0, 1])
+            .expect("a start code after it");
+    let headerless = [&one[..header], &one[next..]].concat();
+    for split_groups in [false, true] {
+        let mut splitter = Mpeg2GopStream::with_split_groups(split_groups);
+        let mut units = splitter.push(&headerless, None);
+        units.extend(splitter.finish());
+        let pictures: usize = units.iter().map(|unit| picture_types(unit).len()).sum();
+        assert_eq!(
+            pictures,
+            picture_starts(&one).len(),
+            "split_groups {split_groups}: every picture comes out at the end"
+        );
+    }
+}
+
 // ---------------------------------------------------------------- decode mode
 
 /// Run a stream in decode mode and on the passthrough path it has to agree
