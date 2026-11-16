@@ -70,6 +70,41 @@ fn pts_field(pts: u64) -> [u8; 5] {
     ]
 }
 
+/// The stream with the five timestamp bytes of the `nth` PES that begins on
+/// `pid` moved by `delta` ticks, and nothing else touched: the packet carries no
+/// error indicator and the continuity counters run on, which is what damage the
+/// transport does not notice looks like.
+pub fn with_pts_shifted(stream: &[u8], pid: u16, nth: usize, delta: i64) -> Vec<u8> {
+    let mut out = stream.to_vec();
+    let mut seen = 0;
+    for packet in out.chunks_mut(PACKET_SIZE) {
+        let this = u16::from(packet[1] & 0x1f) << 8 | u16::from(packet[2]);
+        if this != pid || packet[1] & 0x40 == 0 {
+            continue;
+        }
+        if seen == nth {
+            let payload = if packet[3] & 0x20 != 0 {
+                5 + packet[4] as usize
+            } else {
+                4
+            };
+            assert_eq!(packet[payload..payload + 3], [0, 0, 1], "a PES header");
+            let field = payload + 9;
+            let bytes = &packet[field..field + 5];
+            let pts = u64::from(bytes[0] >> 1 & 0x07) << 30
+                | u64::from(bytes[1]) << 22
+                | u64::from(bytes[2] >> 1) << 15
+                | u64::from(bytes[3]) << 7
+                | u64::from(bytes[4] >> 1);
+            let shifted = (pts as i64 + delta).rem_euclid(1 << 33) as u64;
+            packet[field..field + 5].copy_from_slice(&pts_field(shifted));
+            return out;
+        }
+        seen += 1;
+    }
+    panic!("no PES number {nth} on PID {pid:#x}");
+}
+
 /// Wrap an MPEG-2 elementary stream in a single-program transport stream, so the
 /// demuxer can be exercised without a multi-megabyte broadcast capture.
 pub fn wrap_mpeg2_es_in_ts(

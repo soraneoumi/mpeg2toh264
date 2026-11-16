@@ -15,8 +15,8 @@ use support::{
     adts_frame, adts_frame_with_payload, adts_stream, assert_decode_matches_passthrough, decode,
     decoding, fragments_digest, init_segments, mux_programs, mux_transport_stream, mux_with_sound,
     non_intra_matrix_extension, passthrough, passthrough_like_decode, picture_starts, read_fixture,
-    track_samples, with_extension_in_pictures, wrap_mpeg2_es_in_ts, PesUnit, TrackSample,
-    AUDIO_PID, FIXTURES, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID,
+    track_samples, with_extension_in_pictures, with_pts_shifted, wrap_mpeg2_es_in_ts, PesUnit,
+    TrackSample, AUDIO_PID, FIXTURES, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID,
 };
 
 /// Offset of the first `00 00 01 B8` group header.
@@ -3336,5 +3336,746 @@ fn decode_mode_does_not_depend_on_chunking() {
             whole,
             "chunks of {chunk}"
         );
+    }
+}
+
+// ------------------------------------------------- timestamps that disagree
+
+/// Pictures in one copy of the fixture.
+fn pictures_per_group() -> usize {
+    parse_elementary_stream(&read_fixture("ibbp.m2v"))
+        .expect("parses")
+        .len()
+}
+
+/// Ticks of one 48 kHz AAC access unit.
+const AAC_TICKS: u64 = 1024 * 90_000 / 48_000;
+
+/// `groups` as a broadcast sends them, each stamped where it plays, with sound.
+/// Every group is a copy of the fixture's layout, whatever else about it
+/// differs.
+///
+/// Where `timed_av_stream` has one PES to a group, this can have one to every
+/// picture, as a broadcast does, each stamped with that picture's own display
+/// time. `lost` names groups whose video the recording does not have, leaving
+/// the sound alone, and sound goes only to the first `sound_groups` groups.
+fn stamped_stream(
+    groups: &[Vec<u8>],
+    per_picture: bool,
+    lost: &[usize],
+    sound_groups: usize,
+) -> Vec<u8> {
+    const BASE: u64 = 900_000;
+    let one = &groups[0];
+    let pictures = parse_elementary_stream(one).expect("parses");
+    let mut bounds = vec![0];
+    bounds.extend_from_slice(&picture_starts(one)[1..]);
+    bounds.push(one.len());
+    let frame_ticks = u64::from(
+        mpeg2toh264::mpeg2_video_timeline(one, false)
+            .expect("a timeline")
+            .sample_duration,
+    );
+    let group_ticks = pictures.len() as u64 * frame_ticks;
+
+    let mut audio_frames = 0u64;
+    let mut sound: Vec<Option<(Vec<u8>, u64)>> = Vec::new();
+    for copy in 0..groups.len() as u64 {
+        let through = (copy + 1) * group_ticks / AAC_TICKS;
+        let first = audio_frames;
+        let mut block = Vec::new();
+        while audio_frames < through {
+            block.extend_from_slice(&adts_stream(1, 3, 2));
+            audio_frames += 1;
+        }
+        sound.push(
+            (copy < sound_groups as u64 && !block.is_empty())
+                .then_some((block, BASE + first * AAC_TICKS)),
+        );
+    }
+
+    let mut units: Vec<PesUnit<'_>> = Vec::new();
+    for (copy, es) in groups.iter().enumerate() {
+        if !lost.contains(&copy) {
+            if per_picture {
+                for (picture, bounds) in bounds.windows(2).enumerate() {
+                    let display = copy as u64 * pictures.len() as u64
+                        + u64::from(pictures[picture].header.temporal_reference);
+                    units.push(PesUnit {
+                        pid: VIDEO_PID,
+                        stream_id: 0xe0,
+                        payload: &es[bounds[0]..bounds[1]],
+                        pts: Some(BASE + display * frame_ticks),
+                    });
+                }
+            } else {
+                units.push(PesUnit {
+                    pid: VIDEO_PID,
+                    stream_id: 0xe0,
+                    payload: es,
+                    pts: Some(BASE + copy as u64 * group_ticks),
+                });
+            }
+        }
+        if let Some((block, pts)) = &sound[copy] {
+            units.push(PesUnit {
+                pid: AUDIO_PID,
+                stream_id: 0xc0,
+                payload: block,
+                pts: Some(*pts),
+            });
+        }
+    }
+    mux_transport_stream(
+        &[
+            (VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO),
+            (AUDIO_PID, STREAM_TYPE_AAC_ADTS),
+        ],
+        &units,
+        &mut HashMap::new(),
+    )
+}
+
+/// `copies` of the fixture as they are.
+fn plain_groups(copies: usize) -> Vec<Vec<u8>> {
+    vec![read_fixture("ibbp.m2v"); copies]
+}
+
+/// The fixture coded under a frame height other than its own, which is what
+/// its sequence header is changed to say. The pictures are untouched: only
+/// what the stream is described as differs.
+fn with_frame_height(es: &[u8], height: u32) -> Vec<u8> {
+    let mut out = es.to_vec();
+    let header = out
+        .windows(4)
+        .position(|code| code == [0, 0, 1, 0xb3])
+        .expect("a sequence header");
+    out[header + 5] = (out[header + 5] & 0xf0) | (height >> 8) as u8;
+    out[header + 6] = height as u8;
+    out
+}
+
+/// What the intact stream makes in each mode, which a damaged copy of it has
+/// to make as well: damage the transport does not report must not move anything.
+fn assert_damage_changes_nothing(label: &str, intact: &[u8], damaged: &[u8]) {
+    assert_same_output(label, intact, damaged);
+    assert_decode_mode_agrees(label, damaged, passthrough());
+}
+
+fn assert_same_output(label: &str, intact: &[u8], damaged: &[u8]) {
+    for (mode, options) in [("passthrough", passthrough()), ("decode", decode())] {
+        assert_eq!(
+            fragments_digest(&run_session_with_options(damaged, 64 * 1024, options)),
+            fragments_digest(&run_session_with_options(intact, 64 * 1024, options)),
+            "{label}, {mode}"
+        );
+    }
+}
+
+#[test]
+fn a_damaged_opening_timestamp_twenty_seconds_late_moves_nothing() {
+    // One byte of one PES header changed without the transport noticing. The
+    // opening picture of a group is believed to play twenty seconds after the
+    // one before it, which is held over, sound and all, and every picture
+    // after it is that far late -- when the other timestamps of the unit, each
+    // of which says where the unit starts as well, are what disagrees with it.
+    let pictures = pictures_per_group();
+    let intact = stamped_stream(&plain_groups(10), true, &[], 10);
+    let damaged = with_pts_shifted(&intact, VIDEO_PID, 3 * pictures, 20 * 90_000);
+    assert_damage_changes_nothing("+20 s", &intact, &damaged);
+}
+
+#[test]
+fn a_damaged_opening_timestamp_a_fraction_of_a_second_late_moves_nothing() {
+    let pictures = pictures_per_group();
+    let intact = stamped_stream(&plain_groups(10), true, &[], 10);
+    let damaged = with_pts_shifted(&intact, VIDEO_PID, 3 * pictures, 27_000);
+    assert_damage_changes_nothing("+0.3 s", &intact, &damaged);
+}
+
+#[test]
+fn a_damaged_opening_timestamp_early_moves_nothing() {
+    let pictures = pictures_per_group();
+    let intact = stamped_stream(&plain_groups(10), true, &[], 10);
+    let damaged = with_pts_shifted(&intact, VIDEO_PID, 3 * pictures, -45_000);
+    assert_damage_changes_nothing("-0.5 s", &intact, &damaged);
+}
+
+#[test]
+fn a_damaged_timestamp_of_the_only_one_a_group_has_is_judged_by_the_next_group() {
+    // One PES to a group leaves a group nothing of its own to be checked
+    // against. The group after it says where it should have been.
+    let intact = stamped_stream(&plain_groups(10), false, &[], 10);
+    for delta in [20 * 90_000, 27_000, -45_000] {
+        let damaged = with_pts_shifted(&intact, VIDEO_PID, 3, delta);
+        assert_damage_changes_nothing(&format!("{delta} ticks"), &intact, &damaged);
+    }
+}
+
+#[test]
+fn a_damaged_audio_timestamp_does_not_fill_the_jump_with_silence() {
+    let intact = stamped_stream(&plain_groups(10), false, &[], 10);
+    let damaged = with_pts_shifted(&intact, AUDIO_PID, 4, 20 * 90_000);
+    for (mode, options) in [("passthrough", passthrough()), ("decode", decode())] {
+        let intact = track_samples(&run_session_with_options(&intact, 64 * 1024, options)).audio;
+        let damaged = track_samples(&run_session_with_options(&damaged, 64 * 1024, options)).audio;
+        assert_eq!(damaged.len(), intact.len(), "{mode}: access units");
+        assert!(damaged == intact, "{mode}: where the access units sit");
+    }
+}
+
+
+/// Video PES begun, and the order of what came out, feeding one transport
+/// packet at a time.
+fn pushed_packet_by_packet(stream: &[u8], options: SessionOptions) -> Vec<(usize, Fragment)> {
+    let mut session = Session::new(options);
+    let mut begun = 0;
+    let mut out = Vec::new();
+    for packet in stream.chunks(188) {
+        let pid = u16::from(packet[1] & 0x1f) << 8 | u16::from(packet[2]);
+        if pid == VIDEO_PID && packet[1] & 0x40 != 0 {
+            begun += 1;
+        }
+        out.extend(
+            session
+                .push(packet)
+                .expect("push succeeds")
+                .into_iter()
+                .map(|fragment| (begun, fragment)),
+        );
+    }
+    out.extend(
+        session
+            .finish()
+            .expect("finish succeeds")
+            .into_iter()
+            .map(|fragment| (usize::MAX, fragment)),
+    );
+    out
+}
+
+/// How many video PES had begun when the second unit that a decoder has to
+/// start afresh at came out: the first is the stream's own, and the second is
+/// the one after a hole.
+fn video_pes_begun_before_the_unit_after_the_hole(stream: &[u8]) -> usize {
+    pushed_packet_by_packet(stream, decode())
+        .into_iter()
+        .filter(|(_, fragment)| matches!(fragment, Fragment::Video { restart: true, .. }))
+        .nth(1)
+        .map(|(begun, _)| begun)
+        .expect("a unit comes out after the hole")
+}
+
+#[test]
+fn a_hole_with_a_pes_to_every_picture_is_not_waited_over() {
+    // The group after the hole says where it starts with every picture of it,
+    // and they agree. Nothing more has to arrive to know that.
+    let pictures = pictures_per_group();
+    let stream = stamped_stream(&plain_groups(8), true, &[3], 8);
+    let begun = video_pes_begun_before_the_unit_after_the_hole(&stream);
+    assert!(
+        begun <= 4 * pictures,
+        "{begun} PES had begun, and the group after the hole is the {}th to {}th",
+        3 * pictures + 1,
+        4 * pictures
+    );
+}
+
+#[test]
+fn a_detected_loss_is_not_waited_over() {
+    // The transport says bytes were lost, so the count is known not to be
+    // where the stream has reached, and the first timestamp after it is all
+    // there is to go by.
+    let stream = stamped_stream(&plain_groups(10), false, &[], 10);
+    let first_of_group: Vec<usize> = stream
+        .chunks(188)
+        .enumerate()
+        .filter(|(_, packet)| {
+            let pid = u16::from(packet[1] & 0x1f) << 8 | u16::from(packet[2]);
+            pid == VIDEO_PID && packet[1] & 0x40 != 0
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let lossy = with_packets_dropped(&stream, first_of_group[3] + 5, 1);
+    let begun = video_pes_begun_before_the_unit_after_the_hole(&lossy);
+    // A group's PES is longer than a length field holds, so the fifth ends
+    // where the sixth begins and not before. A unit that waited for the group
+    // after it to be judged as well would come out a whole group later.
+    assert!(
+        begun <= 6,
+        "{begun} groups had begun, and the one after the loss is the fifth"
+    );
+}
+
+/// Where the last picture handed out ends, or the last fragment of the MP4 the
+/// other mode makes, in seconds.
+fn end_of_presentation(fragments: &[Fragment]) -> f64 {
+    let decoded = fragments
+        .iter()
+        .filter_map(|fragment| match fragment {
+            Fragment::Video { pictures, .. } => Some(pictures),
+            _ => None,
+        })
+        .flatten()
+        .map(|picture| picture.time + picture.duration)
+        .fold(0.0, f64::max);
+    if decoded > 0.0 {
+        decoded
+    } else {
+        presentation_end(fragments).0
+    }
+}
+
+#[test]
+fn a_hole_before_the_last_group_is_still_held_over() {
+    // One PES to a group: nothing comes after the last to say it is where it
+    // claims to be, and the end of the input settles that in its favour.
+    let intact = stamped_stream(&plain_groups(6), false, &[], 6);
+    let lossy = stamped_stream(&plain_groups(6), false, &[4], 6);
+    for (mode, options) in [("passthrough", passthrough()), ("decode", decode())] {
+        let intact = end_of_presentation(&run_session_with_options(&intact, 64 * 1024, options));
+        let lossy = end_of_presentation(&run_session_with_options(&lossy, 64 * 1024, options));
+        assert!(
+            (intact - lossy).abs() < 0.05,
+            "{mode}: the last group ends at {lossy}s where the whole recording puts it at {intact}s"
+        );
+    }
+}
+
+#[test]
+fn a_damaged_timestamp_on_a_b_picture_changes_nothing() {
+    let pictures = pictures_per_group();
+    let intact = stamped_stream(&plain_groups(10), true, &[], 10);
+    // The third picture of a group in coding order is a B.
+    let damaged = with_pts_shifted(&intact, VIDEO_PID, 3 * pictures + 2, 20 * 90_000);
+    assert_damage_changes_nothing("a B picture", &intact, &damaged);
+}
+
+#[test]
+fn a_damaged_first_timestamp_of_the_stream_does_not_move_the_origin() {
+    let intact = stamped_stream(&plain_groups(6), true, &[], 6);
+    let origin = |stream: &[u8], options: SessionOptions| {
+        let mut session = Session::new(options);
+        for chunk in stream.chunks(64 * 1024) {
+            session.push(chunk).expect("push succeeds");
+        }
+        session.finish().expect("finish succeeds");
+        session.origin_ticks().expect("the origin is fixed")
+    };
+    for delta in [20 * 90_000, -45_000] {
+        let damaged = with_pts_shifted(&intact, VIDEO_PID, 0, delta);
+        for options in [passthrough(), decode()] {
+            assert_eq!(
+                origin(&damaged, options),
+                origin(&intact, options),
+                "{delta} ticks"
+            );
+        }
+        assert_damage_changes_nothing(&format!("{delta} ticks"), &intact, &damaged);
+    }
+}
+
+#[test]
+fn a_group_coded_under_another_description_costs_two_initialization_segments() {
+    let pictures = pictures_per_group();
+    let height = mpeg2toh264::mpeg2_video_timeline(&read_fixture("ibbp.m2v"), false)
+        .expect("a timeline")
+        .height;
+    let groups: Vec<Vec<u8>> = (0..10)
+        .map(|copy| {
+            let es = read_fixture("ibbp.m2v");
+            if copy == 4 {
+                with_frame_height(&es, height - 16)
+            } else {
+                es
+            }
+        })
+        .collect();
+    let stream = stamped_stream(&groups, false, &[], 10);
+    let muxed = run_session_with_options(&stream, 64 * 1024, passthrough());
+    assert_eq!(
+        init_segments(&muxed).len(),
+        3,
+        "the first, the one for the odd group, and the one back"
+    );
+    assert_eq!(track_samples(&muxed).video.len(), 10 * pictures);
+
+    let decoded = run_session_with_options(&stream, 64 * 1024, decode());
+    let handed_out: usize = decoded
+        .iter()
+        .map(|fragment| match fragment {
+            Fragment::Video { pictures, .. } => pictures.len(),
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(handed_out, 10 * pictures);
+}
+
+#[test]
+fn units_carry_every_timestamp_that_begins_in_them_and_say_when_the_stream_broke() {
+    let one = read_fixture("ibbp.m2v");
+    let starts = picture_starts(&one);
+    let mut bounds = vec![0];
+    bounds.extend_from_slice(&starts[1..]);
+    bounds.push(one.len());
+    let chunks: Vec<(&[u8], u64)> = bounds
+        .windows(2)
+        .enumerate()
+        .map(|(index, pair)| (&one[pair[0]..pair[1]], 1_000 + index as u64 * 100))
+        .collect();
+    let units = split_into_units(&mut Mpeg2GopStream::with_split_groups(true), &chunks);
+
+    // The first unit opens with the group, and holds four pictures.
+    let stamps = |unit: &Mpeg2Gop| -> Vec<(usize, u64)> {
+        unit.timestamps
+            .iter()
+            .map(|stamp| (stamp.offset, stamp.pts))
+            .collect()
+    };
+    assert_eq!(
+        stamps(&units[0]),
+        (0..4)
+            .map(|n| (if n == 0 { 0 } else { starts[n] }, 1_000 + n as u64 * 100))
+            .collect::<Vec<_>>()
+    );
+    // The next begins with a copy of the sequence header, which is no part of
+    // the stream and has no timestamp of its own.
+    let copy = units[1].data.len() - (starts[7] - starts[4]);
+    assert!(copy > 0);
+    assert_eq!(
+        stamps(&units[1]),
+        (4..7)
+            .map(|n| (copy + starts[n] - starts[4], 1_000 + n as u64 * 100))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        units[0].after_break,
+        "nothing is known of what came before the first"
+    );
+    assert!(units[1..].iter().all(|unit| !unit.after_break));
+
+    let mut splitter = Mpeg2GopStream::with_split_groups(true);
+    let mut units = splitter.push(&one, Some(900_000));
+    let before = units.len();
+    splitter.discard_pending();
+    units.extend(splitter.push(&one, Some(910_000)));
+    units.extend(splitter.push(&one, Some(920_000)));
+    units.extend(splitter.finish());
+    assert_eq!(
+        units
+            .iter()
+            .enumerate()
+            .filter(|(_, unit)| unit.after_break)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
+        [0, before],
+        "the first unit after a discard has the break behind it, and only that one"
+    );
+}
+
+/// How many access units of sound a run carries.
+fn sound_units(fragments: &[Fragment]) -> usize {
+    track_samples(fragments).audio.len()
+}
+
+#[test]
+fn a_damaged_audio_timestamp_behind_the_count_moves_nothing() {
+    // A reading before where the count stands is no more to be believed than
+    // one after it: taken at its word it moves the clock back, and the next
+    // packet, which is right, then looks like a jump forward.
+    let intact = stamped_stream(&plain_groups(10), false, &[], 10);
+    for nth in [1, 4] {
+        let damaged = with_pts_shifted(&intact, AUDIO_PID, nth, -5 * 90_000);
+        assert_damage_changes_nothing(
+            &format!("audio PES {nth} five seconds early"),
+            &intact,
+            &damaged,
+        );
+    }
+}
+
+#[test]
+fn a_damaged_first_audio_timestamp_does_not_place_the_track() {
+    // The first timestamp of the sound fixes where the track begins on the
+    // timeline, and only the one after it can say it is wrong.
+    let intact = stamped_stream(&plain_groups(10), false, &[], 10);
+    for delta in [5 * 90_000, -5 * 90_000] {
+        let damaged = with_pts_shifted(&intact, AUDIO_PID, 0, delta);
+        assert_damage_changes_nothing(&format!("{delta} ticks"), &intact, &damaged);
+    }
+}
+
+#[test]
+fn a_jump_in_the_sound_still_waiting_at_the_end_of_the_input_is_taken_at_its_word() {
+    // Nothing comes after the last packet to say it is wrong, and the count it
+    // is ahead of is as likely to be the one that is behind.
+    let intact = stamped_stream(&plain_groups(4), false, &[], 4);
+    let damaged = with_pts_shifted(&intact, AUDIO_PID, 3, 90_000);
+    for options in [passthrough(), decode()] {
+        let before = sound_units(&run_session_with_options(&intact, 64 * 1024, options));
+        let after = sound_units(&run_session_with_options(&damaged, 64 * 1024, options));
+        assert!(
+            (46..=47).contains(&(after - before)),
+            "{} access units where {} were, for a second of jump",
+            after,
+            before
+        );
+    }
+}
+
+#[test]
+fn a_jump_in_the_sound_cannot_be_confirmed_by_another_stream() {
+    // A damaged timestamp just before the sound moves to another stream: the
+    // stream it joins says nothing of it, and filling the jump would put up to
+    // half a minute of silence in front of sound that is then dropped for
+    // covering what is already there.
+    let stream = bilingual_av_stream(6);
+    let switched = |stream: &[u8]| {
+        let mut session = Session::new(passthrough());
+        let chunks: Vec<&[u8]> = stream.chunks(16 * 1024).collect();
+        let mut fragments = Vec::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            if index == chunks.len() / 2 {
+                let second = session.audio_streams()[1].pid;
+                session.select_audio(second);
+            }
+            fragments.extend(session.push(chunk).expect("push succeeds"));
+        }
+        fragments.extend(session.finish().expect("finish succeeds"));
+        sound_units(&fragments)
+    };
+    let intact = switched(&stream);
+    for nth in 1..6 {
+        let damaged = with_pts_shifted(&stream, AUDIO_PID, nth, 20 * 90_000);
+        assert_eq!(switched(&damaged), intact, "audio PES {nth}");
+    }
+}
+
+
+#[test]
+fn a_restart_that_drops_the_leading_pictures_is_still_judged_by_their_timestamps() {
+    // The picture is coded under another height from the fourth group on, which
+    // makes its opening unit a restart that has no references for its leading
+    // B pictures. Those are dropped, but they were stamped, and two of them
+    // agreeing is what says the opener's own timestamp, damaged, is the odd one
+    // out. Nothing waits for the next group to say so.
+    let fixture = read_fixture("open_gop_leading_bb.m2v");
+    let height = mpeg2toh264::mpeg2_video_timeline(&fixture, false)
+        .expect("a timeline")
+        .height;
+    let groups: Vec<Vec<u8>> = (0..6)
+        .map(|copy| {
+            if copy >= 3 {
+                with_frame_height(&fixture, height - 16)
+            } else {
+                fixture.clone()
+            }
+        })
+        .collect();
+    let pictures = parse_elementary_stream(&fixture).expect("parses").len();
+    let intact = stamped_stream(&groups, true, &[], 6);
+    let damaged = with_pts_shifted(&intact, VIDEO_PID, 3 * pictures, 20 * 90_000);
+    assert_same_output("a restart", &intact, &damaged);
+    let begun = video_pes_begun_before_the_unit_after_the_hole(&damaged);
+    assert!(
+        begun <= 4 * pictures,
+        "{begun} PES had begun, and the restart is the {}th",
+        3 * pictures + 1
+    );
+}
+
+/// The times pictures are shown at, in milliseconds, as decode mode hands them
+/// out.
+fn picture_times(fragments: &[Fragment]) -> Vec<i64> {
+    fragments
+        .iter()
+        .filter_map(|fragment| match fragment {
+            Fragment::Video { pictures, .. } => Some(pictures),
+            _ => None,
+        })
+        .flatten()
+        .map(|picture| (picture.time * 1000.0).round() as i64)
+        .collect()
+}
+
+/// The stream with the last video packet of the `nth` video PES missing: the
+/// transport sees the video PID's counter break where the next PES begins.
+fn without_the_tail_of_video_pes(stream: &[u8], nth: usize) -> Vec<u8> {
+    let pid = |packet: &[u8]| u16::from(packet[1] & 0x1f) << 8 | u16::from(packet[2]);
+    let packets: Vec<&[u8]> = stream.chunks(188).collect();
+    let starts: Vec<usize> = (0..packets.len())
+        .filter(|&at| pid(packets[at]) == VIDEO_PID && packets[at][1] & 0x40 != 0)
+        .collect();
+    // The sound that follows the PES is what its last video packet is found by.
+    let next_sound = (starts[nth]..packets.len())
+        .find(|&at| pid(packets[at]) == AUDIO_PID)
+        .expect("sound follows");
+    with_packets_dropped(stream, next_sound - 1, 1)
+}
+
+#[test]
+fn a_damaged_claim_with_a_loss_after_it_leaves_nothing_behind() {
+    // The group after a hole claims where it starts, and the next group is
+    // across a loss, so nothing can count slots to it and say. A claim nothing
+    // witnesses is not believed: a hole closed up costs one group shown early,
+    // which the group after the loss sets right, where a damaged stamp that
+    // was believed would leave every picture after it late for good.
+    let hole = stamped_stream(&plain_groups(8), false, &[3], 8);
+    let intact_stamp = without_the_tail_of_video_pes(&hole, 3);
+    for delta in [20 * 90_000, 27_000, -45_000] {
+        let damaged =
+            without_the_tail_of_video_pes(&with_pts_shifted(&hole, VIDEO_PID, 3, delta), 3);
+        assert_same_output(&format!("{delta} ticks"), &intact_stamp, &damaged);
+    }
+}
+
+#[test]
+fn a_real_hole_with_a_loss_after_it_costs_one_group_at_most() {
+    let hole = stamped_stream(&plain_groups(8), false, &[3], 8);
+    let lossy = without_the_tail_of_video_pes(&hole, 3);
+    let times = |stream: &[u8]| {
+        let mut times = picture_times(&run_session_with_options(stream, 64 * 1024, decode()));
+        times.sort_unstable();
+        times
+    };
+    let (held, lossy) = (times(&hole), times(&lossy));
+    // The group after the lost one is the fifth that is there, and the one
+    // after the loss is the sixth.
+    let from = held[5 * pictures_per_group()];
+    let after = |times: &[i64]| {
+        times
+            .iter()
+            .copied()
+            .filter(|&time| time >= from)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(after(&lossy), after(&held));
+}
+
+/// The first group of `groups` copies of the fixture, one PES to a group, and
+/// the sound as the packets given: each a payload and its timestamp.
+fn stream_with_sound_packets(groups: usize, sound: &[(Vec<u8>, u64)]) -> Vec<u8> {
+    let one = read_fixture("ibbp.m2v");
+    let group_ticks = pictures_per_group() as u64 * FRAME_TICKS;
+    let mut units: Vec<PesUnit<'_>> = (0..groups as u64)
+        .map(|copy| PesUnit {
+            pid: VIDEO_PID,
+            stream_id: 0xe0,
+            payload: &one,
+            pts: Some(900_000 + copy * group_ticks),
+        })
+        .collect();
+    units.extend(sound.iter().map(|(payload, pts)| PesUnit {
+        pid: AUDIO_PID,
+        stream_id: 0xc0,
+        payload,
+        pts: Some(*pts),
+    }));
+    mux_transport_stream(
+        &[
+            (VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO),
+            (AUDIO_PID, STREAM_TYPE_AAC_ADTS),
+        ],
+        &units,
+        &mut HashMap::new(),
+    )
+}
+
+fn origin_of(stream: &[u8], options: SessionOptions) -> u64 {
+    let mut session = Session::new(options);
+    for chunk in stream.chunks(64 * 1024) {
+        session.push(chunk).expect("push succeeds");
+    }
+    session.finish().expect("finish succeeds");
+    session.origin_ticks().expect("the origin is fixed")
+}
+
+#[test]
+fn a_first_packet_of_sound_with_no_frame_in_it_is_not_the_first_timestamp() {
+    // The first PES holds three bytes of an access unit, which counts nothing
+    // from where its timestamp says. The next one is where the sound starts,
+    // and has nothing to be confirmed by but the one after it.
+    let frame = adts_stream(1, 3, 2);
+    let all = frame.repeat(120);
+    let sound = |first: u64| {
+        let mut packets = vec![
+            (all[..3].to_vec(), first),
+            (all[3..10 * frame.len()].to_vec(), 900_000 + AAC_TICKS),
+        ];
+        for chunk in 1..12u64 {
+            let range =
+                (10 * chunk as usize * frame.len())..(10 * (chunk as usize + 1) * frame.len());
+            packets.push((all[range].to_vec(), 900_000 + 10 * chunk * AAC_TICKS));
+        }
+        packets
+    };
+    let intact = stream_with_sound_packets(6, &sound(900_000));
+    let damaged = stream_with_sound_packets(6, &sound(900_000 - 5 * 90_000));
+    assert_same_output("a partial first packet", &intact, &damaged);
+    for options in [passthrough(), decode()] {
+        assert_eq!(origin_of(&damaged, options), origin_of(&intact, options));
+    }
+}
+
+#[test]
+fn the_first_timestamp_is_not_confirmed_by_a_packet_of_another_sample_rate() {
+    // The packet after it is counted afresh, for its own rate, and cannot be
+    // measured against what the first one says. The first one is not believed
+    // for that: the timestamp of the packet after it stands in for it, taken
+    // back over the frames before it, and the one after that confirms it.
+    let sound = |first: u64| {
+        let mut packets = vec![(adts_stream(10, 3, 2), first)];
+        for chunk in 0..8u64 {
+            packets.push((
+                adts_stream(10, 4, 2),
+                900_000 + 10 * 1_920 + chunk * 10 * 1024 * 90_000 / 44_100,
+            ));
+        }
+        packets
+    };
+    let intact = stream_with_sound_packets(6, &sound(900_000));
+    let damaged = stream_with_sound_packets(6, &sound(900_000 - 5 * 90_000));
+    for options in [passthrough(), decode()] {
+        let (intact, damaged) = (origin_of(&intact, options), origin_of(&damaged, options));
+        assert!(
+            intact.abs_diff(damaged) <= 2,
+            "the origin is {damaged} where the intact stream puts it at {intact}"
+        );
+    }
+}
+
+#[test]
+fn a_first_timestamp_waiting_across_a_change_of_sample_rate_places_the_whole_track() {
+    // The sound before the change is part of the track, so where the track
+    // starts is that much before where the count after it does, whichever of
+    // the two timestamps in question is the damaged one.
+    let sound = |second: i64| {
+        let mut packets = vec![(adts_stream(10, 3, 2), 900_000)];
+        for chunk in 0..8u64 {
+            let pts = 900_000 + 10 * 1_920 + chunk * 10 * 1024 * 90_000 / 44_100;
+            packets.push((
+                adts_stream(10, 4, 2),
+                if chunk == 0 {
+                    (pts as i64 + second) as u64
+                } else {
+                    pts
+                },
+            ));
+        }
+        packets
+    };
+    let intact = stream_with_sound_packets(6, &sound(0));
+    for shift in [5 * 90_000, -5 * 90_000] {
+        let damaged = stream_with_sound_packets(6, &sound(shift));
+        for options in [passthrough(), decode()] {
+            let times = |stream: &[u8]| {
+                track_samples(&run_session_with_options(stream, 64 * 1024, options))
+                    .audio
+                    .iter()
+                    .map(|sample| sample.decode_time)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(times(&damaged), times(&intact), "{shift} ticks");
+        }
     }
 }

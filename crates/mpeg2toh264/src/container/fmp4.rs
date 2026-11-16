@@ -333,6 +333,10 @@ pub(crate) struct TimedUnit {
     /// Original first coded PTS relative to the retimed unit boundary. This
     /// must not be inferred from the evenly spaced presentation times.
     pub source_offset: i64,
+    /// The phase the unit's slots were counted in: what `source_offset` and
+    /// the offsets of `picture_offsets` have taken away from the source's own
+    /// slot starts.
+    pub start_shift: i64,
     pub before: RffState,
     pub after: RffState,
     /// How many display slots of the group the unit ends in the group has now
@@ -342,20 +346,86 @@ pub(crate) struct TimedUnit {
     /// From the start of the unit's first display slot to the end of its last,
     /// as the slots are laid out, so empty ones count.
     pub span_ticks: u64,
+    /// Every picture the unit holds, kept or not, in decode order: where the
+    /// bytes it was coded in end, and the display slot it takes, if it takes
+    /// one. A picture whose slot an earlier unit covered, or that is no
+    /// picture of a kind that is shown, has none.
+    picture_slots: Vec<PictureSlot>,
+    /// Where each of those pictures is shown in the source's clock, counted
+    /// from the start of the unit's first display slot.
+    picture_offsets: Vec<PictureOffset>,
     display_fields: Vec<u8>,
     repeats: Vec<bool>,
     rate: (u32, u32),
 }
 
+/// See [`TimedUnit::picture_slots`].
+#[derive(Clone, Copy)]
+struct PictureSlot {
+    end: usize,
+    slot: Option<u32>,
+    /// Where the bytes of the second field begin, for a pair of fields.
+    second_field: Option<usize>,
+}
+
+/// See [`TimedUnit::picture_offsets`].
+#[derive(Clone, Copy)]
+struct PictureOffset {
+    end: usize,
+    /// Where the picture, or its first field, is shown.
+    first: Option<i64>,
+    /// For a pair of fields, where its second field's bytes begin and where
+    /// that field is shown: a field later.
+    second_field: Option<(usize, i64)>,
+}
+
 impl TimedUnit {
+    /// Where the unit's first display slot starts in the source's clock, given
+    /// that the PES beginning at `offset` of its data is stamped `pts`: the
+    /// picture the PES carries is the first whose bytes end after it, whether
+    /// the unit keeps that picture or not. `None` when that picture has no
+    /// slot of its own to say anything about.
+    pub(crate) fn start_from_timestamp(&self, offset: usize, pts: u64) -> Option<i64> {
+        let picture = self
+            .picture_offsets
+            .iter()
+            .find(|picture| picture.end > offset)?;
+        // A PES that begins at the second field of a pair stamps that field.
+        let shown = match picture.second_field {
+            Some((from, shown)) if offset >= from => shown,
+            _ => picture.first?,
+        };
+        Some(pts as i64 - shown)
+    }
+
     /// Reuse the header walk when a discontinuity clears the previous unit's
     /// committed timing phase.
     pub(crate) fn retime(&mut self, before: RffState) {
         let timing = display_timing(&self.display_fields, &self.repeats, self.rate, before);
         let timeline = &mut self.unit.timeline;
+        self.start_shift = timing.start_shift;
         self.source_offset = timeline.presentation_indices.first().map_or(0, |&index| {
             timing.source_starts[index as usize] as i64 - timing.start_shift
         });
+        let field =
+            round_half_up(90_000.0 * f64::from(self.rate.1) / f64::from(self.rate.0) / 2.0) as i64;
+        self.picture_offsets = self
+            .picture_slots
+            .iter()
+            .map(|picture| {
+                let first = picture
+                    .slot
+                    .map(|slot| timing.source_starts[slot as usize] as i64 - timing.start_shift);
+                PictureOffset {
+                    end: picture.end,
+                    first,
+                    second_field: picture
+                        .second_field
+                        .zip(first)
+                        .map(|(from, first)| (from, first + field)),
+                }
+            })
+            .collect();
         timeline.presentation_times = timeline
             .presentation_indices
             .iter()
@@ -436,6 +506,7 @@ pub(crate) fn timed_mpeg2_unit(
     let mut repeats = vec![false];
     let mut field_pairs = Vec::new();
     let mut samples = Vec::new();
+    let mut picture_slots = Vec::new();
     let mut picture_index = 0;
     // Where the picture in hand starts, which is where the one before it ended.
     // A picture that is dropped leaves its bytes to the sample that follows,
@@ -479,6 +550,24 @@ pub(crate) fn timed_mpeg2_unit(
         let start = sample_start;
         let field_end = mate.map(|_| picture_end(picture, start));
         sample_start = picture_end(mate.unwrap_or(picture), start);
+        // A picture with no slices has no end of its own to read: its bytes
+        // run to the start of the next picture's, so a PES that begins in
+        // them is its own and not the next one's.
+        // The second field of a pair is searched for from the end of the
+        // first, since from the start of the pair the first start code found
+        // would be the first field's own.
+        let slot_end = match (mate, field_end) {
+            (Some(field), Some(field_end)) if field.slices.is_empty() => {
+                next_picture_start(data, field_end)
+            }
+            (None, _) if picture.slices.is_empty() => next_picture_start(data, start),
+            _ => sample_start,
+        };
+        picture_slots.push(PictureSlot {
+            end: slot_end,
+            slot: None,
+            second_field: field_end.filter(|_| !picture.slices.is_empty()),
+        });
         let picture_type = picture.header.picture_coding_type;
         if !picture_type.is_ipb() {
             continue;
@@ -495,6 +584,7 @@ pub(crate) fn timed_mpeg2_unit(
             continue;
         }
         let presentation_index = (gop_base + tr + 1 - group_consumed) as usize;
+        picture_slots.last_mut().expect("pushed above").slot = Some(presentation_index as u32);
         if display_fields.len() <= presentation_index {
             display_fields.resize(presentation_index + 1, 2);
             repeats.resize(presentation_index + 1, false);
@@ -584,16 +674,30 @@ pub(crate) fn timed_mpeg2_unit(
     let mut timed = TimedUnit {
         unit,
         source_offset: 0,
+        start_shift: 0,
         before,
         after: RffState::default(),
         slots_after: slots_in_group,
         span_ticks: 0,
+        picture_slots,
+        picture_offsets: Vec::new(),
         display_fields,
         repeats,
         rate: frame_rate(first),
     };
     timed.retime(before);
     Ok(timed)
+}
+
+/// Where the picture whose bytes begin at `from` ends when it has no slices to
+/// say so: at the start code of the picture after it, or the end of the data.
+fn next_picture_start(data: &[u8], from: usize) -> usize {
+    let mut starts = data[from..]
+        .windows(4)
+        .enumerate()
+        .filter(|(_, code)| *code == [0, 0, 1, start_code::PICTURE])
+        .map(|(at, _)| from + at);
+    starts.nth(1).unwrap_or(data.len())
 }
 
 /// Where a picture's coded data ends, which is the start code that terminated
@@ -1737,5 +1841,40 @@ mod tests {
         // A ratio that does not divide the width evenly keeps its fraction
         // rather than landing on a pixel: 704 * 40 / 33 is 853 and a third.
         assert_eq!(track_width(704, sar(40, 33)), 853 * 65536 + 21845);
+    }
+
+    /// Where each picture's start code is, in coded order.
+    fn picture_starts(data: &[u8]) -> Vec<usize> {
+        (0..data.len() - 3)
+            .filter(|&at| data[at..at + 4] == [0, 0, 1, start_code::PICTURE])
+            .collect()
+    }
+
+    #[test]
+    fn a_picture_with_no_slices_keeps_the_timestamp_that_begins_in_it() {
+        let mut data = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/ibbp.m2v"
+        ))
+        .expect("fixture is readable");
+        // Cut the slices out of the third picture in coded order, a B: what is
+        // left of it is its header.
+        let starts = picture_starts(&data);
+        let slice = (starts[2]..starts[3])
+            .find(|&at| data[at..at + 4] == [0, 0, 1, start_code::SLICE_MIN])
+            .expect("a slice");
+        data.drain(slice..starts[3]);
+
+        let timed = timed_mpeg2_unit(&data, true, RffState::default(), 0).expect("a unit");
+        let pictures = parse_elementary_stream(&data).expect("parses");
+        let frame = i64::from(timed.unit.timeline.sample_duration);
+        for (picture, &at) in picture_starts(&data).iter().enumerate() {
+            let shown = 1_000 + i64::from(pictures[picture].header.temporal_reference) * frame;
+            assert_eq!(
+                timed.start_from_timestamp(at, shown as u64),
+                Some(1_000),
+                "the PES at picture {picture}"
+            );
+        }
     }
 }

@@ -63,11 +63,35 @@ pub struct Mpeg2Gop {
     /// covers it from further back belongs to another picture, so it has one
     /// only when a PES begins exactly at its first byte.
     pub pts: Option<u64>,
+    /// Every PES timestamp supplied for the unit's bytes, in stream order. One
+    /// is listed for each PES that begins inside the unit; a unit that opens a
+    /// group inside a PES also lists the timestamp that covers it, at its first
+    /// byte of the stream, as `pts` has it.
+    ///
+    /// A broadcast carries one PES per picture, so a unit has a timestamp for
+    /// several of its pictures, and the ones that disagree with the rest can be
+    /// told apart from the ones that do.
+    pub timestamps: Vec<UnitTimestamp>,
     /// Recent PAT/PMT start from which that PES can be demuxed again.
     pub restart_offset: Option<u64>,
     /// Whether the unit carries on a group that earlier units opened. Only the
     /// splitter that cuts groups into anchor units produces these.
     pub continues_group: bool,
+    /// Whether the stream broke since the unit before this one began: bytes
+    /// were discarded, or the caller reported a break with [`Mpeg2GopStream::note_break`].
+    /// True for the first unit of all.
+    pub after_break: bool,
+}
+
+/// A PES timestamp, and where in a unit's data the PES that carried it begins.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct UnitTimestamp {
+    /// Byte offset into [`Mpeg2Gop::data`]. The sequence header copy the
+    /// splitter puts in front of a unit is not part of the stream, so nothing
+    /// begins inside it: the first offset a PES can have is its length.
+    pub offset: usize,
+    /// Presentation timestamp in 90 kHz units.
+    pub pts: u64,
 }
 
 /// Where a PES packet's payload landed in the stream, and one value it
@@ -110,6 +134,12 @@ pub struct Mpeg2GopStream {
     prefix_length: usize,
     pts_marks: Vec<Mark>,
     restart_marks: Vec<Mark>,
+    /// Whether a unit has been cut yet. The first one follows a break by
+    /// definition: nothing is known of what came before it.
+    emitted: bool,
+    /// The stream offsets the stream broke at, in order, that no unit has been
+    /// told of yet: a unit that begins at or after one has the break behind it.
+    breaks: Vec<usize>,
     /// Start-code offsets in `buffer`, discovered once as bytes arrive.
     sequences: VecDeque<usize>,
     gops: VecDeque<usize>,
@@ -208,6 +238,7 @@ impl Mpeg2GopStream {
     /// the last sequence header needed to describe the next complete GOP.
     pub fn discard_pending(&mut self) {
         self.base += self.buffer.len().saturating_sub(self.prefix_length);
+        self.breaks.push(self.base);
         self.buffer.clear();
         self.prefix_length = 0;
         self.pts_marks.clear();
@@ -222,6 +253,16 @@ impl Mpeg2GopStream {
         self.group_matrices.clear();
     }
 
+    /// Record that the stream broke at the end of what has been pushed, without
+    /// the bytes of an unfinished unit being given up: a discontinuity marker
+    /// opens a new time base and leaves the bytes on either side of it whole,
+    /// and only the units that begin after it know. A loss of packets always
+    /// comes with [`Mpeg2GopStream::discard_pending`] as well.
+    pub(crate) fn note_break(&mut self) {
+        self.breaks
+            .push(self.base + self.buffer.len() - self.prefix_length);
+    }
+
     /// The unit running from the start of the buffer to `boundary`, with the
     /// marks that cover its first byte.
     fn unit_before(&mut self, boundary: usize) -> Mpeg2Gop {
@@ -231,11 +272,45 @@ impl Mpeg2GopStream {
             Self::mark_at(&mut self.pts_marks, self.base)
         };
         let restart_offset = Self::mark_at(&mut self.restart_marks, self.base);
+        // Marks are kept in stream order, and the covering one stays at the
+        // front for the units that begin inside the same PES.
+        let end = self.base + boundary - self.prefix_length;
+        let mut timestamps = Vec::new();
+        for mark in &self.pts_marks {
+            if mark.offset >= end {
+                break;
+            }
+            if mark.offset >= self.base {
+                timestamps.push(UnitTimestamp {
+                    offset: mark.offset - self.base + self.prefix_length,
+                    pts: mark.value,
+                });
+            }
+        }
+        if let (false, Some(pts)) = (self.continuing, pts) {
+            if timestamps
+                .first()
+                .is_none_or(|first| first.offset > self.prefix_length)
+            {
+                timestamps.insert(
+                    0,
+                    UnitTimestamp {
+                        offset: self.prefix_length,
+                        pts,
+                    },
+                );
+            }
+        }
+        let after_break = !self.emitted || self.breaks.first().is_some_and(|&at| at <= self.base);
+        self.emitted = true;
+        self.breaks.retain(|&at| at > self.base);
         Mpeg2Gop {
             data: self.buffer[..boundary].to_vec(),
             pts,
+            timestamps,
             restart_offset,
             continues_group: self.continuing,
+            after_break,
         }
     }
 
@@ -567,5 +642,35 @@ impl Mpeg2GopStream {
             self.prefix_length = 0;
         }
         output
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_second_break_before_a_unit_is_cut_does_not_hide_the_first() {
+        let one = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/ibbp.m2v"
+        ))
+        .expect("fixture is readable");
+        let mut splitter = Mpeg2GopStream::new();
+        let mut units = splitter.push(&one, None);
+        splitter.note_break();
+        units.extend(splitter.push(&one, None));
+        // The group that begins at the first break is still in the buffer
+        // when the second one is noted.
+        splitter.note_break();
+        units.extend(splitter.push(&one, None));
+        units.extend(splitter.finish());
+        assert_eq!(
+            units
+                .iter()
+                .map(|unit| unit.after_break)
+                .collect::<Vec<_>>(),
+            [true, true, true]
+        );
     }
 }

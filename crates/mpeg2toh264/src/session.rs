@@ -20,7 +20,7 @@ use crate::container::fmp4::{
 use crate::container::mpegts::{AudioStream, ElementaryKind, ElementaryPacket, MpegTsAvDemuxer};
 use crate::container::rff::RffState;
 use crate::error::{Error, Result};
-use crate::mpeg2::gop_stream::{Mpeg2Gop, Mpeg2GopStream};
+use crate::mpeg2::gop_stream::{Mpeg2Gop, Mpeg2GopStream, UnitTimestamp};
 use crate::mpeg2::headers::{stream_sequence_description, Interlacing, SequenceDescription};
 use crate::round_half_up;
 
@@ -47,6 +47,16 @@ const MAX_UNREADABLE_GROUPS: usize = 16;
 /// The PES timestamp field is 33 bits and wraps every 26.5 hours (clause
 /// 2.4.3.7), so the distance between two of them is modular.
 const PTS_MODULUS: i64 = 1 << 33;
+
+/// How far apart two timestamps, or two readings of one, have to be before a
+/// unit is placed again from its own: what the retime check tolerates.
+const RETIME_TOLERANCE: i64 = 2;
+
+/// A difference of timestamps taken across the wrap, so that one a little
+/// before another comes out negative rather than as most of 26.5 hours.
+fn signed_ticks(difference: i64) -> i64 {
+    (difference + PTS_MODULUS / 2).rem_euclid(PTS_MODULUS) - PTS_MODULUS / 2
+}
 
 /// Ticks from `origin` to `pts`, across however many wraps lie between them.
 fn ticks_since(origin: i64, pts: i64) -> u64 {
@@ -226,6 +236,42 @@ pub struct VideoPicture {
 struct WaitingUnit {
     gop: Arc<Mpeg2Gop>,
     timing: Option<KeptTiming>,
+    /// Where the unit's timestamps were taken to put it, once that is decided;
+    /// see [`Session::believed_start`]. It is the start of the unit's first
+    /// display slot, which no change of plan moves, and it is decided once so
+    /// that waiting for the sound cannot change it between one look and the
+    /// next.
+    belief: Option<Option<i64>>,
+    /// What the unit counts to as a later one in the queue; see
+    /// [`Session::next_unit_confirms`].
+    probe: Option<Probe>,
+}
+
+/// What a unit counts to, asked of it as one of the units after the one being
+/// judged.
+struct Probe {
+    /// The display slots of its group it was counted after, which is what the
+    /// units before it decide.
+    consumed: u32,
+    /// `None` for a unit that cannot be read.
+    counted: Option<Counted>,
+}
+
+struct Counted {
+    starts: Vec<i64>,
+    slots_after: u32,
+    span_ticks: u64,
+}
+
+/// What the queue says of a claim about a unit's start.
+enum Evidence {
+    Confirms,
+    Contradicts,
+    /// Nothing that can say so has arrived.
+    Pending,
+    /// Nothing that can say so can be counted against it: the stream breaks
+    /// before it does, and a claim with no witness is not believed.
+    Unavailable,
 }
 
 impl WaitingUnit {
@@ -233,6 +279,8 @@ impl WaitingUnit {
         Self {
             gop: Arc::new(gop),
             timing: None,
+            belief: None,
+            probe: None,
         }
     }
 }
@@ -284,12 +332,42 @@ impl UnitPlan {
     }
 }
 
+/// What planning the unit at the head of the queue came to.
+enum Planned {
+    /// Its headers cannot be read; the caller drops it.
+    Dropped,
+    /// Its timestamps cannot be judged until a later unit has arrived.
+    Waiting,
+    /// The plan, and where the unit's first display slot starts as its
+    /// timestamps are believed, in the source's own 90 kHz clock, or `None` when
+    /// the unit has none that can be believed.
+    Unit(Box<(UnitPlan, Option<i64>)>),
+}
+
 /// A unit that is going out, waiting only to be packaged.
 struct Ready {
     gop: Mpeg2Gop,
     audio: Vec<AacFrame>,
     plan: UnitPlan,
+    /// See [`Planned::Unit`].
+    start: Option<i64>,
     restarts: bool,
+}
+
+/// A packet of sound whose timestamp is not where the count of access units
+/// puts it -- frames missing in front of it, or time gone backwards -- held
+/// back until something else says so too.
+struct ClaimedAudio {
+    pts: u64,
+    /// Whether the first timestamp of the sound is in question as well: this
+    /// packet disagrees with it, and either may be the damaged one.
+    first_in_question: bool,
+    /// How many access units the timestamp puts the clock ahead of its count,
+    /// negative for behind.
+    deficit: i64,
+    /// The packet's first frame, which is what a short hole is covered with.
+    first: AacFrame,
+    frames: Vec<AacFrame>,
 }
 
 /// What packaging one unit made.
@@ -445,7 +523,9 @@ pub struct Session {
     unreadable_run: Option<(Error, usize)>,
     audio_config: Option<AacConfig>,
 
-    /// PES timestamp of the first audio packet, in 90 kHz units.
+    /// Where the first access unit of the sound is, in 90 kHz units, once the
+    /// first timestamp has been confirmed -- or, where it was the damaged
+    /// one, projected back from the timestamp that outvoted it.
     audio_start_pts: Option<u64>,
     /// Which elementary stream the sound is being read from, so that a
     /// programme moving it to another one is noticed.
@@ -457,6 +537,17 @@ pub struct Session {
     /// Whether the sound is being joined from another elementary stream, and so
     /// may be carrying moments that have already been laid down.
     audio_realigning: bool,
+    /// The packet of sound whose timestamp claims a jump, until the next one
+    /// agrees or the input ends. Its frames are in no queue, so nothing reads
+    /// them before the claim is settled; see [`Session::conceal_audio_gap`].
+    audio_claim: Option<ClaimedAudio>,
+    /// The first timestamp the sound carried, until the next one agrees with
+    /// it, when it becomes `audio_start_pts`.
+    audio_first: Option<u64>,
+    /// Ticks of sound laid down at other sample rates before the count it is
+    /// measured by started, which the track start is that much before where
+    /// that count's start puts it. Nonzero only while `audio_first` waits.
+    audio_first_prior: i64,
     /// Where the audio track begins on the shared timeline, once it is fixed.
     audio_origin_ticks: u64,
     /// The PES timestamp presentation time zero stands for. Supplied by a
@@ -466,13 +557,21 @@ pub struct Session {
 
     /// Where the next unit's first display slot is expected, in the source's
     /// own timestamps: where the display clock has reached. A unit that opens
-    /// later than this has a hole in front of it -- pictures the recording
-    /// lost, or ones that would not decode.
+    /// later than this, by a timestamp that is believed, has a hole in front
+    /// of it -- pictures the recording lost, or ones that would not decode.
     ///
     /// It moves with the display clock. Slots left empty inside a group are
     /// shown empty and are no hole; a unit that opens a group and shows
     /// nothing leaves its own span to be counted as part of the next one's.
+    /// A unit that opens a group with a timestamp that is believed reads it
+    /// from there instead of accumulating; see [`Session::believed_start`].
     expected_pts: Option<i64>,
+    /// Whether `expected_pts` is known not to be where the source has reached:
+    /// nothing has been read from the stream yet, it broke since, or a unit was
+    /// lost or laid down no picture. A timestamp is then the only thing to go
+    /// by, and the first one is taken as it is. Cleared when a unit that opens
+    /// a group reads `expected_pts` from its timestamp.
+    count_broken: bool,
     /// Source field clock and the end time already committed across GOPs.
     rff: RffState,
 }
@@ -621,10 +720,14 @@ impl Session {
             audio_clock_frames: 0,
             audio_clock_sample_rate: None,
             audio_realigning: false,
+            audio_claim: None,
+            audio_first: None,
+            audio_first_prior: 0,
             audio_origin_ticks: 0,
             timeline_origin: origin_ticks.map(|ticks| ticks as i64),
             timelines_aligned: false,
             expected_pts: None,
+            count_broken: true,
             rff: RffState::default(),
         }
     }
@@ -655,6 +758,12 @@ impl Session {
 
         self.pending_gops
             .extend(self.gops.finish().into_iter().map(WaitingUnit::new));
+        self.accept_audio_claim();
+        // A stream with one packet of sound, or none after the first that
+        // carries a timestamp, has nothing to disagree with it.
+        if let Some(first) = self.audio_first.take() {
+            self.audio_start_pts = Some(first);
+        }
         let final_audio = self.adts.finish()?;
         if self.audio_config.is_none() {
             self.audio_config = final_audio.first().map(|frame| frame.config.clone());
@@ -688,6 +797,13 @@ impl Session {
                                 .map(WaitingUnit::new),
                         );
                     }
+                    // A discontinuity marker leaves the bytes on both sides of it
+                    // whole and the stream broken, which the units after it have
+                    // to know. A loss of packets is told by `damaged_previous_pes`
+                    // above as well.
+                    if packet.discontinuity {
+                        self.gops.note_break();
+                    }
                     let units = self.gops.push_with_restart(
                         &packet.data,
                         packet.pts,
@@ -697,11 +813,17 @@ impl Session {
                         .extend(units.into_iter().map(WaitingUnit::new));
                 }
                 ElementaryKind::Audio => {
+                    // Whatever the claim in hand turns out to be, its frames
+                    // come before this packet's. A packet from another stream
+                    // cannot confirm what the stream before it claimed, so
+                    // the claim is not believed.
+                    if self.audio_pid.is_some_and(|pid| pid != packet.pid) {
+                        self.lay_audio_claim_by_count();
+                    } else {
+                        self.settle_audio_claim(packet.pts);
+                    }
                     if packet.discontinuity {
                         self.adts.discard_pending();
-                    }
-                    if self.audio_start_pts.is_none() {
-                        self.audio_start_pts = packet.pts;
                     }
                     // A programme that moves its sound to another elementary
                     // stream leaves the reader holding the start of a frame the
@@ -728,8 +850,21 @@ impl Session {
                     if let Some(config) = frames.last().map(|frame| frame.config.clone()) {
                         self.audio_config = Some(config);
                     }
-                    self.conceal_audio_gap(packet.pts, &mut frames);
+                    let carried_frames = !frames.is_empty();
+                    self.conceal_audio_gap(packet.pts, packet.discontinuity, &mut frames);
                     self.pending_audio.extend(frames);
+                    // The first timestamp of the sound places the whole track,
+                    // and nothing yet says it is right: the next packet that
+                    // carries one is measured against it. A packet with no
+                    // frame in it starts nothing the count can be measured
+                    // from, so it is not the first.
+                    if carried_frames
+                        && self.audio_start_pts.is_none()
+                        && self.audio_first.is_none()
+                    {
+                        self.audio_first = packet.pts;
+                        self.audio_first_prior = 0;
+                    }
                 }
                 ElementaryKind::PrivateStream1 | ElementaryKind::PrivateStream2 => {
                     out.push(Fragment::PrivateStream {
@@ -760,7 +895,32 @@ impl Session {
     ///
     /// The picture is held over the same hole, so the two stay together --
     /// see [`Session::hold_over_hole`].
-    fn conceal_audio_gap(&mut self, pts: Option<u64>, frames: &mut Vec<AacFrame>) {
+    ///
+    /// A timestamp that is not where the count of access units puts it, ahead
+    /// or behind, is not taken at its word, though: one damaged byte that the
+    /// transport did not report makes one just as well, and filling the jump
+    /// would put seconds of silence into the track, or move the clock back and
+    /// make the next intact packet look like a jump. It is believed when the
+    /// stream reported a break at this packet, or when the packet after it
+    /// carries on from where it lands. Until then the packet waits in
+    /// `audio_claim`, out of every queue, and what is not believed is laid down
+    /// by count, as if it had no timestamp.
+    ///
+    /// The same goes for the first timestamp the sound carries, which places
+    /// the whole track: see `audio_first`. It is confirmed by the next packet
+    /// that carries frames, or outvoted by it when a third agrees with that
+    /// one. What that costs is one audio PES of waiting at the start of a
+    /// stream, and again at the start of every seek leg, which is a new
+    /// session; two when the first two disagree. A genuine hole between the
+    /// first and second PES is closed up rather than filled, because from the
+    /// sound alone it cannot be told from a damaged first timestamp, and this
+    /// confines the error to that first packet.
+    fn conceal_audio_gap(
+        &mut self,
+        pts: Option<u64>,
+        break_reported: bool,
+        frames: &mut Vec<AacFrame>,
+    ) {
         let Some(first) = frames.first().cloned() else {
             return;
         };
@@ -769,25 +929,45 @@ impl Session {
             self.audio_clock_frames += frames.len() as u64;
             return;
         };
-        if self.audio_clock_sample_rate != Some(rate) || self.audio_clock_start_pts.is_none() {
+        let fresh =
+            self.audio_clock_sample_rate != Some(rate) || self.audio_clock_start_pts.is_none();
+        // Where the track would start if this packet carried on from the
+        // frames before it, which is what a first timestamp that is waiting to
+        // be confirmed becomes when the count starts again for another rate.
+        let earlier_ticks = self
+            .audio_clock_sample_rate
+            .filter(|_| fresh && self.audio_first.is_some())
+            .map(|old| self.audio_clock_ticks(old));
+        let projected_start = earlier_ticks.map(|ticks| {
+            (pts as i64 - self.audio_first_prior - ticks).rem_euclid(PTS_MODULUS) as u64
+        });
+        if fresh {
             self.audio_clock_start_pts = Some(pts);
             self.audio_clock_frames = 0;
             self.audio_clock_sample_rate = Some(rate);
+        } else {
+            self.rebase_audio_clock(rate);
         }
-        let mut elapsed =
-            ticks_since(self.audio_clock_start_pts.unwrap() as i64, pts as i64) as i64;
-        // The timestamp field wraps every 26.5 hours, so a distance measured
-        // from a fixed point stops meaning anything at half of that: past it,
-        // the reading is as likely to be a stream that has run round as one
-        // that has run long. Count from here instead, which costs the fraction
-        // of an access unit the count had accumulated and keeps a stream that
-        // plays for days measurable.
-        if elapsed > PTS_MODULUS / 2 {
-            self.audio_clock_start_pts = Some(pts);
-            self.audio_clock_frames = 0;
-            elapsed = 0;
+        let mut deficit = self.audio_deficit(pts, rate);
+        // The packet after the first timestamp either carries on from it, which
+        // confirms it, or does not, and then one of the two is damaged and a
+        // third has to say which.
+        let mut first_in_question = false;
+        if let (Some(projected), Some(ticks)) = (projected_start, earlier_ticks) {
+            self.audio_first_prior += ticks;
+            // The count has started again, for sound of another rate. What
+            // is waiting to be confirmed is now this packet's timestamp, which
+            // nothing has said yet is right, as the start it implies for the
+            // track.
+            self.audio_first = Some(projected);
+        } else if let Some(candidate) = self.audio_first {
+            if deficit.abs() <= 1 || break_reported {
+                self.audio_start_pts = Some(candidate);
+                self.audio_first = None;
+            } else {
+                first_in_question = true;
+            }
         }
-        let expected = aac_frame_count_through_video_time(elapsed, rate).max(0) as u64;
         // Sound joined from another elementary stream opens wherever that
         // stream's own access units begin, which is before where the one being
         // left had reached: a switch takes effect at a PES boundary, and the
@@ -796,7 +976,7 @@ impl Session {
         // it there, so what has been covered is dropped and the join lands on
         // the first access unit that has not.
         if self.audio_realigning {
-            let over = self.audio_clock_frames.saturating_sub(expected) as usize;
+            let over = (-deficit).max(0) as usize;
             frames.drain(..over.min(frames.len()));
             // A packet with nothing left in it was covered in full, so the one
             // after it is measured the same way. Anything left is the join.
@@ -804,10 +984,69 @@ impl Session {
             if frames.is_empty() {
                 return;
             }
+            deficit += over as i64;
         }
-        let missing = expected.saturating_sub(self.audio_clock_frames);
+        if !(-1..=0).contains(&deficit) && !break_reported {
+            self.audio_claim = Some(ClaimedAudio {
+                pts,
+                first_in_question,
+                deficit,
+                first,
+                frames: std::mem::take(frames),
+            });
+            return;
+        }
+        self.fill_audio_gap(pts, first, frames, deficit);
+    }
+
+    /// Ticks the access units counted since the clock started add up to.
+    fn audio_clock_ticks(&self, rate: u32) -> i64 {
+        (self.audio_clock_frames * AAC_FRAME_SAMPLES * TIMESCALE / u64::from(rate)) as i64
+    }
+
+    /// Start counting afresh from the count itself once it has run so long that
+    /// a timestamp could as well be behind it as ahead.
+    ///
+    /// The timestamp field wraps every 26.5 hours, so a distance measured from
+    /// a fixed point stops meaning anything at half of that. Moving the start
+    /// on to where the count has reached, which costs the fraction of an access
+    /// unit the count had accumulated, keeps a stream that plays for days
+    /// measurable without taking a timestamp's word for where that is.
+    fn rebase_audio_clock(&mut self, rate: u32) {
+        let counted = self.audio_clock_ticks(rate);
+        if counted > PTS_MODULUS / 4 {
+            let start = self.audio_clock_start_pts.expect("the clock is anchored") as i64;
+            self.audio_clock_start_pts = Some((start + counted).rem_euclid(PTS_MODULUS) as u64);
+            self.audio_clock_frames = 0;
+        }
+    }
+
+    /// How many access units the clock stands ahead of its count at `pts`, or
+    /// behind it, if negative.
+    fn audio_deficit(&self, pts: u64, rate: u32) -> i64 {
+        let start = self.audio_clock_start_pts.expect("the clock is anchored") as i64;
+        aac_frame_count_through_video_time(signed_ticks(pts as i64 - start), rate)
+            - self.audio_clock_frames as i64
+    }
+
+    /// Lay a packet whose timestamp is believed down in the clock, with what it
+    /// is ahead of the count covered, or the clock started again where it says
+    /// when it is behind.
+    fn fill_audio_gap(
+        &mut self,
+        pts: u64,
+        first: AacFrame,
+        frames: &mut Vec<AacFrame>,
+        deficit: i64,
+    ) {
+        let rate = first.config.sample_rate;
+        let missing = deficit.max(0) as u64;
         let held = (missing * AAC_FRAME_SAMPLES * TIMESCALE / rate as u64) as i64;
-        if missing <= MAX_CONCEALED_AUDIO_FRAMES {
+        if deficit < -1 {
+            // Time went back, which nothing fills. Counting goes on from here.
+            self.audio_clock_start_pts = Some(pts);
+            self.audio_clock_frames = 0;
+        } else if missing <= MAX_CONCEALED_AUDIO_FRAMES {
             frames.splice(0..0, std::iter::repeat_n(first, missing as usize));
         } else if held <= MAX_HELD_TICKS {
             // Silence rather than a repeat: a stutter that long is worse than
@@ -829,6 +1068,84 @@ impl Session {
         self.audio_clock_frames += frames.len() as u64;
     }
 
+    /// Decide the claim in hand against the next packet of sound, which was
+    /// stamped `next`: the jump is real when that packet carries on from where
+    /// it lands, within an access unit. One that has no timestamp cannot carry
+    /// on from anywhere, and the claim is not believed.
+    ///
+    /// Where the claim is also what the first timestamp of the sound is in
+    /// question against, believing it is believing that the first one was
+    /// the damaged one: the track starts where the count that has run since
+    /// puts the first frame, to land on this packet's timestamp. Not believing
+    /// it keeps the first timestamp.
+    fn settle_audio_claim(&mut self, next: Option<u64>) {
+        let Some(claim) = self.audio_claim.take() else {
+            return;
+        };
+        let rate = claim.first.config.sample_rate;
+        let clock = (self.audio_clock_start_pts, self.audio_clock_frames);
+        let mut believed = claim.frames.clone();
+        let start =
+            (claim.pts as i64 - self.audio_clock_ticks(rate)).rem_euclid(PTS_MODULUS) as u64;
+        if claim.first_in_question {
+            self.audio_clock_start_pts = Some(start);
+            self.fill_audio_gap(claim.pts, claim.first, &mut believed, 0);
+        } else {
+            self.fill_audio_gap(claim.pts, claim.first, &mut believed, claim.deficit);
+        }
+        let agrees = next.is_some_and(|next| self.audio_deficit(next, rate).abs() <= 1);
+        if agrees {
+            if claim.first_in_question {
+                self.audio_start_pts = Some(self.track_start(start));
+                self.audio_first = None;
+            }
+            self.pending_audio.extend(believed);
+        } else {
+            (self.audio_clock_start_pts, self.audio_clock_frames) = clock;
+            self.lay_claim_by_count(claim.frames);
+        }
+    }
+
+    /// Where the track starts, given where the count in force starts: before
+    /// it by the sound laid down at other sample rates ahead of it.
+    fn track_start(&self, clock_start: u64) -> u64 {
+        (clock_start as i64 - self.audio_first_prior).rem_euclid(PTS_MODULUS) as u64
+    }
+
+    /// Lay the claim in hand down by count, as one that is not believed.
+    fn lay_audio_claim_by_count(&mut self) {
+        if let Some(claim) = self.audio_claim.take() {
+            self.lay_claim_by_count(claim.frames);
+        }
+    }
+
+    fn lay_claim_by_count(&mut self, frames: Vec<AacFrame>) {
+        self.audio_clock_frames += frames.len() as u64;
+        self.pending_audio.extend(frames);
+        // What the first timestamp was in question against is not believed.
+        if let Some(first) = self.audio_first.take() {
+            self.audio_start_pts = Some(first);
+        }
+    }
+
+    /// Take the claim in hand at its word, where nothing is left to decide it.
+    fn accept_audio_claim(&mut self) {
+        let Some(mut claim) = self.audio_claim.take() else {
+            return;
+        };
+        if claim.first_in_question {
+            let rate = claim.first.config.sample_rate;
+            let start =
+                (claim.pts as i64 - self.audio_clock_ticks(rate)).rem_euclid(PTS_MODULUS) as u64;
+            self.audio_clock_start_pts = Some(start);
+            self.audio_start_pts = Some(self.track_start(start));
+            self.audio_first = None;
+            claim.deficit = 0;
+        }
+        self.fill_audio_gap(claim.pts, claim.first, &mut claim.frames, claim.deficit);
+        self.pending_audio.extend(claim.frames);
+    }
+
     /// Whether the fragment about to be emitted is a restart: it opens where a
     /// decoder begins afresh, with no reference from before it. This includes
     /// periodic recovery in discard mode, so that the timeline and the unit
@@ -848,8 +1165,14 @@ impl Session {
 
     /// The display slots of the unit's group that went out before it.
     fn consumed_before(&self, gop: &Mpeg2Gop) -> u32 {
+        Self::slots_after(gop, self.slots_consumed)
+    }
+
+    /// The display slots of the unit's group that went out before it, when
+    /// `used` of them are what the unit before it left used up.
+    fn slots_after(gop: &Mpeg2Gop, used: u32) -> u32 {
         if gop.continues_group {
-            self.slots_consumed
+            used
         } else {
             0
         }
@@ -869,13 +1192,16 @@ impl Session {
     /// this crate's.
     ///
     /// `kept` is the walk of the unit's headers from the last time it was
-    /// planned, which is used again where it was asked the same thing.
+    /// planned, which is used again where it was asked the same thing, and
+    /// `belief` is where its timestamps were taken to put it, once decided.
     fn plan_unit(
-        &self,
+        &mut self,
         gop: &Mpeg2Gop,
         restarts: bool,
         kept: &mut Option<KeptTiming>,
-    ) -> Result<UnitPlan> {
+        belief: &mut Option<Option<i64>>,
+        final_flush: bool,
+    ) -> Result<Planned> {
         let has_references = !restarts;
         let consumed = self.consumed_before(gop);
         let mut timed = match kept {
@@ -897,21 +1223,179 @@ impl Session {
                 timed
             }
         };
-        // A seek, missing GOP, or timestamp jump resets the timing phase.
-        // The ordinary hole handling accounts for any outstanding half field.
         // A unit in the middle of a group is timed against the ones before it
         // in the group, whose own timestamps it does not carry.
-        if let (Some(pts), Some(expected), false) =
-            (gop.pts, self.expected_pts, Self::follows_on(gop, restarts))
-        {
-            let difference = (pts as i64 - timed.source_offset - expected + PTS_MODULUS / 2)
-                .rem_euclid(PTS_MODULUS)
-                - PTS_MODULUS / 2;
-            if difference.abs() > 2 {
+        let mut start = None;
+        if !Self::follows_on(gop, restarts) {
+            start = match *belief {
+                Some(decided) => decided,
+                None => {
+                    let Some(decided) = self.believed_start(gop, &timed, final_flush) else {
+                        return Ok(Planned::Waiting);
+                    };
+                    *belief = Some(decided);
+                    decided
+                }
+            };
+        }
+        // A seek, missing GOP, or timestamp jump resets the timing phase.
+        // The ordinary hole handling accounts for any outstanding half field.
+        if let (Some(opens), Some(expected)) = (start, self.expected_pts) {
+            if signed_ticks(opens - expected).abs() > RETIME_TOLERANCE {
+                let shift = timed.start_shift;
                 timed.retime(RffState::default());
+                // The slots keep their places in the source's clock; what moves
+                // is the phase they are counted from.
+                start = Some(opens + timed.start_shift - shift);
             }
         }
-        Ok(self.plan_from_timed(timed))
+        Ok(Planned::Unit(Box::new((
+            self.plan_from_timed(timed),
+            start,
+        ))))
+    }
+
+    /// Where the first display slot of a unit that opens a group starts in the
+    /// source's 90 kHz clock, as far as its timestamps are to be believed, in
+    /// the phase the unit is planned in. `None` is a unit with no timestamp
+    /// worth going by, which is placed as one that has none; the outer `None`
+    /// is a unit that cannot be judged yet.
+    ///
+    /// A timestamp moves the timeline only when something else agrees with it,
+    /// because a byte of one that is damaged without the transport noticing
+    /// puts every picture after it seconds from where it belongs. Each
+    /// timestamp of the unit says where the unit starts, by the picture it
+    /// belongs to -- kept or not, since a picture the unit drops is no less
+    /// stamped -- and the first of these that holds is believed:
+    ///
+    /// 1. Two of them agree with each other. A broadcast carries a PES to a
+    ///    picture, so one that dissents is the odd one out, even the first.
+    /// 2. One is within a picture of where the display clock has reached.
+    /// 3. The count is known to be broken, or there is none yet, so there is
+    ///    nothing to measure against: the first one is taken as it is.
+    /// 4. The next unit that opens a group and carries a timestamp lands where
+    ///    this one, with the display slots between them, says it should. Until
+    ///    one has arrived the unit waits. The end of the input settles it in
+    ///    favour of the timestamp, since nothing comes after it to be put out
+    ///    of place. A break in the stream before that unit leaves the claim
+    ///    with no witness -- a count of slots across a break means nothing --
+    ///    and an unwitnessed claim is not believed, nor is one that is
+    ///    disagreed with: the unit is left with none. That errs towards a real
+    ///    hole being closed up for one group, which the unit after the break
+    ///    sets right by itself, because a damaged timestamp that was believed
+    ///    would hold the decode clock ahead for good.
+    ///
+    /// Asked of every unit that is placed by its own timestamp, which is a
+    /// unit that opens a group and one that restarts the decoder in the middle
+    /// of one.
+    fn believed_start(
+        &mut self,
+        gop: &Mpeg2Gop,
+        timed: &TimedUnit,
+        final_flush: bool,
+    ) -> Option<Option<i64>> {
+        let starts = Self::unit_starts(&gop.timestamps, timed);
+        let Some(&first) = starts.first() else {
+            return Some(None);
+        };
+        for (at, &start) in starts.iter().enumerate() {
+            if starts[at + 1..]
+                .iter()
+                .any(|&other| signed_ticks(start - other).abs() <= RETIME_TOLERANCE)
+            {
+                return Some(Some(start));
+            }
+        }
+        let picture = i64::from(timed.unit.timeline.sample_duration);
+        if let Some(expected) = self.expected_pts {
+            if let Some(&near) = starts
+                .iter()
+                .find(|&&start| signed_ticks(start - expected).abs() <= picture)
+            {
+                return Some(Some(near));
+            }
+        }
+        if self.count_broken || self.expected_pts.is_none() {
+            return Some(Some(first));
+        }
+        match self.next_unit_confirms(timed, first) {
+            Evidence::Confirms => Some(Some(first)),
+            Evidence::Contradicts | Evidence::Unavailable => Some(None),
+            Evidence::Pending if final_flush => Some(Some(first)),
+            Evidence::Pending => None,
+        }
+    }
+
+    /// Where each timestamp of a unit puts the unit's first display slot, in the
+    /// source's clock. A timestamp whose picture takes no slot says nothing.
+    fn unit_starts(timestamps: &[UnitTimestamp], timed: &TimedUnit) -> Vec<i64> {
+        timestamps
+            .iter()
+            .filter_map(|stamp| timed.start_from_timestamp(stamp.offset, stamp.pts))
+            .collect()
+    }
+
+    /// What the units after this one, in the queue, say of `claim`, the start of
+    /// this unit's first display slot: whether the next that opens a group and
+    /// carries a timestamp opens where the claim puts it, after the display
+    /// slots of this unit and of the ones between.
+    ///
+    /// Only a unit that opens a group is asked, because that is the kind a
+    /// timestamp places: the others are placed by the count, so a stream cut
+    /// into anchor units and the same stream cut into whole groups judge a
+    /// claim by the same evidence.
+    ///
+    /// The slots are counted from the units' own headers, in the phase a
+    /// stream begins in, which is a field off at most -- well inside the
+    /// picture the comparison allows. A unit that cannot be read cannot be
+    /// counted, and contradicts. What each unit counts to is kept with it, so
+    /// that asking again at the next packet costs nothing.
+    fn next_unit_confirms(&mut self, timed: &TimedUnit, claim: i64) -> Evidence {
+        let mut used = timed.slots_after;
+        let mut distance = timed.span_ticks as i64;
+        let picture = i64::from(timed.unit.timeline.sample_duration);
+        for waiting in self.pending_gops.iter_mut().skip(1) {
+            if waiting.gop.after_break {
+                return Evidence::Unavailable;
+            }
+            let consumed = Self::slots_after(&waiting.gop, used);
+            if waiting
+                .probe
+                .as_ref()
+                .is_none_or(|probe| probe.consumed != consumed)
+            {
+                let counted =
+                    timed_mpeg2_unit(&waiting.gop.data, true, RffState::default(), consumed)
+                        .ok()
+                        .map(|next| Counted {
+                            starts: Self::unit_starts(&waiting.gop.timestamps, &next),
+                            slots_after: next.slots_after,
+                            span_ticks: next.span_ticks,
+                        });
+                waiting.probe = Some(Probe { consumed, counted });
+            }
+            let Some(counted) = waiting
+                .probe
+                .as_ref()
+                .and_then(|probe| probe.counted.as_ref())
+            else {
+                return Evidence::Contradicts;
+            };
+            if !waiting.gop.continues_group && !counted.starts.is_empty() {
+                let agrees = counted
+                    .starts
+                    .iter()
+                    .any(|&start| signed_ticks(start - claim - distance).abs() <= picture);
+                return if agrees {
+                    Evidence::Confirms
+                } else {
+                    Evidence::Contradicts
+                };
+            }
+            used = counted.slots_after;
+            distance += counted.span_ticks as i64;
+        }
+        Evidence::Pending
     }
 
     /// Tell a unit's timeline where it sits in its group: how far its display
@@ -1048,14 +1532,6 @@ impl Session {
         self.describe_pending = true;
     }
 
-    /// Where a unit's first display slot sits in the source's own timestamps.
-    ///
-    /// Not the timestamp the unit carries: that belongs to its first *coded*
-    /// picture, which an open group displays after the pictures that lead it.
-    fn unit_start_pts(gop: &Mpeg2Gop, plan: &UnitPlan) -> Option<i64> {
-        Some(gop.pts? as i64 - plan.timed().source_offset)
-    }
-
     /// Hold this unit's opening sample over whatever the source lost in front
     /// of it, so that nothing after the hole moves earlier than it belongs.
     ///
@@ -1067,6 +1543,9 @@ impl Session {
     /// stay drifted. Holding the opening sample over it puts everything back
     /// where the source had it.
     ///
+    /// The unit's timestamp is the one it is believed to have, which is what
+    /// keeps a damaged one from being held over; see [`Session::believed_start`].
+    ///
     /// Only a unit that opens a random access point has a sample to hold with:
     /// its first picture. So a hole asks for one, and a unit that cannot
     /// provide it -- one with no intra picture in it -- leaves the hole to the
@@ -1075,14 +1554,18 @@ impl Session {
     ///
     /// A jump too long to sit through is left as a gap instead; see
     /// [`Session::open_a_gap`].
-    fn hold_over_hole(&mut self, gop: &Mpeg2Gop, plan: &mut UnitPlan) -> Result<()> {
+    fn hold_over_hole(
+        &mut self,
+        gop: &Mpeg2Gop,
+        plan: &mut UnitPlan,
+        start: Option<i64>,
+    ) -> Result<()> {
         // A unit in the middle of a group has no sample to hold with, and its
         // place against the ones before it is kept by the group's lag instead.
         if Self::follows_on(gop, self.restarts(gop)) {
             return Ok(());
         }
-        let (Some(expected), Some(start)) = (self.expected_pts, Self::unit_start_pts(gop, plan))
-        else {
+        let (Some(expected), Some(start)) = (self.expected_pts, start) else {
             return Ok(());
         };
         // Signed, across the wrap: a unit that opens a little before the one
@@ -1174,7 +1657,8 @@ impl Session {
     /// only thing left is to package it.
     fn take_ready(&mut self, final_flush: bool) -> Result<Option<Ready>> {
         loop {
-            if !self.demuxer.has_aac_audio() {
+            let has_audio = self.demuxer.has_aac_audio();
+            if !has_audio {
                 if self.pending_gops.is_empty() {
                     return Ok(None);
                 }
@@ -1182,47 +1666,71 @@ impl Session {
                 if matches!(self.video, VideoPipeline::Decode { .. }) {
                     return Err(Error::no_aac_audio());
                 }
-                let gop = Arc::unwrap_or_clone(self.pending_gops.remove(0).gop);
-                self.note_description(&gop);
-                let Some(mut plan) = self.plan_readable(&gop, &mut None)? else {
-                    continue;
-                };
-                self.hold_over_hole(&gop, &mut plan)?;
-                self.place_in_group(&gop, self.restarts(&gop), &mut plan);
-                return Ok(Some(self.commit(gop, Vec::new(), plan)));
-            }
-            // A unit goes out as soon as the sound that belongs beside it has
-            // arrived, which the frame count below checks. Holding it until the
-            // unit after it is complete as well would add a whole unit of delay to
-            // a live stream and change nothing in the fragment.
-            if self.pending_gops.is_empty() {
-                return Ok(None);
-            }
-            let Some(config) = self.audio_config.clone() else {
-                return Ok(None);
-            };
-            if !final_flush && self.pending_audio.is_empty() {
-                return Ok(None);
+            } else {
+                // A unit goes out as soon as the sound that belongs beside it has
+                // arrived, which the frame count below checks. Holding it until
+                // the unit after it is complete as well would add a whole unit of
+                // delay to a live stream and change nothing in the fragment.
+                if self.pending_gops.is_empty() {
+                    return Ok(None);
+                }
+                if self.audio_config.is_none() {
+                    return Ok(None);
+                }
+                // Where the sound starts is not known until a second timestamp
+                // has agreed with the first, and the origin is not to be moved.
+                if self.audio_first.is_some() && !final_flush {
+                    return Ok(None);
+                }
+                if !final_flush && self.pending_audio.is_empty() {
+                    return Ok(None);
+                }
             }
             let gop = Arc::clone(&self.pending_gops[0].gop);
             let mut timing = self.pending_gops[0].timing.take();
+            let mut belief = self.pending_gops[0].belief;
+            // A stream that broke in front of the unit has left the count
+            // wherever it was.
+            if gop.after_break {
+                self.count_broken = true;
+            }
             // Before the plan, because a unit the fragments so far do not describe
             // has to open at a random access point and the plan is drawn knowing
             // whether it does. The sound is asked the same question: an
             // initialization segment describes both tracks, so either of them
             // changing calls for a new one.
             self.note_description(&gop);
-            self.note_audio_description();
-            let Some(mut plan) = self.plan_readable(&gop, &mut timing)? else {
-                self.pending_gops.remove(0);
-                continue;
+            if has_audio {
+                self.note_audio_description();
+            }
+            let planned = self.plan_readable(&gop, &mut timing, &mut belief, final_flush)?;
+            self.pending_gops[0].belief = belief;
+            let (mut plan, start) = match planned {
+                Planned::Dropped => {
+                    self.pending_gops.remove(0);
+                    continue;
+                }
+                Planned::Waiting => {
+                    self.pending_gops[0].timing = timing;
+                    return Ok(None);
+                }
+                Planned::Unit(unit) => *unit,
             };
             // Before the audio is measured against the video, since a hole held
             // over is part of what the fragment spans and so of what it carries.
-            self.hold_over_hole(&gop, &mut plan)?;
+            self.hold_over_hole(&gop, &mut plan, start)?;
             let restarts = self.restarts(&gop);
             self.place_in_group(&gop, restarts, &mut plan);
-            self.align_timelines(&gop, &plan);
+            if !has_audio {
+                self.pending_gops.remove(0);
+                let gop = Arc::unwrap_or_clone(gop);
+                return Ok(Some(self.commit(gop, Vec::new(), plan, start)));
+            }
+            self.align_timelines(&plan, start);
+            let config = self
+                .audio_config
+                .clone()
+                .expect("the sound's configuration was checked before the unit was planned");
             let video_duration = mpeg2_fragment_duration(plan.timeline(), plan.lead_in(restarts));
             // Audio is measured from where the audio track itself starts, not
             // from where the video does.
@@ -1251,7 +1759,7 @@ impl Session {
             // short by is asked for again as soon as the next one is measured.
             let take = self.frames_under_one_configuration(take);
             let frames: Vec<AacFrame> = self.pending_audio.drain(..take).collect();
-            return Ok(Some(self.commit(gop, frames, plan)));
+            return Ok(Some(self.commit(gop, frames, plan, start)));
         }
     }
 
@@ -1266,11 +1774,13 @@ impl Session {
         &mut self,
         gop: &Mpeg2Gop,
         kept: &mut Option<KeptTiming>,
-    ) -> Result<Option<UnitPlan>> {
-        match self.plan_unit(gop, self.restarts(gop), kept) {
-            Ok(plan) => {
+        belief: &mut Option<Option<i64>>,
+        final_flush: bool,
+    ) -> Result<Planned> {
+        match self.plan_unit(gop, self.restarts(gop), kept, belief, final_flush) {
+            Ok(planned) => {
                 self.unreadable_run = None;
-                Ok(Some(plan))
+                Ok(planned)
             }
             Err(error) => {
                 self.unreadable_units += 1;
@@ -1283,14 +1793,22 @@ impl Session {
                     return Err(first);
                 }
                 self.video.request_random_access();
-                Ok(None)
+                // What the unit would have spanned is lost with it.
+                self.count_broken = true;
+                Ok(Planned::Dropped)
             }
         }
     }
 
     /// Settle what a unit that is going out will be: whether it carries a
     /// restart point, and so what its plan is.
-    fn commit(&mut self, gop: Mpeg2Gop, audio: Vec<AacFrame>, plan: UnitPlan) -> Ready {
+    fn commit(
+        &mut self,
+        gop: Mpeg2Gop,
+        audio: Vec<AacFrame>,
+        plan: UnitPlan,
+        start: Option<i64>,
+    ) -> Ready {
         if self.recovery_due(&gop) {
             match self.open_gop_recovery {
                 OpenGopRecovery::RecoveryPoint => self.video.request_recovery_point(),
@@ -1302,12 +1820,13 @@ impl Session {
             gop,
             audio,
             plan,
+            start,
             restarts,
         }
     }
 
     /// Put the two tracks on one timeline, using the timestamps the transport
-    /// stream gives them.
+    /// stream gives them, the video's being the one believed for its unit.
     ///
     /// Video and audio in a broadcast stream do not start at the same PTS -- a
     /// few hundred milliseconds apart is normal -- so starting both tracks at
@@ -1315,7 +1834,7 @@ impl Session {
     /// placed at their real distance from the origin, which for a session that
     /// picks its own is whichever track starts first, and for an anchored one
     /// is the timestamp the caller named.
-    fn align_timelines(&mut self, gop: &Mpeg2Gop, plan: &UnitPlan) {
+    fn align_timelines(&mut self, plan: &UnitPlan, start: Option<i64>) {
         let timeline = plan.timeline();
         if self.timelines_aligned {
             return;
@@ -1327,15 +1846,15 @@ impl Session {
             self.timelines_aligned = true;
             return;
         }
-        let Some(video_pts) = gop.pts else {
+        // Where the unit's first display slot starts, which is before its first
+        // coded picture where the group is open: that one is shown after the
+        // B pictures that lead it. This only ever runs on the opening
+        // fragment, where those pictures are missing and the first picture
+        // covers their display slots, so the presentation still starts where
+        // they would.
+        let Some(video_start) = start else {
             return;
         };
-        // A GOP's timestamp belongs to its I picture, which is coded first but
-        // displayed after the B pictures that lead the group. This only ever
-        // runs on the opening fragment, where those pictures are missing and
-        // the first picture covers their display slots, so the presentation
-        // still starts where they would.
-        let video_start = video_pts as i64 - plan.timed().source_offset;
         let origin = match self.timeline_origin {
             Some(origin) => origin,
             None => {
@@ -1379,10 +1898,11 @@ impl Session {
             gop: unit,
             audio: audio_frames,
             plan,
+            start,
             restarts,
         } = ready;
         let gop = &unit;
-        self.align_timelines(gop, &plan);
+        self.align_timelines(&plan, start);
 
         let config = audio_frames
             .first()
@@ -1413,21 +1933,27 @@ impl Session {
         // than accumulated, so that the presentation and the source cannot
         // creep apart; the hold at its front covered the hole in front of it
         // and is not part of what it spans. Any other unit has no timestamp of
-        // its own to read it from, and moves it on by what the display clock
-        // moved -- slots the source lost included, which are no hole.
+        // its own to read it from -- or none that is believed -- and moves it
+        // on by what the display clock moved, slots the source lost included,
+        // which are no hole.
         let moved = (fragment.duration + lag.lead) as i64 - self.lead as i64;
         let opens =
             !Self::follows_on(gop, restarts) && !plan.timeline().presentation_indices.is_empty();
-        match (opens, Self::unit_start_pts(gop, &plan)) {
+        match (opens, start) {
             (true, Some(start)) => {
                 let hold = i64::from(plan.timeline().hold_ticks);
                 self.expected_pts = Some(start + moved - hold);
+                self.count_broken = false;
             }
             _ => {
                 if let Some(expected) = self.expected_pts.as_mut() {
                     *expected += moved;
                 }
             }
+        }
+        // Pictures the unit was meant to carry are not there to be counted.
+        if plan.timeline().presentation_indices.is_empty() {
+            self.count_broken = true;
         }
         self.lead = lag.lead;
         self.group_laid_down = lag.group_laid_down;
