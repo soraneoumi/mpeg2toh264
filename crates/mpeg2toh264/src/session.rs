@@ -503,14 +503,17 @@ pub struct Session {
     group_laid_down: bool,
     media_bytes_since_random_access: usize,
     initialized: bool,
-    /// What the initialization segment that went out describes, and so what a
-    /// unit has to be coded under to play against it.
+    /// What the video that went out is coded under, and so what a unit has to
+    /// be coded under to follow it: the initialization segment's description
+    /// when the video is muxed, the last unit handed out when it is decoded by
+    /// the caller.
     described: Option<SequenceDescription>,
     /// The same for the sound, which that segment describes as well.
     described_audio: Option<AacConfig>,
     /// Whether the next fragment has to carry an initialization segment: the
     /// first one does, and so does the first one after a stream changes what
-    /// its sequence header says.
+    /// its sequence header says -- or, where the pictures are handed out and
+    /// the segment holds only the sound, what the sound is described by.
     describe_pending: bool,
 
     pending_gops: Vec<WaitingUnit>,
@@ -1475,8 +1478,8 @@ impl Session {
         }
     }
 
-    /// Notice a unit coded under something other than what the initialization
-    /// segment describes, and arrange for it to be described afresh.
+    /// Notice a unit coded under something other than what the fragments so far
+    /// describe, and arrange for it to be described afresh.
     ///
     /// A broadcast changes its frame size, its field coding or its aspect ratio
     /// between programmes, and Media Source Extensions takes a further
@@ -1505,7 +1508,11 @@ impl Session {
         if self.described.is_some() {
             self.video.request_random_access();
         }
-        self.describe_pending = true;
+        // The decoder is given the pictures' own headers. The initialization
+        // segment holds the sound alone, whatever the picture is coded under.
+        if !matches!(self.video, VideoPipeline::Decode { .. }) {
+            self.describe_pending = true;
+        }
     }
 
     /// Notice sound coded under something other than what the initialization
@@ -1994,14 +2001,18 @@ impl Session {
             self.gops_emitted += 1;
         }
 
-        // Whichever path made the fragment describes it exactly when the
+        // A fragment that muxes the video describes it exactly when the
         // pictures in it are the first coded under their description, which is
-        // the fragment a `SourceBuffer` has to be given one for.
+        // the fragment a `SourceBuffer` has to be given one for. One that
+        // carries only the sound is described when the sound changes.
+        let description = stream_sequence_description(&gop.data);
+        let decode = matches!(plan, UnitPlan::Decode(_));
         if !fragment.init_segment.is_empty() {
-            let description = stream_sequence_description(&gop.data);
             self.initialized = true;
             self.describe_pending = false;
-            self.described = description;
+            if !decode {
+                self.described = description;
+            }
             self.described_audio = config;
             out.push(Fragment::Init {
                 data: fragment.init_segment,
@@ -2010,7 +2021,6 @@ impl Session {
                 height: description.map_or(0, |description| description.height),
             });
         }
-        let decode = matches!(plan, UnitPlan::Decode(_));
         // Sound alone: every fragment is somewhere a decoder can begin.
         let random_access = restarts || recovery_point || decode;
         if random_access {
@@ -2044,6 +2054,12 @@ impl Session {
             // A unit with no sound can go out before the initialization
             // segment does, and its pictures fix the origin all the same.
             self.initialized = true;
+            // What the pictures handed out are coded under is what the next
+            // unit is measured against, whether or not any segment went out
+            // with them.
+            if description.is_some() {
+                self.described = description;
+            }
             out.push(Fragment::Video {
                 data: unit.data,
                 start,

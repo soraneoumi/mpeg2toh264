@@ -3524,6 +3524,39 @@ fn a_damaged_audio_timestamp_does_not_fill_the_jump_with_silence() {
     }
 }
 
+#[test]
+fn a_change_of_description_in_decode_mode_does_not_ask_for_a_restart_forever() {
+    // The picture is coded under another height from the third group on, and
+    // from the third group on there is no sound to carry an initialization
+    // segment out: the units go out without one. What they are coded under
+    // has to be remembered all the same, or every unit that continues a group
+    // is taken for the first of something new and dropped for want of an
+    // intra picture.
+    let pictures = pictures_per_group();
+    let height = mpeg2toh264::mpeg2_video_timeline(&read_fixture("ibbp.m2v"), false)
+        .expect("a timeline")
+        .height;
+    let groups: Vec<Vec<u8>> = (0..8)
+        .map(|copy| {
+            let es = read_fixture("ibbp.m2v");
+            if copy >= 3 {
+                with_frame_height(&es, height - 16)
+            } else {
+                es
+            }
+        })
+        .collect();
+    let stream = stamped_stream(&groups, false, &[], 2);
+    let decoded = run_session_with_options(&stream, 64 * 1024, decode());
+    let handed_out: usize = decoded
+        .iter()
+        .map(|fragment| match fragment {
+            Fragment::Video { pictures, .. } => pictures.len(),
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(handed_out, 8 * pictures, "every picture of every group");
+}
 
 /// Video PES begun, and the order of what came out, feeding one transport
 /// packet at a time.
@@ -3851,6 +3884,26 @@ fn a_jump_in_the_sound_cannot_be_confirmed_by_another_stream() {
     }
 }
 
+#[test]
+fn a_description_change_in_decode_mode_makes_no_initialization_segment() {
+    // The segment holds the sound, and the sound did not change.
+    let height = mpeg2toh264::mpeg2_video_timeline(&read_fixture("ibbp.m2v"), false)
+        .expect("a timeline")
+        .height;
+    let groups: Vec<Vec<u8>> = (0..8)
+        .map(|copy| {
+            let es = read_fixture("ibbp.m2v");
+            if copy == 4 {
+                with_frame_height(&es, height - 16)
+            } else {
+                es
+            }
+        })
+        .collect();
+    let stream = stamped_stream(&groups, false, &[], 8);
+    let decoded = run_session_with_options(&stream, 64 * 1024, decode());
+    assert_eq!(init_segments(&decoded).len(), 1);
+}
 
 #[test]
 fn a_restart_that_drops_the_leading_pictures_is_still_judged_by_their_timestamps() {
