@@ -3180,6 +3180,71 @@ fn decode_mode_holds_over_holes_and_keeps_a_group_in_place_after_one() {
     assert!(cases > 4);
 }
 
+/// Where a stream's sequence headers are, each inside one transport packet.
+fn sequence_headers(stream: &[u8]) -> Vec<usize> {
+    stream
+        .windows(4)
+        .enumerate()
+        .filter(|(at, code)| *code == [0, 0, 1, 0xb3] && at % 188 + 8 < 188)
+        .map(|(at, _)| at)
+        .collect()
+}
+
+/// Damage a sequence header's frame rate code to the forbidden zero.
+fn damage_frame_rate(stream: &mut [u8], header: usize) {
+    stream[header + 7] &= 0xf0;
+}
+
+#[test]
+fn decode_mode_drops_a_unit_whose_sequence_header_was_damaged() {
+    let stream = timed_av_stream(10);
+    let headers = sequence_headers(&stream);
+    let mut damaged = stream.clone();
+    damage_frame_rate(&mut damaged, headers[headers.len() / 2]);
+    assert_decode_mode_agrees("a sequence header damaged", &damaged, passthrough());
+    let run = |stream: &[u8]| -> (usize, u64) {
+        let mut session = Session::new(decode());
+        let mut fragments = Vec::new();
+        for chunk in stream.chunks(64 * 1024) {
+            fragments.extend(session.push(chunk).expect("push succeeds"));
+        }
+        fragments.extend(session.finish().expect("finish succeeds"));
+        let pictures = fragments
+            .iter()
+            .map(|fragment| match fragment {
+                Fragment::Video { pictures, .. } => pictures.len(),
+                _ => 0,
+            })
+            .sum();
+        (pictures, session.errors())
+    };
+    let ((whole, clean), (kept, errors)) = (run(&stream), run(&damaged));
+    assert!(
+        kept < whole && kept > whole / 2,
+        "{kept} of {whole} pictures: the damaged group is lost and the rest plays"
+    );
+    assert_eq!(clean, 0);
+    assert!(errors > 0, "the unit dropped counts as an error");
+}
+
+#[test]
+fn fails_on_a_stream_none_of_whose_headers_can_be_read() {
+    let mut stream = timed_av_stream(40);
+    for header in sequence_headers(&stream) {
+        damage_frame_rate(&mut stream, header);
+    }
+    for options in [decode(), passthrough()] {
+        let mut session = Session::new(options);
+        let failure = stream
+            .chunks(64 * 1024)
+            .map(|chunk| session.push(chunk).map(drop))
+            .find_map(Result::err)
+            .or_else(|| session.finish().err())
+            .expect("the session fails");
+        assert!(failure.to_string().contains("frame_rate_code"), "{failure}");
+    }
+}
+
 #[test]
 fn decode_mode_leaves_a_join_and_a_wrap_where_the_source_has_them() {
     const JUMP: u64 = 120 * 90_000;

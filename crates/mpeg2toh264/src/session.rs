@@ -39,6 +39,11 @@ const MAX_CONCEALED_AUDIO_FRAMES: u64 = 8;
 /// the presentation instead -- see [`Session::open_a_gap`].
 const MAX_HELD_TICKS: i64 = 30 * TIMESCALE as i64;
 
+/// Groups in a row whose units' headers cannot be read, with no unit that can
+/// between them, past which the stream is taken to be one this cannot read
+/// rather than a damaged one: some seconds of it, however the groups are cut.
+const MAX_UNREADABLE_GROUPS: usize = 16;
+
 /// The PES timestamp field is 33 bits and wraps every 26.5 hours (clause
 /// 2.4.3.7), so the distance between two of them is modular.
 const PTS_MODULUS: i64 = 1 << 33;
@@ -432,6 +437,12 @@ pub struct Session {
 
     pending_gops: Vec<WaitingUnit>,
     pending_audio: Vec<AacFrame>,
+    /// Units dropped because their headers could not be read, which count
+    /// among the errors.
+    unreadable_units: u64,
+    /// The first error of the unreadable units since the last one that could
+    /// be read, and how many groups they have opened.
+    unreadable_run: Option<(Error, usize)>,
     audio_config: Option<AacConfig>,
 
     /// PES timestamp of the first audio packet, in 90 kHz units.
@@ -556,7 +567,7 @@ impl Session {
         self.demuxer.scrambled()
     }
     pub fn errors(&self) -> u64 {
-        self.demuxer.errors()
+        self.demuxer.errors() + self.unreadable_units
     }
 
     /// Start a session whose timeline is measured from a PES timestamp of the
@@ -601,6 +612,8 @@ impl Session {
             describe_pending: true,
             pending_gops: Vec::new(),
             pending_audio: Vec::new(),
+            unreadable_units: 0,
+            unreadable_run: None,
             audio_config: None,
             audio_start_pts: None,
             audio_pid: None,
@@ -1160,79 +1173,119 @@ impl Session {
     /// that decides it happens after: what comes back is committed to, and the
     /// only thing left is to package it.
     fn take_ready(&mut self, final_flush: bool) -> Result<Option<Ready>> {
-        if !self.demuxer.has_aac_audio() {
+        loop {
+            if !self.demuxer.has_aac_audio() {
+                if self.pending_gops.is_empty() {
+                    return Ok(None);
+                }
+                // The sound is the clock decoded pictures are shown by.
+                if matches!(self.video, VideoPipeline::Decode { .. }) {
+                    return Err(Error::no_aac_audio());
+                }
+                let gop = Arc::unwrap_or_clone(self.pending_gops.remove(0).gop);
+                self.note_description(&gop);
+                let Some(mut plan) = self.plan_readable(&gop, &mut None)? else {
+                    continue;
+                };
+                self.hold_over_hole(&gop, &mut plan)?;
+                self.place_in_group(&gop, self.restarts(&gop), &mut plan);
+                return Ok(Some(self.commit(gop, Vec::new(), plan)));
+            }
+            // A unit goes out as soon as the sound that belongs beside it has
+            // arrived, which the frame count below checks. Holding it until the
+            // unit after it is complete as well would add a whole unit of delay to
+            // a live stream and change nothing in the fragment.
             if self.pending_gops.is_empty() {
                 return Ok(None);
             }
-            // The sound is the clock decoded pictures are shown by.
-            if matches!(self.video, VideoPipeline::Decode { .. }) {
-                return Err(Error::no_aac_audio());
+            let Some(config) = self.audio_config.clone() else {
+                return Ok(None);
+            };
+            if !final_flush && self.pending_audio.is_empty() {
+                return Ok(None);
             }
-            let gop = Arc::unwrap_or_clone(self.pending_gops.remove(0).gop);
+            let gop = Arc::clone(&self.pending_gops[0].gop);
+            let mut timing = self.pending_gops[0].timing.take();
+            // Before the plan, because a unit the fragments so far do not describe
+            // has to open at a random access point and the plan is drawn knowing
+            // whether it does. The sound is asked the same question: an
+            // initialization segment describes both tracks, so either of them
+            // changing calls for a new one.
             self.note_description(&gop);
-            let mut plan = self.plan_unit(&gop, self.restarts(&gop), &mut None)?;
+            self.note_audio_description();
+            let Some(mut plan) = self.plan_readable(&gop, &mut timing)? else {
+                self.pending_gops.remove(0);
+                continue;
+            };
+            // Before the audio is measured against the video, since a hole held
+            // over is part of what the fragment spans and so of what it carries.
             self.hold_over_hole(&gop, &mut plan)?;
-            self.place_in_group(&gop, self.restarts(&gop), &mut plan);
-            return Ok(Some(self.commit(gop, Vec::new(), plan)));
+            let restarts = self.restarts(&gop);
+            self.place_in_group(&gop, restarts, &mut plan);
+            self.align_timelines(&gop, &plan);
+            let video_duration = mpeg2_fragment_duration(plan.timeline(), plan.lead_in(restarts));
+            // Audio is measured from where the audio track itself starts, not
+            // from where the video does.
+            let through = (self.video_presentation_start + video_duration) as i64
+                - self.audio_origin_ticks as i64;
+            let desired = aac_frame_count_through_video_time(through, config.sample_rate);
+            let wanted = (desired - self.audio_frames_emitted as i64).max(0) as usize;
+            if !final_flush && self.pending_audio.len() < wanted {
+                self.pending_gops[0].timing = timing;
+                return Ok(None);
+            }
+            // The queue's hold on the unit goes with its place in it, which
+            // leaves the one here the only one.
+            self.pending_gops.remove(0);
+            let gop = Arc::unwrap_or_clone(gop);
+            // The last fragment takes whatever audio is left, since nothing
+            // follows it to carry the remainder.
+            let take = if final_flush && self.pending_gops.is_empty() {
+                self.pending_audio.len()
+            } else {
+                wanted.min(self.pending_audio.len())
+            };
+            // A fragment's sound is described by the initialization segment in
+            // front of it, so it holds one configuration. The frames past a change
+            // wait for the fragment that describes them, and the count they are
+            // short by is asked for again as soon as the next one is measured.
+            let take = self.frames_under_one_configuration(take);
+            let frames: Vec<AacFrame> = self.pending_audio.drain(..take).collect();
+            return Ok(Some(self.commit(gop, frames, plan)));
         }
-        // A unit goes out as soon as the sound that belongs beside it has
-        // arrived, which the frame count below checks. Holding it until the
-        // unit after it is complete as well would add a whole unit of delay to
-        // a live stream and change nothing in the fragment.
-        if self.pending_gops.is_empty() {
-            return Ok(None);
+    }
+
+    /// Plan a unit, or give it up when its headers cannot be read, for the
+    /// caller to drop. That is damage the transport did not report, and no
+    /// decoder can begin anything from it either: what depends on it waits for
+    /// the next random access point, as after a gap, and its span becomes part
+    /// of the hole in front of the unit that opens there. Damage passes; a run
+    /// of such units with no readable one between them says the stream itself
+    /// cannot be read, and the first of their errors is returned.
+    fn plan_readable(
+        &mut self,
+        gop: &Mpeg2Gop,
+        kept: &mut Option<KeptTiming>,
+    ) -> Result<Option<UnitPlan>> {
+        match self.plan_unit(gop, self.restarts(gop), kept) {
+            Ok(plan) => {
+                self.unreadable_run = None;
+                Ok(Some(plan))
+            }
+            Err(error) => {
+                self.unreadable_units += 1;
+                let run = self.unreadable_run.get_or_insert((error, 0));
+                if !gop.continues_group {
+                    run.1 += 1;
+                }
+                if run.1 > MAX_UNREADABLE_GROUPS {
+                    let (first, _) = self.unreadable_run.take().expect("a run under way");
+                    return Err(first);
+                }
+                self.video.request_random_access();
+                Ok(None)
+            }
         }
-        let Some(config) = self.audio_config.clone() else {
-            return Ok(None);
-        };
-        if !final_flush && self.pending_audio.is_empty() {
-            return Ok(None);
-        }
-        let gop = Arc::clone(&self.pending_gops[0].gop);
-        let mut timing = self.pending_gops[0].timing.take();
-        // Before the plan, because a unit the fragments so far do not describe
-        // has to open at a random access point and the plan is drawn knowing
-        // whether it does. The sound is asked the same question: an
-        // initialization segment describes both tracks, so either of them
-        // changing calls for a new one.
-        self.note_description(&gop);
-        self.note_audio_description();
-        let mut plan = self.plan_unit(&gop, self.restarts(&gop), &mut timing)?;
-        // Before the audio is measured against the video, since a hole held
-        // over is part of what the fragment spans and so of what it carries.
-        self.hold_over_hole(&gop, &mut plan)?;
-        let restarts = self.restarts(&gop);
-        self.place_in_group(&gop, restarts, &mut plan);
-        self.align_timelines(&gop, &plan);
-        let video_duration = mpeg2_fragment_duration(plan.timeline(), plan.lead_in(restarts));
-        // Audio is measured from where the audio track itself starts, not
-        // from where the video does.
-        let through = (self.video_presentation_start + video_duration) as i64
-            - self.audio_origin_ticks as i64;
-        let desired = aac_frame_count_through_video_time(through, config.sample_rate);
-        let wanted = (desired - self.audio_frames_emitted as i64).max(0) as usize;
-        if !final_flush && self.pending_audio.len() < wanted {
-            self.pending_gops[0].timing = timing;
-            return Ok(None);
-        }
-        // The queue's hold on the unit goes with its place in it, which
-        // leaves the one here the only one.
-        self.pending_gops.remove(0);
-        let gop = Arc::unwrap_or_clone(gop);
-        // The last fragment takes whatever audio is left, since nothing
-        // follows it to carry the remainder.
-        let take = if final_flush && self.pending_gops.is_empty() {
-            self.pending_audio.len()
-        } else {
-            wanted.min(self.pending_audio.len())
-        };
-        // A fragment's sound is described by the initialization segment in
-        // front of it, so it holds one configuration. The frames past a change
-        // wait for the fragment that describes them, and the count they are
-        // short by is asked for again as soon as the next one is measured.
-        let take = self.frames_under_one_configuration(take);
-        let frames: Vec<AacFrame> = self.pending_audio.drain(..take).collect();
-        Ok(Some(self.commit(gop, frames, plan)))
     }
 
     /// Settle what a unit that is going out will be: whether it carries a
