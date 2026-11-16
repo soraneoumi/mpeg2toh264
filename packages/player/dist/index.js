@@ -242,7 +242,7 @@ class b {
     if (e?.type === "append") {
       if (e.epoch === this.#d && this.#h[0] === e.pending) {
         const t = this.#h.shift();
-        this.#S -= t.data.byteLength, t.init || this.#x(t.start);
+        this.#S -= t.data.byteLength, t.init || this.#F(t.start);
       }
     } else e?.type === "remove" ? (this.#u = !1, this.#v()) : e?.type === "clear" && (this.#y = !1);
     this.#a = null, this.#_(), this.#H(), this.#p(), this.#E();
@@ -285,7 +285,7 @@ class b {
    * does, and the playhead goes to the later of the two, where the tracks of
    * muxed media would have both begun.
    */
-  #x(e) {
+  #F(e) {
     const t = this.#t?.buffered;
     this.#b || !t || t.length === 0 || (this.#b = !0, this.#r.onMark?.("appended"), this.#r.seek(Math.max(t.start(0), e)));
   }
@@ -334,12 +334,12 @@ class b {
     }
   }
   /** How far past the playhead the buffer reaches, in seconds. */
-  #F() {
+  #G() {
     const e = this.#t?.buffered;
     return !e || e.length === 0 ? 0 : e.end(e.length - 1) - this.#T;
   }
   #p() {
-    const e = !this.#u && this.#f && this.#F() < this.#r.maxAheadSeconds && this.#S < this.#r.queueHighWaterMark && // The fragment limit would stop the input before a start hold fills.
+    const e = !this.#u && this.#f && this.#G() < this.#r.maxAheadSeconds && this.#S < this.#r.queueHighWaterMark && // The fragment limit would stop the input before a start hold fills.
     (this.#i > 0 || this.#h.length < 2);
     this.#s.set(e) && this.#r.onReadyChange?.(e);
   }
@@ -366,7 +366,7 @@ class b {
     );
   }
 }
-const w = "" + new URL("assets/worker-DwxKlq9_.js", import.meta.url).href, M = w, u = 0.1, f = [
+const w = "" + new URL("assets/worker-hZ2zdemf.js", import.meta.url).href, M = w, u = 0.1, f = [
   "loadedmetadata",
   "loadeddata",
   "canplay",
@@ -449,7 +449,7 @@ class I extends EventTarget {
   constructor(e, t = {}) {
     super(), this.video = e, this.#e = t;
     const i = t.mediaSource ?? "auto";
-    this.#r = i === "auto" ? m(t.preferManagedMediaSource) ? "worker" : "main" : i, this.video.addEventListener("seeking", this.#j);
+    this.#r = i === "auto" ? m(t.preferManagedMediaSource) ? "worker" : "main" : i, this.video.addEventListener("seeking", this.#q);
     for (const s of p)
       this.video.addEventListener(s, this.#v);
     for (const s of f)
@@ -577,17 +577,17 @@ class I extends EventTarget {
       }
   }
   #C(e, t, i) {
-    e <= 0 || t <= 0 || this.#x({ start: i, codedSize: { width: e, height: t } });
+    e <= 0 || t <= 0 || this.#F({ start: i, codedSize: { width: e, height: t } });
   }
   /** Add source metadata now, but apply it only when its picture is shown. */
   #W(e) {
     for (const { start: t, interlaced: i, topFieldFirst: s } of e)
-      this.#x({
+      this.#F({
         start: t,
         scan: { interlaced: i, topFieldFirst: s }
       });
   }
-  #x(e) {
+  #F(e) {
     const t = this.#d.at(-1), i = {
       start: e.start,
       codedSize: e.codedSize ?? t?.codedSize,
@@ -653,10 +653,10 @@ class I extends EventTarget {
       queueHighWaterMark: this.#e.queueHighWaterMark ?? 33554432,
       maxAheadSeconds: this.#e.maxAheadSeconds ?? 8,
       keepBehindSeconds: this.#e.keepBehindSeconds ?? 10
-    }), this.#X(), this.#s && s && (s.onrelease = this.#F, this.#p(), this.#E = setInterval(this.#v, 40)), g;
+    }), this.#X(), this.#s && s && (s.onrelease = this.#G, this.#p(), this.#E = setInterval(this.#v, 40)), g;
   }
   /** Give a picture's buffer back to the worker that made it. */
-  #F = (e) => {
+  #G = (e) => {
     !this.#s || e.byteLength === 0 || this.#n?.postMessage(
       { type: "recycle", id: this.#t, data: e },
       [e]
@@ -682,7 +682,7 @@ class I extends EventTarget {
   #O(e, t) {
     const i = this.#i?.decodedVideo;
     if (e !== this.#U || !i) {
-      this.#F(t.data);
+      this.#G(t.data);
       return;
     }
     const s = this.#L;
@@ -704,7 +704,7 @@ class I extends EventTarget {
   /** Stop, and give up the worker. The player cannot be loaded again. */
   destroy() {
     if (!this.#c) {
-      this.stop(), this.#c = !0, this.video.removeEventListener("seeking", this.#j);
+      this.stop(), this.#c = !0, this.video.removeEventListener("seeking", this.#q);
       for (const e of p)
         this.video.removeEventListener(e, this.#v);
       for (const e of f)
@@ -726,19 +726,19 @@ class I extends EventTarget {
           type: "module"
         }
       );
-      e.onmessage = this.#$, e.onerror = (t) => this.#w(new Error(t.message || "the worker failed")), this.#n = e;
+      e.onmessage = this.#Z, e.onerror = (t) => this.#w(new Error(t.message || "the worker failed")), this.#n = e;
     }
     return this.#n;
   }
-  #$ = (e) => {
+  #Z = (e) => {
     const t = e.data;
     if (t.id === this.#t)
       switch (t.type) {
         case "handle":
-          t.managed && this.#q(), this.video.srcObject = t.handle, this.#B("attached", a());
+          t.managed && this.#z(), this.video.srcObject = t.handle, this.#B("attached", a());
           break;
         case "open":
-          this.#J(t.mimeCodec, t.data);
+          this.#$(t.mimeCodec, t.data);
           break;
         case "video-config":
           this.#s || this.#C(
@@ -789,7 +789,7 @@ class I extends EventTarget {
           this.#B(t.name, t.at);
           break;
         case "seek":
-          this.#z(t.time);
+          this.#j(t.time);
           break;
         case "hold":
           this.#y = t.seconds, this.#o?.holdStart(t.seconds);
@@ -810,7 +810,7 @@ class I extends EventTarget {
           this.#te();
           break;
         case "completed":
-          this.#A("completed"), this.#r === "worker" && this.#G();
+          this.#A("completed"), this.#r === "worker" && this.#x();
           break;
         case "error":
           this.#w(new Error(t.message));
@@ -818,11 +818,11 @@ class I extends EventTarget {
       }
   };
   /** Open a MediaSource here, for browsers that cannot have one in a worker. */
-  #J(e, t) {
+  #$(e, t) {
     const i = this.#t;
     let s;
     try {
-      s = this.#o ?? this.#Z(i), s.holdStart(this.#y);
+      s = this.#o ?? this.#J(i), s.holdStart(this.#y);
     } catch (r) {
       this.#w(o(r));
       return;
@@ -837,13 +837,13 @@ class I extends EventTarget {
       }
     );
   }
-  #Z(e) {
+  #J(e) {
     const t = new b({
       preferManaged: this.#e.preferManagedMediaSource,
       queueHighWaterMark: this.#e.queueHighWaterMark ?? 33554432,
       maxAheadSeconds: this.#e.maxAheadSeconds ?? 8,
       keepBehindSeconds: this.#e.keepBehindSeconds ?? 10,
-      seek: (i) => this.#z(i),
+      seek: (i) => this.#j(i),
       onMark: (i) => this.#B(i, a()),
       onReadyChange: (i) => this.#Q(e, { type: "flow", id: e, ready: i }),
       onBlocked: (i) => {
@@ -865,7 +865,7 @@ class I extends EventTarget {
    * arrives and the load waits for a stream that has not begun.
    */
   #ee(e) {
-    this.video.removeAttribute("src"), this.#q();
+    this.video.removeAttribute("src"), this.#z();
     const t = document.createElement("source");
     t.type = "video/mp4", t.src = e, this.video.append(t), this.#S = t, this.video.load();
   }
@@ -875,14 +875,14 @@ class I extends EventTarget {
    * belongs to whoever made it, so it is put back on the way out -- unless it
    * was already off, and theirs to keep.
    */
-  #q() {
+  #z() {
     this.video.disableRemotePlayback || (this.video.disableRemotePlayback = !0, this.#a = !0);
   }
   #te() {
     const e = this.#t, t = this.#o;
     t && t.finish().then(
       () => {
-        e === this.#t && this.#G();
+        e === this.#t && this.#x();
       },
       (i) => {
         e === this.#t && this.#w(o(i));
@@ -895,7 +895,7 @@ class I extends EventTarget {
    * position begin there, so the run they belong to goes on, and the sound
    * held back for them has not been let into the element any earlier.
    */
-  #z(e) {
+  #j(e) {
     this.video.currentTime >= e || (this.video.currentTime = e, this.#M = this.video.currentTime);
   }
   /**
@@ -907,7 +907,7 @@ class I extends EventTarget {
    * a real seek: the worker throws the buffer away and reads the input again
    * from where the viewer asked to be.
    */
-  #j = () => {
+  #q = () => {
     const e = this.#M === this.video.currentTime;
     if (this.#M = null, e || this.#g === "idle" || this.#g === "error" || (this.#s && this.#p(), this.#k === null)) return;
     const t = this.video.currentTime;
@@ -992,7 +992,7 @@ class I extends EventTarget {
       200
     ));
   }
-  #G() {
+  #x() {
     this.#u !== null && (clearInterval(this.#u), this.#u = null);
   }
   /**
@@ -1019,7 +1019,7 @@ class I extends EventTarget {
     this.#f = null, this.stop(), this.#H(this.#D, !1).then(e?.resolve, (i) => e?.reject(i));
   }
   #Y() {
-    this.#G(), this.#E !== null && clearInterval(this.#E), this.#E = null;
+    this.#x(), this.#E !== null && clearInterval(this.#E), this.#E = null;
     const e = this.#s;
     this.#s = !1, e && this.#i?.decodedVideo?.reset(), this.#_(), this.#o?.close(), this.#o = null, this.#h && URL.revokeObjectURL(this.#h), this.#h = null, this.#S?.remove(), this.#S = null, this.#a && (this.video.disableRemotePlayback = !1, this.#a = !1), this.video.removeAttribute("src"), this.video.srcObject = null, this.video.load();
   }
