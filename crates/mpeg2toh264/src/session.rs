@@ -303,9 +303,14 @@ struct Packaged {
 struct UnitLag {
     /// Ticks to add to every composition offset of the unit.
     ticks: u32,
+    /// The lead the unit takes up; see [`Mpeg2VideoTimeline::catch_up_ticks`].
+    catch_up: u32,
     /// How far the display clock runs ahead of the decode clock once the unit
-    /// has gone out, or `None` when nothing of the group has been laid down.
-    after: Option<u64>,
+    /// has gone out.
+    lead: u64,
+    /// Whether anything of the unit's group has been laid down once it has
+    /// gone out.
+    group_laid_down: bool,
 }
 
 /// How the video reaches the MP4.
@@ -405,11 +410,14 @@ pub struct Session {
     /// only being planned, which happens again for as long as the unit waits
     /// for its sound.
     slots_consumed: u32,
-    /// How far the group's display clock runs ahead of the decode clock, once a
-    /// unit of it has been laid down. Pictures the source lost leave their
-    /// display slots empty without moving the decode clock, and the units
-    /// after them have to keep their places all the same.
-    group_lag: Option<u64>,
+    /// How far the display clock runs ahead of the decode clock. Pictures the
+    /// source lost leave their display slots empty without moving the decode
+    /// clock, and the units after them have to keep their places all the
+    /// same. The next unit that opens a group takes it up.
+    lead: u64,
+    /// Whether a unit of the group the last unit belonged to has been laid
+    /// down, which is what the units continuing it are placed after.
+    group_laid_down: bool,
     media_bytes_since_random_access: usize,
     initialized: bool,
     /// What the initialization segment that went out describes, and so what a
@@ -446,11 +454,13 @@ pub struct Session {
     timelines_aligned: bool,
 
     /// Where the next unit's first display slot is expected, in the source's
-    /// own timestamps. A unit that opens later than this has a hole in front of
-    /// it -- pictures the recording lost, or ones that would not decode.
+    /// own timestamps: where the display clock has reached. A unit that opens
+    /// later than this has a hole in front of it -- pictures the recording
+    /// lost, or ones that would not decode.
     ///
-    /// It moves only when a fragment goes out, so a unit that yields none
-    /// leaves its own span to be counted as part of the next one's hole.
+    /// It moves with the display clock. Slots left empty inside a group are
+    /// shown empty and are no hole; a unit that opens a group and shows
+    /// nothing leaves its own span to be counted as part of the next one's.
     expected_pts: Option<i64>,
     /// Source field clock and the end time already committed across GOPs.
     rff: RffState,
@@ -582,7 +592,8 @@ impl Session {
             audio_frames_emitted: 0,
             gops_emitted: 0,
             slots_consumed: 0,
-            group_lag: None,
+            lead: 0,
+            group_laid_down: false,
             media_bytes_since_random_access: 0,
             initialized: false,
             described: None,
@@ -896,27 +907,27 @@ impl Session {
     /// This is set when the unit is planned, since what the fragment spans
     /// decides how much sound goes in it.
     fn place_in_group(&self, gop: &Mpeg2Gop, restarts: bool, plan: &mut UnitPlan) {
-        let lag = Self::unit_lag(self.group_lag, gop, restarts, plan.timed());
-        plan.timeline_mut().lag_ticks = lag.ticks;
+        let lag = self.unit_lag(gop, restarts, plan.timed());
+        let timeline = plan.timeline_mut();
+        timeline.lag_ticks = lag.ticks;
+        timeline.catch_up_ticks = lag.catch_up;
     }
 
     /// Where a unit's display slots sit against the decode clock, given what
-    /// the group has laid down so far.
+    /// has been laid down so far.
     ///
     /// A unit that opens a group, or restarts the decoder, starts its group's
-    /// display clock afresh; so does one that continues a group nothing has
-    /// been laid down for. The rest are timed against the clock the group's
-    /// earlier units have kept: the slots between the end of what they laid
-    /// down and the unit's first picture were empty, and are kept empty here.
+    /// display clock afresh, after taking up the lead the decode clock was
+    /// left behind by. One that continues a group nothing has been laid down
+    /// for starts afresh where the display clock stands. The rest are timed
+    /// against the clock the group's earlier units have kept: the slots between
+    /// the end of what they laid down and the unit's first picture were empty,
+    /// and are kept empty here. A unit with no picture has nothing to take the
+    /// lead up with, and leaves it to the next.
     ///
     /// This is read off the timeline that is packaged, which is not always the
     /// one that was planned: a picture that proves undecodable draws it again.
-    fn unit_lag(
-        group_lag: Option<u64>,
-        gop: &Mpeg2Gop,
-        restarts: bool,
-        timed: &TimedUnit,
-    ) -> UnitLag {
+    fn unit_lag(&self, gop: &Mpeg2Gop, restarts: bool, timed: &TimedUnit) -> UnitLag {
         let timeline = &timed.unit.timeline;
         let first = timeline.first_presentation_time();
         let laid_down: u64 = timeline
@@ -924,16 +935,38 @@ impl Session {
             .iter()
             .map(|&duration| u64::from(duration))
             .sum();
-        match group_lag.filter(|_| Self::follows_on(gop, restarts)) {
-            Some(lag) => UnitLag {
-                ticks: (lag + first) as u32,
-                after: Some((lag + timed.span_ticks).saturating_sub(laid_down)),
-            },
-            None => UnitLag {
+        let follows_on = Self::follows_on(gop, restarts);
+        if follows_on && self.group_laid_down {
+            return UnitLag {
+                ticks: (self.lead + first) as u32,
+                catch_up: 0,
+                lead: (self.lead + timed.span_ticks).saturating_sub(laid_down),
+                group_laid_down: true,
+            };
+        }
+        if timeline.presentation_indices.is_empty() {
+            return UnitLag {
                 ticks: 0,
-                after: (!timeline.presentation_indices.is_empty())
-                    .then(|| timed.span_ticks.saturating_sub(first + laid_down)),
-            },
+                catch_up: 0,
+                lead: self.lead,
+                group_laid_down: false,
+            };
+        }
+        let after = timed.span_ticks.saturating_sub(first + laid_down);
+        if follows_on {
+            UnitLag {
+                ticks: self.lead as u32,
+                catch_up: 0,
+                lead: self.lead + after,
+                group_laid_down: true,
+            }
+        } else {
+            UnitLag {
+                ticks: 0,
+                catch_up: self.lead as u32,
+                lead: after,
+                group_laid_down: true,
+            }
         }
     }
 
@@ -1321,7 +1354,30 @@ impl Session {
         // for a unit in the middle of a group: the next one has nothing else to
         // be timed from.
         self.slots_consumed = plan.timed().slots_after;
-        self.group_lag = lag.after;
+        // Where the unit after this one is expected to open is where the
+        // display clock has reached, in the source's timestamps. A unit that
+        // opens a group with a picture reads it from its own timestamp rather
+        // than accumulated, so that the presentation and the source cannot
+        // creep apart; the hold at its front covered the hole in front of it
+        // and is not part of what it spans. Any other unit has no timestamp of
+        // its own to read it from, and moves it on by what the display clock
+        // moved -- slots the source lost included, which are no hole.
+        let moved = (fragment.duration + lag.lead) as i64 - self.lead as i64;
+        let opens =
+            !Self::follows_on(gop, restarts) && !plan.timeline().presentation_indices.is_empty();
+        match (opens, Self::unit_start_pts(gop, &plan)) {
+            (true, Some(start)) => {
+                let hold = i64::from(plan.timeline().hold_ticks);
+                self.expected_pts = Some(start + moved - hold);
+            }
+            _ => {
+                if let Some(expected) = self.expected_pts.as_mut() {
+                    *expected += moved;
+                }
+            }
+        }
+        self.lead = lag.lead;
+        self.group_laid_down = lag.group_laid_down;
         if gop.continues_group {
             self.rff = plan.timed().after;
         }
@@ -1333,8 +1389,9 @@ impl Session {
             return;
         }
         // Aligning can still move the origin, so read the start after it.
-        let start =
-            (self.video_presentation_start + u64::from(lag.ticks)) as f64 / TIMESCALE as f64;
+        let start = (self.video_presentation_start + u64::from(lag.ticks) + u64::from(lag.catch_up))
+            as f64
+            / TIMESCALE as f64;
         let first_time = plan.timeline().first_presentation_time();
         let mut scans: Vec<VideoScan> = (0..plan.timeline().presentation_indices.len())
             .map(|index| {
@@ -1352,23 +1409,6 @@ impl Session {
 
         self.sequence_number += 1;
         self.video_presentation_start += fragment.duration;
-        // Where the unit after this one is expected to open, read from this
-        // one's own timestamp rather than accumulated, so that the presentation
-        // and the source cannot creep apart. The hold at the front covered the
-        // hole in front of this unit and is not part of what it spans.
-        //
-        // A unit in the middle of a group has no timestamp of its own to read
-        // it from, and its predecessor's expectation moves on by what it laid
-        // down.
-        let hold = plan.timeline().hold_ticks as u64;
-        let span = fragment.duration.saturating_sub(hold) as i64;
-        if Self::follows_on(gop, restarts) {
-            if let Some(expected) = self.expected_pts.as_mut() {
-                *expected += span;
-            }
-        } else if let Some(start) = Self::unit_start_pts(gop, &plan) {
-            self.expected_pts = Some(start + span);
-        }
         self.rff = plan.timed().after;
         self.audio_frames_emitted += audio_frames.len() as u64;
         if !gop.continues_group {
@@ -1454,6 +1494,7 @@ impl Session {
         audio: Option<&AacConfig>,
         audio_track: Option<&Fmp4AudioSamples>,
     ) -> Packaged {
+        let lag = self.unit_lag(gop, restarts, plan.timed());
         match (&mut self.video, plan) {
             (
                 VideoPipeline::Passthrough {
@@ -1464,7 +1505,6 @@ impl Session {
                 UnitPlan::Passthrough(timed),
             ) => {
                 let unit = &timed.unit;
-                let lag = Self::unit_lag(self.group_lag, gop, restarts, timed);
                 // A unit yields samples only once a picture a decoder can
                 // begin at has arrived, which is what this was waiting for.
                 *awaiting_intra &= unit.samples.is_empty();
@@ -1497,7 +1537,6 @@ impl Session {
             }
             (VideoPipeline::Decode { awaiting_intra }, UnitPlan::Decode(timed)) => {
                 let unit = &timed.unit;
-                let lag = Self::unit_lag(self.group_lag, gop, restarts, timed);
                 *awaiting_intra &= unit.samples.is_empty();
                 let (fragment, pictures) = mpeg2_decode_unit_to_fmp4(
                     unit,

@@ -187,6 +187,17 @@ pub struct Mpeg2VideoTimeline {
     /// be told how far behind the display clock the decode clock has fallen,
     /// and this is that. Set by the caller, like `hold_ticks`; zero otherwise.
     pub lag_ticks: u32,
+    /// How far the display clock runs ahead of the decode clock where this
+    /// unit opens a group, for the unit to take up.
+    ///
+    /// `lag_ticks` carries that lead through a group, but a unit that opens
+    /// one is placed by its own timestamp, which the display clock already
+    /// reached: shown from the decode clock, its first picture would land on
+    /// pictures already shown. Its first sample is decoded this much longer
+    /// and shown this much later instead, which brings the two clocks together
+    /// again without moving a picture. Set by the caller, like `hold_ticks`;
+    /// zero otherwise.
+    pub catch_up_ticks: u32,
 }
 
 impl Mpeg2VideoTimeline {
@@ -565,6 +576,7 @@ pub(crate) fn timed_mpeg2_unit(
             sample_aspect_ratio: sequence_sample_aspect_ratio(&first.sequence),
             hold_ticks: 0,
             lag_ticks: 0,
+            catch_up_ticks: 0,
         },
         samples,
         sequence_header_len: sequence_header_len(data),
@@ -711,7 +723,7 @@ pub fn mpeg2_sample_timing(timeline: &Mpeg2VideoTimeline, lead_in: UnitLeadIn) -
     // unpaired RFF picture can occupy three fields at the end of a film run.
     let measured = -offsets.iter().copied().min().unwrap_or(0).min(0);
     let reorder_delay = measured.max(duration);
-    let compositions: Vec<u32> = offsets
+    let mut compositions: Vec<u32> = offsets
         .iter()
         .map(|offset| (offset + reorder_delay) as u32 + timeline.lag_ticks)
         .collect();
@@ -728,6 +740,10 @@ pub fn mpeg2_sample_timing(timeline: &Mpeg2VideoTimeline, lead_in: UnitLeadIn) -
                 *first += first_presentation_time as u32 + timeline.hold_ticks;
             }
         }
+    }
+    if let (Some(duration), Some(composition)) = (durations.first_mut(), compositions.first_mut()) {
+        *duration += timeline.catch_up_ticks;
+        *composition += timeline.catch_up_ticks;
     }
     SampleTiming {
         durations,
@@ -1409,14 +1425,20 @@ pub fn mpeg2_decode_unit_to_fmp4(
         } else {
             1
         };
-        let duration: u32 = timing.durations[at..at + samples].iter().sum();
+        let decoded: u32 = timing.durations[at..at + samples].iter().sum();
+        // The lead the first sample takes up was shown by the units before.
+        let caught_up = if at == 0 {
+            unit.timeline.catch_up_ticks
+        } else {
+            0
+        };
         pictures.push(PicturePresentation {
             picture: sample.picture,
             field_pair: sample.field_end.is_some(),
             time: decode_time + u64::from(timing.compositions[at]),
-            duration,
+            duration: decoded - caught_up,
         });
-        decode_time += u64::from(duration);
+        decode_time += u64::from(decoded);
         at += samples;
     }
     let sound = audio_track.filter(|track| !track.samples.is_empty());
@@ -1532,6 +1554,7 @@ mod tests {
             sample_aspect_ratio: None,
             hold_ticks: 0,
             lag_ticks: 0,
+            catch_up_ticks: 0,
         }
     }
 

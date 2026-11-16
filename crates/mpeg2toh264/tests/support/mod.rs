@@ -832,17 +832,57 @@ pub fn assert_decode_matches_passthrough(label: &str, decoded: &[Fragment], muxe
                 .map(|picture| (picture.time, picture.duration))
         })
         .collect();
+    // A sample is shown for its duration, except the first of a fragment that
+    // opens a group after pictures were lost: it takes up the lead the decode
+    // clock was left behind by, and is decoded for longer than it is shown,
+    // until the next sample in presentation order.
+    let opening: Vec<bool> = muxed
+        .iter()
+        .filter_map(|fragment| match fragment {
+            Fragment::Media { data, .. } => Some(fragment_samples(data)),
+            _ => None,
+        })
+        .flatten()
+        .filter(|(track, _)| *track == 1)
+        .flat_map(|(_, samples)| (0..samples.len()).map(|index| index == 0))
+        .collect();
+    assert_eq!(opening.len(), muxed_samples.video.len());
+    let mut shown: Vec<i64> = muxed_samples
+        .video
+        .iter()
+        .map(|sample| sample.composition_time)
+        .collect();
+    shown.sort_unstable();
     let samples: Vec<(f64, f64)> = muxed_samples
         .video
         .iter()
-        .map(|sample| {
+        .zip(&opening)
+        .map(|(sample, &opening)| {
+            let end = sample.composition_time + i64::from(sample.duration);
+            let next = shown.partition_point(|&time| time <= sample.composition_time);
+            let until = match shown.get(next) {
+                Some(&next) if opening => next.min(end),
+                _ => end,
+            };
             (
                 sample.composition_time as f64 / 90_000.0,
-                f64::from(sample.duration) / 90_000.0,
+                (until - sample.composition_time) as f64 / 90_000.0,
             )
         })
         .collect();
     assert!(!pictures.is_empty(), "{label}: the stream made pictures");
+    // A player shows the pictures one after another, so none may start before
+    // the one ahead of it has ended.
+    let mut shown_order = pictures.clone();
+    shown_order.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for pair in shown_order.windows(2) {
+        assert!(
+            pair[1].0 >= pair[0].0 + pair[0].1 - 1e-9,
+            "{label}: a picture at {} s starts before the one at {} s has ended",
+            pair[1].0,
+            pair[0].0
+        );
+    }
     assert_eq!(pictures, samples, "{label}: picture times and durations");
 }
 
