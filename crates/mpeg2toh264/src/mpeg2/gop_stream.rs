@@ -4,8 +4,79 @@
 use std::collections::VecDeque;
 use std::ops::ControlFlow;
 
-use crate::mpeg2::constants::{extension, start_code};
+use crate::mpeg2::constants::{extension, start_code, FRAME_RATE};
 use crate::mpeg2::headers::stream_sequence_description;
+
+/// The `sequence_error_code` (ITU-T H.262 6.2.1), which H.262 sets aside for
+/// whoever reads the stream in to mark where data was lost.
+const SEQUENCE_ERROR_CODE: [u8; 4] = [0, 0, 1, start_code::SEQUENCE_ERROR];
+
+/// What the splitter does with a picture that lost data on the way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DamagedPictures {
+    /// Hand on only pictures that arrived whole: after a loss the pictures
+    /// completed before it go out, and nothing more until the next group.
+    /// For a decoder whose handling of damage is not known.
+    Drop,
+    /// Hand on what arrived, with a `sequence_error_code` where the loss fell,
+    /// and carry on with the group: a decoder conceals what is missing, and the
+    /// pictures after the damaged one predict from its concealed self rather
+    /// than not being shown at all.
+    #[default]
+    Conceal,
+}
+
+/// A piece of elementary stream, with what the transport said about it.
+#[derive(Clone, Copy, Debug)]
+pub struct EsChunk<'a> {
+    pub data: &'a [u8],
+    /// `data` opens the payload of a PES packet, whose header gave `pts` and
+    /// `dts`.
+    pub pes_start: bool,
+    pub pts: Option<u64>,
+    pub dts: Option<u64>,
+    /// Recent PAT/PMT start from which a new demuxer can read this PES again.
+    pub restart_offset: Option<u64>,
+    /// Bytes of the stream right before `data` were lost.
+    pub gap_before: bool,
+}
+
+impl<'a> EsChunk<'a> {
+    /// A piece of elementary stream with nothing known of it but, where given,
+    /// the presentation time covering it: an elementary-stream file read in
+    /// pieces, which has no PES packets and no losses.
+    pub fn new(data: &'a [u8], pts: Option<u64>) -> Self {
+        Self {
+            data,
+            pes_start: false,
+            pts,
+            dts: None,
+            restart_offset: None,
+            gap_before: false,
+        }
+    }
+}
+
+/// Bytes that arrived after a loss and before the next PES packet began, kept
+/// apart until that packet says whose they are.
+///
+/// A broadcast puts one coded frame in each PES packet (ARIB STD-B32 Part 1
+/// 5.1.1), so bytes that arrive between a loss and the next packet's start are
+/// the rest of the picture the loss cut only if no picture began inside what
+/// was lost. The next packet's decode time says whether one did: it is a frame
+/// period after the cut picture's, or one and a half where a repeated field
+/// stretches it, unless whole pictures went missing. And the slices of the
+/// rest of a picture carry on down its rows, where a second field whose header
+/// was lost starts again at the top.
+struct Suspect {
+    /// The decode time of the PES packet the loss cut, where it had one.
+    decode_time: Option<u64>,
+    /// The macroblock row of the last slice that began before the loss.
+    last_row: u32,
+    /// The bytes since, with a `sequence_error_code` wherever a further loss
+    /// fell among them.
+    tail: Vec<u8>,
+}
 
 /// Walk every `00 00 01 <code>` start code in `data` in order, handing each
 /// offset and its code byte to `visit`, and stop as soon as `visit` breaks.
@@ -44,6 +115,31 @@ fn scan_start_codes(data: &[u8], mut visit: impl FnMut(usize, u8) -> ControlFlow
             i += 1;
         }
     }
+}
+
+/// Whether the slices at the front of `tail`, up to the first header of a
+/// picture or of something larger, carry on from a picture whose last slice
+/// began at macroblock row `last_row`: a row may hold several slices, so a row
+/// is never gone back to, though the same one may go on.
+fn rows_carry_on(tail: &[u8], mut last_row: u32) -> bool {
+    let mut carries_on = true;
+    scan_start_codes(tail, |_, code| {
+        if (start_code::SLICE_MIN..=start_code::SLICE_MAX).contains(&code) {
+            let row = code as u32;
+            carries_on = row >= last_row;
+            last_row = row;
+            if carries_on {
+                ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break(())
+            }
+        } else if code == start_code::SEQUENCE_ERROR {
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break(())
+        }
+    });
+    carries_on
 }
 
 /// One GOP unit, and when its first coded picture is meant to be shown.
@@ -140,6 +236,12 @@ pub struct Mpeg2GopStream {
     /// The stream offsets the stream broke at, in order, that no unit has been
     /// told of yet: a unit that begins at or after one has the break behind it.
     breaks: Vec<usize>,
+    /// What to do with a picture that lost data.
+    damaged: DamagedPictures,
+    /// The decode time of the PES packet being read.
+    pes_decode_time: Option<u64>,
+    /// What arrived after a loss, until the next PES packet settles it.
+    suspect: Option<Suspect>,
     /// Start-code offsets in `buffer`, discovered once as bytes arrive.
     sequences: VecDeque<usize>,
     gops: VecDeque<usize>,
@@ -164,17 +266,33 @@ impl Mpeg2GopStream {
         }
     }
 
-    pub fn push(&mut self, chunk: &[u8], pts: Option<u64>) -> Vec<Mpeg2Gop> {
-        self.push_marked(chunk, pts, None)
+    /// Treat pictures that lost data as `damaged` says, rather than as
+    /// [`DamagedPictures::Conceal`].
+    pub fn with_damaged_pictures(mut self, damaged: DamagedPictures) -> Self {
+        self.damaged = damaged;
+        self
     }
 
-    pub fn push_with_restart(
-        &mut self,
-        chunk: &[u8],
-        pts: Option<u64>,
-        restart_offset: Option<u64>,
-    ) -> Vec<Mpeg2Gop> {
-        self.push_marked(chunk, pts, restart_offset)
+    pub fn push(&mut self, chunk: EsChunk<'_>) -> Vec<Mpeg2Gop> {
+        let mut output = Vec::new();
+        if chunk.gap_before {
+            match self.damaged {
+                DamagedPictures::Drop => output.extend(self.give_up_group(false)),
+                DamagedPictures::Conceal => self.mark_loss(),
+            }
+        }
+        if chunk.pes_start {
+            let decode_time = chunk.dts.or(chunk.pts);
+            if let Some(suspect) = self.suspect.take() {
+                output.extend(self.settle(suspect, decode_time));
+            }
+            self.pes_decode_time = decode_time;
+        }
+        match &mut self.suspect {
+            Some(suspect) => suspect.tail.extend_from_slice(chunk.data),
+            None => output.extend(self.push_marked(chunk.data, chunk.pts, chunk.restart_offset)),
+        }
+        output
     }
 
     fn push_marked(
@@ -196,21 +314,89 @@ impl Mpeg2GopStream {
     }
 
     pub fn finish(&mut self) -> Vec<Mpeg2Gop> {
+        // Nothing comes after it to say whose it is.
+        self.suspect = None;
         self.extract(true)
     }
 
-    /// Return complete pictures before a known byte gap, then forget the damaged tail.
+    /// Mark a loss at the end of what has been read: the slice it cut ends at a
+    /// `sequence_error_code`, and what follows waits to be settled.
+    fn mark_loss(&mut self) {
+        if let Some(suspect) = &mut self.suspect {
+            suspect.tail.extend_from_slice(&SEQUENCE_ERROR_CODE);
+            return;
+        }
+        // Waiting for a group already, everything until one is dropped anyway.
+        if self.awaiting_group {
+            return;
+        }
+        let last_row = self.last_slice_row();
+        self.buffer.extend_from_slice(&SEQUENCE_ERROR_CODE);
+        self.scan_new_bytes();
+        self.suspect = Some(Suspect {
+            decode_time: self.pes_decode_time,
+            last_row,
+            tail: Vec::new(),
+        });
+    }
+
+    /// The macroblock row of the last slice of the picture being read, or zero
+    /// when none of its slices has begun.
+    fn last_slice_row(&self) -> u32 {
+        let from = self.pictures.back().copied().unwrap_or(0);
+        let mut row = 0;
+        scan_start_codes(&self.buffer[from..], |_, code| {
+            if (start_code::SLICE_MIN..=start_code::SLICE_MAX).contains(&code) {
+                row = code as u32;
+            }
+            ControlFlow::Continue(())
+        });
+        row
+    }
+
+    /// Settle what arrived after a loss now that the next PES packet, decoded
+    /// at `next`, has begun: the rest of the cut picture, or bytes of pictures
+    /// whose start was lost, which nothing can decode and which may have
+    /// carried the start of a group.
+    fn settle(&mut self, suspect: Suspect, next: Option<u64>) -> Vec<Mpeg2Gop> {
+        let next_picture = match (suspect.decode_time, next, self.frame_period()) {
+            (Some(cut), Some(next), Some(period)) => {
+                let step = (next as i64 - cut as i64).rem_euclid(1 << 33);
+                step > 0 && (step as f64) < 2.0 * period
+            }
+            _ => false,
+        };
+        if next_picture && rows_carry_on(&suspect.tail, suspect.last_row) {
+            self.push_marked(&suspect.tail, None, None)
+        } else {
+            self.give_up_group(true)
+        }
+    }
+
+    /// The length of a frame in 90 kHz ticks, as the sequence header in force
+    /// gives it.
+    fn frame_period(&self) -> Option<f64> {
+        let header = match self.sequences.back() {
+            Some(&at) => &self.buffer[at..],
+            None => &self.sequence_prefix[..],
+        };
+        let &(numerator, denominator) = FRAME_RATE.get(*header.get(7)? as usize & 15)?;
+        (numerator != 0).then(|| 90_000.0 * denominator as f64 / numerator as f64)
+    }
+
+    /// Hand on what the group under way holds up to a loss, then drop what
+    /// follows until the next group.
     ///
-    /// The caller must invoke this before pushing any bytes received after the
-    /// gap. The last picture start in the buffer then has no following start
-    /// code to prove that picture ended before the gap. Every earlier picture
-    /// does, so the prefix ending at that last start is byte-complete input for
-    /// the decoder. Reference resolution, leading B pictures, and field-pair
-    /// validity remain the decoder's responsibility, as for ordinary units.
+    /// With `through_the_cut` the picture the loss cut goes too, ended by the
+    /// `sequence_error_code` that marks the loss. Without it the unit stops at
+    /// that picture's start: every earlier picture has a start code after it to
+    /// prove it ended before the loss, so what goes out is byte-complete.
+    /// Reference resolution, leading B pictures, and field-pair validity remain
+    /// the decoder's responsibility, as for ordinary units.
     ///
-    /// What follows the gap is dropped until the next group header, so no
-    /// anchor unit can start in the middle of the damaged group.
-    pub(crate) fn take_complete_prefix_before_gap(&mut self) -> Vec<Mpeg2Gop> {
+    /// What follows is dropped until the next group header, so no anchor unit
+    /// can start in the middle of the damaged group.
+    fn give_up_group(&mut self, through_the_cut: bool) -> Vec<Mpeg2Gop> {
         // A buffer that continues a group has no header of the group's own in
         // it: the next group's header would already have cut it.
         let first_gop = if self.continuing {
@@ -219,7 +405,11 @@ impl Mpeg2GopStream {
             self.gops.front().copied()
         };
         let unit = first_gop.and_then(|first_gop| {
-            let boundary = self.pictures.back().copied()?;
+            let boundary = if through_the_cut {
+                self.buffer.len()
+            } else {
+                self.pictures.back().copied()?
+            };
             if !self
                 .pictures
                 .iter()
@@ -435,7 +625,11 @@ impl Mpeg2GopStream {
         let mut block = None;
         let mut starts_something = false;
         scan_start_codes(&self.buffer[previous..picture], |at, code| {
-            if (start_code::SLICE_MIN..=start_code::SLICE_MAX).contains(&code) {
+            // A sequence_error_code ends the slice a loss cut, and stays with
+            // the picture that slice is in.
+            if (start_code::SLICE_MIN..=start_code::SLICE_MAX).contains(&code)
+                || code == start_code::SEQUENCE_ERROR
+            {
                 after_slice = true;
                 block = None;
                 starts_something = false;
@@ -657,13 +851,13 @@ mod tests {
         ))
         .expect("fixture is readable");
         let mut splitter = Mpeg2GopStream::new();
-        let mut units = splitter.push(&one, None);
+        let mut units = splitter.push(EsChunk::new(&one, None));
         splitter.note_break();
-        units.extend(splitter.push(&one, None));
+        units.extend(splitter.push(EsChunk::new(&one, None)));
         // The group that begins at the first break is still in the buffer
         // when the second one is noted.
         splitter.note_break();
-        units.extend(splitter.push(&one, None));
+        units.extend(splitter.push(EsChunk::new(&one, None)));
         units.extend(splitter.finish());
         assert_eq!(
             units

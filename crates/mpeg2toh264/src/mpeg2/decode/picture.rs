@@ -259,7 +259,14 @@ impl Work {
         // slice_vertical_position is 1-based and names the macroblock row.
         let row = slice.vertical_position as usize - 1;
         let mut address = row as isize * params.mb_width as isize - 1;
+        // Where a slice cut short by a loss stops being its own: whatever is
+        // read past there was read out of the start code marking the loss.
+        let cut = slice.data_end_bit.filter(|_| slice.truncated);
+        let past_cut = |r: &BitReader<'_>| cut.is_some_and(|cut| r.bit_pos() > cut);
         while let Some(increment) = address_increment(r, syntax)? {
+            if past_cut(r) {
+                return Ok(());
+            }
             // Everything between the previous macroblock and this one is skipped.
             for _ in 1..increment {
                 address += 1;
@@ -269,13 +276,38 @@ impl Work {
                 )?;
             }
             address += 1;
+            let was_done = self.done.get(address as usize).copied().unwrap_or(true);
+            let counted = *concealed;
             let mb = macroblock_header(r, picture, syntax, &mut state, address as usize, frame)?;
             self.place(
                 r, syntax, &mut state, params, references, target, row, &mb, concealed,
             )?;
+            if past_cut(r) {
+                // The macroblock the loss came in the middle of: its blocks
+                // decoded, but from the zeros of the start code as much as from
+                // its own bits. It is concealed with the rest of the slice.
+                if !was_done {
+                    self.forget(address as usize);
+                    *concealed = counted;
+                }
+                return Ok(());
+            }
             state.finish(&mb);
         }
         Ok(())
+    }
+
+    /// Undo whatever a slice did with the macroblock at `address`, so that the
+    /// sweep at the end of the picture conceals it.
+    fn forget(&mut self, address: usize) {
+        self.done[address] = false;
+        if let Some(cell) = self
+            .deferred
+            .iter_mut()
+            .find(|cell| cell.mb.address == address)
+        {
+            cell.complete = false;
+        }
     }
 
     /// Read the blocks of `mb`, whose header has just been read, and see to

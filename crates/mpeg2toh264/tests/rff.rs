@@ -4,7 +4,10 @@ mod support;
 
 use std::collections::HashMap;
 
-use mpeg2toh264::mpeg2::{gop_stream::Mpeg2GopStream, headers::parse_elementary_stream};
+use mpeg2toh264::mpeg2::{
+    gop_stream::{EsChunk, Mpeg2GopStream},
+    headers::parse_elementary_stream,
+};
 use mpeg2toh264::{mpeg2_video_timeline, Fragment, Session, SessionOptions};
 use support::{
     assert_decode_matches_passthrough, decoding, init_segments, mux_with_sound, passthrough,
@@ -293,7 +296,7 @@ fn missing_gops_cannot_change_an_already_emitted_duration() {
 #[test]
 fn open_gop_pts_stay_on_the_source_clock_and_seeks_land_at_the_same_time() {
     let mut splitter = Mpeg2GopStream::new();
-    let mut groups = splitter.push(&read_fixture("open_gop_leading_bb.m2v"), None);
+    let mut groups = splitter.push(EsChunk::new(&read_fixture("open_gop_leading_bb.m2v"), None));
     groups.extend(splitter.finish());
     let mut index = 0usize;
     let mut pieces = Vec::new();
@@ -328,7 +331,7 @@ fn open_gop_pts_stay_on_the_source_clock_and_seeks_land_at_the_same_time() {
 #[test]
 fn consecutive_repeats_keep_decode_time_continuous_through_the_last_open_gop() {
     let mut splitter = Mpeg2GopStream::new();
-    let mut groups = splitter.push(&read_fixture("open_gop_leading_bb.m2v"), None);
+    let mut groups = splitter.push(EsChunk::new(&read_fixture("open_gop_leading_bb.m2v"), None));
     groups.extend(splitter.finish());
     let mut continuity = HashMap::new();
     let mut source = Vec::new();
@@ -396,7 +399,8 @@ fn video_and_rff_emit_without_any_following_picture() {
         for phase in [None, Some(0), Some(1)] {
             let (first, next, count) = if open {
                 let mut splitter = Mpeg2GopStream::new();
-                let groups = splitter.push(&read_fixture("open_gop_leading_bb.m2v"), None);
+                let groups =
+                    splitter.push(EsChunk::new(&read_fixture("open_gop_leading_bb.m2v"), None));
                 (
                     set_film(groups[0].data.clone(), phase),
                     set_film(groups[1].data.clone(), phase.map(|p| p + 13)),

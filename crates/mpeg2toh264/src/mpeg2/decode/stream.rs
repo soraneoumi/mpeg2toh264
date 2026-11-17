@@ -4,7 +4,7 @@ use crate::container::fmp4::complementary_field;
 use crate::error::Error;
 use crate::mpeg2::constants::{PictureStructure, PictureType};
 use crate::mpeg2::decode::{DecodedFrame, Decoder, DisplayOrder};
-use crate::mpeg2::gop_stream::Mpeg2GopStream;
+use crate::mpeg2::gop_stream::{EsChunk, Mpeg2GopStream};
 use crate::mpeg2::headers::parse_elementary_stream;
 
 /// Counts kept by a [`StreamDecoder`].
@@ -75,7 +75,7 @@ impl StreamDecoder {
 
     /// Feed stream bytes; `output` receives every frame that becomes due.
     pub fn push(&mut self, data: &[u8], mut output: impl FnMut(&DecodedFrame)) {
-        for group in self.splitter.push(data, None) {
+        for group in self.splitter.push(EsChunk::new(data, None)) {
             self.decode_group(&group.data, &mut output);
         }
     }

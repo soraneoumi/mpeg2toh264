@@ -360,27 +360,225 @@ fn mux_payloads(
     out
 }
 
-/// Synthesise one AAC-LC ADTS frame with a payload of `payload_len` bytes.
+/// Synthesise one AAC-LC ADTS frame whose raw_data_block is `payload_len`
+/// bytes long.
 ///
-/// The payload is not valid AAC, which does not matter: nothing here decodes
-/// it, and the point of the session's audio path is that it never looks
-/// inside.
+/// The block is one a decoder reads, as the stream reader hands on nothing
+/// else: the channel elements `channel_count` names (ISO/IEC 14496-3 Table
+/// 1.19; zero gets one single channel element), each an empty channel stream,
+/// then fill elements whose bytes count up from zero to make up the length,
+/// then `ID_END`. Frames of different lengths therefore differ in content too.
 pub fn adts_frame(sampling_frequency_index: u8, channel_count: u8, payload_len: usize) -> Vec<u8> {
-    let frame_length = 7 + payload_len;
-    let mut frame = vec![
+    adts_frame_filled(
+        sampling_frequency_index,
+        channel_count,
+        payload_len,
+        false,
+        |at| (at % 251) as u8,
+    )
+}
+
+/// [`adts_frame`] with the `adts_error_check` CRC a broadcast frame carries.
+pub fn adts_frame_protected(
+    sampling_frequency_index: u8,
+    channel_count: u8,
+    payload_len: usize,
+) -> Vec<u8> {
+    adts_frame_filled(
+        sampling_frequency_index,
+        channel_count,
+        payload_len,
+        true,
+        |at| (at % 251) as u8,
+    )
+}
+
+/// [`adts_frame`] with `fill` giving each byte of the fill elements, by its
+/// position among them, and with a CRC when `protected`.
+pub fn adts_frame_filled(
+    sampling_frequency_index: u8,
+    channel_count: u8,
+    payload_len: usize,
+    protected: bool,
+    fill: impl Fn(usize) -> u8,
+) -> Vec<u8> {
+    let block = SilentBlock::new(channel_count, payload_len, fill);
+    let mut frame = adts_header(
+        sampling_frequency_index,
+        channel_count,
+        payload_len,
+        protected,
+    );
+    frame.extend_from_slice(&block.bytes);
+    if protected {
+        let crc = block.crc(&frame);
+        frame[7..9].copy_from_slice(&crc.to_be_bytes());
+    }
+    frame
+}
+
+/// An ADTS header for a frame of `payload_len` bytes of raw_data_block, with
+/// room for a CRC of zero when `protected`.
+pub fn adts_header(
+    sampling_frequency_index: u8,
+    channel_count: u8,
+    payload_len: usize,
+    protected: bool,
+) -> Vec<u8> {
+    let header_length = if protected { 9 } else { 7 };
+    let frame_length = header_length + payload_len;
+    let mut header = vec![
         0xff,
-        0xf1, // MPEG-4, layer 0, protection absent
+        if protected { 0xf0 } else { 0xf1 }, // MPEG-4, layer 0, protection_absent
         (1 << 6) | (sampling_frequency_index << 2) | ((channel_count >> 2) & 1),
         ((channel_count & 3) << 6) | ((frame_length >> 11) & 3) as u8,
         ((frame_length >> 3) & 0xff) as u8,
         (((frame_length & 7) << 5) | 0x1f) as u8,
         0xfc,
     ];
-    frame.extend((0..payload_len).map(|i| (i % 251) as u8));
-    if channel_count == 2 && payload_len != 0 {
-        frame[7] |= 0x20; // Treat synthetic payloads as an opaque CPE.
+    header.resize(header_length, 0);
+    header
+}
+
+/// The raw_data_block [`adts_frame`] carries, and the spans of it the ADTS CRC
+/// protects: `(from, limit, count)` -- `count` bits from `from`, those at or
+/// past `limit` counted as zeros.
+struct SilentBlock {
+    bytes: Vec<u8>,
+    protected: Vec<(usize, usize, usize)>,
+}
+
+impl SilentBlock {
+    fn new(channel_count: u8, payload_len: usize, fill: impl Fn(usize) -> u8) -> Self {
+        const SCE: u8 = 0;
+        const CPE: u8 = 1;
+        const LFE: u8 = 3;
+        let layout: &[(u8, u8)] = match channel_count {
+            0 | 1 => &[(SCE, 0)],
+            2 => &[(CPE, 0)],
+            3 => &[(SCE, 0), (CPE, 0)],
+            4 => &[(SCE, 0), (CPE, 0), (SCE, 1)],
+            5 => &[(SCE, 0), (CPE, 0), (CPE, 1)],
+            6 => &[(SCE, 0), (CPE, 0), (CPE, 1), (LFE, 0)],
+            _ => &[(SCE, 0), (CPE, 0), (CPE, 1), (CPE, 2), (LFE, 0)],
+        };
+        // global_gain, an ics_info of a long window with max_sfb 0, and the
+        // three absent-tool flags: no spectral data at all.
+        const EMPTY_ICS: usize = 22;
+        let mut bits = BitWriter::default();
+        let mut protected = Vec::new();
+        for &(id, tag) in layout {
+            let start = bits.len;
+            bits.put(3, id as u32);
+            bits.put(4, tag as u32);
+            if id == CPE {
+                bits.put(1, 0); // common_window
+                bits.put(EMPTY_ICS, 0);
+                let second = bits.len;
+                bits.put(EMPTY_ICS, 0);
+                protected.push((start + 3, bits.len, 192));
+                protected.push((second, bits.len, 128));
+            } else {
+                bits.put(EMPTY_ICS, 0);
+                protected.push((start + 3, bits.len, 192));
+            }
+        }
+        // Fill elements up to the length asked for, leaving ID_END and fewer
+        // than eight bits of alignment. One element carries at most 269 bytes.
+        // Where there is room, empty ones first put the bytes of the next on
+        // byte boundaries, so that they can be found in the frame as bytes: a
+        // fill element's header is seven bits, or fifteen with an escape.
+        let lead = (bits.len + 7) % 8;
+        if payload_len * 8 >= bits.len + 7 * lead + 7 + 8 + 3 {
+            for _ in 0..lead {
+                bits.put(3, 6); // ID_FIL
+                bits.put(4, 0);
+            }
+        }
+        let mut filled = 0;
+        loop {
+            let room = (payload_len * 8)
+                .checked_sub(bits.len + 3)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{payload_len} bytes cannot hold the channel elements of {channel_count}"
+                    )
+                });
+            if room < 7 {
+                break;
+            }
+            let count = if room < 7 + 8 * 15 {
+                (room - 7) / 8
+            } else {
+                ((room - 15) / 8).min(269)
+            };
+            bits.put(3, 6); // ID_FIL
+            if count < 15 {
+                bits.put(4, count as u32);
+            } else {
+                bits.put(4, 15);
+                bits.put(8, (count - 14) as u32);
+            }
+            for _ in 0..count {
+                bits.put(8, fill(filled) as u32);
+                filled += 1;
+            }
+        }
+        bits.put(3, 7); // ID_END
+        assert_eq!(
+            bits.len.div_ceil(8),
+            payload_len,
+            "{payload_len} bytes cannot be filled exactly"
+        );
+        Self {
+            bytes: bits.bytes,
+            protected,
+        }
     }
-    frame
+
+    /// The CRC of a frame carrying this block, written independently of the
+    /// reader's: CRC-16 0x8005 from all ones over the header's first 56 bits
+    /// and then the protected spans.
+    fn crc(&self, frame: &[u8]) -> u16 {
+        let bit = |data: &[u8], at: usize| (data[at / 8] >> (7 - at % 8)) & 1;
+        let mut crc = 0xffffu16;
+        let mut feed = |input: u8| {
+            let top = (crc >> 15) as u8 ^ input;
+            crc <<= 1;
+            if top != 0 {
+                crc ^= 0x8005;
+            }
+        };
+        for at in 0..56 {
+            feed(bit(frame, at));
+        }
+        for &(from, limit, count) in &self.protected {
+            for at in from..from + count {
+                feed(if at < limit { bit(&self.bytes, at) } else { 0 });
+            }
+        }
+        crc
+    }
+}
+
+#[derive(Default)]
+struct BitWriter {
+    bytes: Vec<u8>,
+    len: usize,
+}
+
+impl BitWriter {
+    fn put(&mut self, count: usize, value: u32) {
+        for shift in (0..count).rev() {
+            if self.len % 8 == 0 {
+                self.bytes.push(0);
+            }
+            if (value >> shift) & 1 != 0 {
+                *self.bytes.last_mut().expect("a byte was pushed") |= 0x80 >> (self.len % 8);
+            }
+            self.len += 1;
+        }
+    }
 }
 
 pub fn adts_frame_with_payload(
@@ -388,8 +586,13 @@ pub fn adts_frame_with_payload(
     channel_count: u8,
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut frame = adts_frame(sampling_frequency_index, channel_count, payload.len());
-    frame[7..].copy_from_slice(payload);
+    let mut frame = adts_header(
+        sampling_frequency_index,
+        channel_count,
+        payload.len(),
+        false,
+    );
+    frame.extend_from_slice(payload);
     frame
 }
 

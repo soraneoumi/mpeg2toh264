@@ -5,8 +5,17 @@
 //! of the primary channel, then the ADTS header is removed for fragmented MP4.
 //! The sound can be raised on the way through, which is a change to each
 //! channel's `global_gain` and to nothing else.
+//!
+//! A frame goes out only when a decoder would take it: its block walks to
+//! `ID_END` in the last byte of the frame, its CRC matches where it carries
+//! one, and its channel elements are the ones its configuration names.
+//! Anything else is an access unit lost to damage, not an error -- a broadcast
+//! received at the edge of reception loses whole transport packets, and the
+//! bytes after a loss land in the middle of whatever frame was being read.
 
-use super::aac::{cpe_end, sce_end, single_channel_end, GlobalGains};
+use super::aac::{
+    walk_block, Block, Element, PceInfo, ID_CPE, ID_DSE, ID_END, ID_LFE, ID_PCE, ID_SCE,
+};
 use crate::error::{bail, Result};
 
 /// `sampling_frequency_index` to sample rate (ISO/IEC 14496-3 Table 1.16).
@@ -35,6 +44,52 @@ pub struct AacFrame {
     pub config: AacConfig,
 }
 
+/// One access unit of the stream, in the order they came.
+#[derive(Clone, Debug)]
+pub enum AacUnit {
+    Frame(AacFrame),
+    /// An access unit lost to damage. It took up one frame's time all the
+    /// same, in the configuration the stream was in, which is what whatever
+    /// fills its place has to be coded in.
+    Lost(AacConfig),
+}
+
+/// What reading a piece of an ADTS stream gave.
+#[derive(Clone, Debug, Default)]
+pub struct AdtsOutput {
+    pub units: Vec<AacUnit>,
+    /// Where, counting on from `units[0]`, the first unit whose ADTS header
+    /// lies in the piece just read is. A PES timestamp refers to the first
+    /// access unit that begins in the packet (ISO/IEC 13818-1 2.4.3.7), and
+    /// the units before this one began in an earlier packet. It can be
+    /// `units.len()` or more: the frame began in this piece but ends in a
+    /// later one, and is the first unit of a later output.
+    ///
+    /// The first header is the one reached in step with the frames before,
+    /// or, where the reader was already searching for framing when the piece
+    /// began -- at the start of a stream, after a reported gap or a new time
+    /// base -- the first one the search finds. It is `None` where no header
+    /// begins in the piece; where the one that does is of a frame lost before
+    /// the stream said what it is, which no unit stands for; where the reader
+    /// is still searching, so that a syncword in the piece is not known to be
+    /// a header yet; and where the header due in step inside the piece was
+    /// not there, since the frame the piece's timestamp names is then lost and
+    /// the one a search finds after it is a later frame.
+    pub commencing: Option<usize>,
+    /// Ascending indices into `units` at which the reader took up framing
+    /// anew, so that the unit there continues nothing before it: where its
+    /// place is depends on a timestamp, not on the frames before it.
+    ///
+    /// Framing is taken up anew at the first frame of a stream, after a
+    /// reported gap or a new time base, and where the frame before ended
+    /// somewhere no header was and a header had to be searched for. The
+    /// access unit a reported gap cut came before the gap, so it is not one;
+    /// nor is a damaged frame whose header was where the one before ended,
+    /// which keeps its place. A restart found while no unit follows it in the
+    /// piece is reported at the first unit of a later one.
+    pub restarts: Vec<usize>,
+}
+
 /// AAC access units needed through an absolute 90 kHz video decode time. The
 /// result can be negative, when the audio track starts later than the video
 /// time being asked about.
@@ -49,15 +104,23 @@ pub struct AdtsStream {
     pending: Vec<u8>,
     current_config: Option<AacConfig>,
     /// `sampling_frequency_index` and `channel_configuration` as the last
-    /// accepted frame's header gave them. Not the same as the configuration
-    /// derived from them: a mono or dual-mono service is rebuilt as a stereo
-    /// pair, so its configuration says two channels whatever the header said.
+    /// frame handed out had them in its header.
     announced: Option<(u8, u8)>,
-    /// The channel elements of the last frame that walked, by id and instance
-    /// tag. Until one has, a walk that fails says nothing about the frame;
-    /// after one has, it says the frame is damaged -- and so does a frame that
-    /// walks but names elements the last one did not.
+    /// That frame's channel elements, by id and instance tag. A decoder takes
+    /// the tags of the first frame it is given as the layout's, and refuses a
+    /// later one naming another, so under an unchanged header the elements
+    /// have to stay the same. A mono or dual-mono service is rebuilt from its
+    /// first element, which alone is listed.
     chain: Option<Vec<(u8, u8)>>,
+    /// Access units given up as damaged.
+    lost: u64,
+    /// The `adts_fixed_header` fields of the last frame handed out, as
+    /// [`fixed_fields`] takes them.
+    fixed_header: Option<[u8; 3]>,
+    /// Whether the next unit handed out carries on the framing of the last
+    /// one. Not at the start of a stream, nor after framing was taken up
+    /// anew; see [`AdtsOutput::restarts`].
+    continues: bool,
     /// Whether the next byte to read is known to start a frame, which it is
     /// once a header has said where its frame ends and a header was there.
     /// Until then every syncword is a candidate rather than a frame.
@@ -95,6 +158,19 @@ fn framing(data: &[u8], at: usize) -> Option<Framing> {
         header_length,
         frame_length,
     })
+}
+
+/// The fields of the `adts_fixed_header` at `at` that say what the stream is:
+/// ID, layer, protection_absent, profile, sampling_frequency_index and
+/// channel_configuration. They are the same in every frame of a stream
+/// (ISO/IEC 13818-7) until the service changes what it is. `at + 4` must be
+/// within `data`.
+fn fixed_fields(data: &[u8], at: usize) -> [u8; 3] {
+    [
+        data[at + 1] & 0x0f,
+        data[at + 2] & 0xfd,
+        data[at + 3] & 0xc0,
+    ]
 }
 
 /// The syncword is twelve set bits; the layer bits below it must be zero, which
@@ -167,179 +243,6 @@ fn frame_start(data: &[u8]) -> FrameStart {
 
 fn bit(data: &[u8], at: usize) -> u8 {
     (data[at >> 3] >> (7 - (at & 7))) & 1
-}
-
-/// Return the first channel element, skipping any byte-counted fill elements
-/// an encoder placed before it.
-struct PceInfo {
-    end: usize,
-    body_start: usize,
-    body_end: usize,
-    channels: u8,
-}
-
-fn parse_pce(data: &[u8], start: usize) -> Result<PceInfo> {
-    let mut r = crate::bitreader::BitReader::at_bit(data, start + 3);
-    r.skip(4 + 2 + 4); // tag, object_type, sampling_frequency_index
-    let front = r.u(4);
-    let side = r.u(4);
-    let back = r.u(4);
-    let lfe = r.u(2);
-    let assoc = r.u(3);
-    let cc = r.u(4);
-    if r.flag() {
-        r.skip(4);
-    } // mono_mixdown_element_number
-    if r.flag() {
-        r.skip(4);
-    } // stereo_mixdown_element_number
-    if r.flag() {
-        r.skip(3);
-    } // matrix_mixdown_idx, pseudo_surround_enable
-    let mut channels = lfe as u8;
-    for _ in 0..front + side + back {
-        channels += if r.flag() { 2 } else { 1 };
-        r.skip(4);
-    }
-    r.skip((lfe + assoc) * 4 + cc * 5);
-    let body_end = r.bit_pos();
-    r.align_to_byte();
-    let comments = r.u(8);
-    r.skip(comments * 8);
-    if r.bits_left() < 0 {
-        bail!("AAC program_config_element overruns the raw_data_block");
-    }
-    Ok(PceInfo {
-        end: r.bit_pos(),
-        body_start: start + 3,
-        body_end,
-        channels,
-    })
-}
-
-/// Step over a fill element, which is byte-counted rather than parsed.
-fn fill_element_end(data: &[u8], at: usize) -> usize {
-    let mut at = at + 3;
-    let mut count = (0..4).fold(0usize, |v, n| (v << 1) | bit(data, at + n) as usize);
-    at += 4;
-    if count == 15 {
-        let extra = (0..8).fold(0usize, |v, n| (v << 1) | bit(data, at + n) as usize);
-        at += 8;
-        // `cnt = count + esc_count - 1`, and `count` is 15 to have got here, so
-        // the escape spans fourteen bytes upwards. Fourteen is the one length
-        // both forms can write, and an encoder that writes it the long way was
-        // costing a byte here, which walked the element past the end of the
-        // block it was in.
-        count = 14 + extra;
-    }
-    at + count * 8
-}
-
-/// One past the last bit of ID_END, walking whatever fill elements sit between
-/// the channel element and it.
-///
-/// What follows ID_END is the alignment the encoder wrote, and a rewrite that
-/// carries it across ends up padding a frame that was padded already: the two
-/// together come to more than a byte about half the time, which leaves a whole
-/// byte hanging off the end of the block. Decoders that stop reading at ID_END
-/// never notice; ones that check the frame against the bytes they consumed
-/// reject it, and half the frames of a mono service went missing that way.
-fn raw_data_block_end(data: &[u8], mut at: usize) -> Result<usize> {
-    let total = data.len() * 8;
-    loop {
-        if at + 3 > total {
-            bail!("AAC raw_data_block ended before ID_END");
-        }
-        match (bit(data, at) << 2) | (bit(data, at + 1) << 1) | bit(data, at + 2) {
-            7 => return Ok(at + 3),
-            6 => at = fill_element_end(data, at),
-            id => bail!("unsupported AAC element {id} after the channel element"),
-        }
-    }
-}
-
-/// Whether every element of a raw_data_block can be walked to its end.
-///
-/// A broadcast recording carries the odd damaged access unit, and one handed to
-/// a decoder is not a frame it skips: it is an error that stops the stream. The
-/// video path drops a picture whose slices will not decode, and this is the
-/// same decision made on the same grounds -- what cannot be walked here is what
-/// a decoder cannot read either, which is how the frame that prompted this was
-/// found: the fourth element of an otherwise ordinary 5.1 frame read as a
-/// single channel element with prediction, which AAC-LC does not have.
-///
-/// Only the sample rates the element walker handles can be judged. At anything
-/// else the frame goes out unexamined, as it always did.
-///
-/// What the walk learns about the level of each channel goes into `gains`,
-/// which is only complete where the chain comes back and is not empty.
-fn raw_data_block_chain(
-    data: &[u8],
-    frequency_index: u8,
-    gains: &mut GlobalGains,
-) -> Option<Vec<(u8, u8)>> {
-    if frequency_index != 3 && frequency_index != 4 {
-        return Some(Vec::new());
-    }
-    let mut chain = Vec::new();
-    let mut at = 0;
-    loop {
-        if at + 3 > data.len() * 8 {
-            return None;
-        }
-        let id = (bit(data, at) << 2) | (bit(data, at + 1) << 1) | bit(data, at + 2);
-        if matches!(id, 0 | 1 | 3) {
-            if at + 7 > data.len() * 8 {
-                return None;
-            }
-            let tag = (bit(data, at + 3) << 3)
-                | (bit(data, at + 4) << 2)
-                | (bit(data, at + 5) << 1)
-                | bit(data, at + 6);
-            chain.push((id, tag));
-        }
-        let next = match id {
-            7 => return Some(chain),
-            0 | 3 => single_channel_end(data, at, frequency_index, id as u32, gains),
-            1 => cpe_end(data, at, frequency_index, gains),
-            5 => parse_pce(data, at).map(|pce| pce.end),
-            6 => Ok(fill_element_end(data, at)),
-            _ => return None,
-        };
-        match next {
-            Ok(end) if end > at => at = end,
-            _ => return None,
-        }
-    }
-}
-
-fn first_channel_element(data: &[u8]) -> Result<(u8, usize, Vec<(usize, usize)>, Option<PceInfo>)> {
-    let mut at = 0;
-    let mut pces = Vec::new();
-    let mut pce = None;
-    loop {
-        if at + 7 > data.len() * 8 {
-            bail!("AAC raw_data_block ended before a channel element");
-        }
-        let id = (bit(data, at) << 2) | (bit(data, at + 1) << 1) | bit(data, at + 2);
-        if id == 0 || id == 1 {
-            return Ok((id, at, pces, pce));
-        }
-        if id == 5 {
-            let info = parse_pce(data, at)?;
-            pces.push((at, info.end));
-            at = info.end;
-            pce = Some(info);
-            continue;
-        }
-        if id != 6 {
-            bail!("unsupported AAC element {id} before the channel element");
-        }
-        at = fill_element_end(data, at);
-        if at + 7 > data.len() * 8 {
-            bail!("AAC FIL element overruns the raw_data_block");
-        }
-    }
 }
 
 struct Bits {
@@ -470,33 +373,28 @@ pub struct AudioGain {
     pub surround: u8,
 }
 
-/// Add `steps` to every channel's `global_gain` in a raw_data_block.
+/// Add `steps` to the `global_gain` at each of `positions`, the channels of a
+/// raw_data_block whose largest band scalefactor is `max_scalefactor`.
 ///
-/// A frame that cannot be walked, or one that the steps would take past what a
-/// decoder accepts -- a `global_gain` or band scalefactor above 255 -- is left
-/// as it was. Broadcast scalefactors stay far below that, so leaving one frame
-/// at its own level is the lesser harm next to a frame no decoder will read.
-fn raise_global_gain(data: &mut [u8], frequency_index: u8, steps: u8) {
-    let mut gains = GlobalGains::default();
-    let walked = raw_data_block_chain(data, frequency_index, &mut gains)
-        .is_some_and(|chain| !chain.is_empty());
-    if !walked {
-        return;
-    }
+/// A frame that the steps would take past what a decoder accepts -- a
+/// `global_gain` or band scalefactor above 255 -- is left as it was. Broadcast
+/// scalefactors stay far below that, so leaving one frame at its own level is
+/// the lesser harm next to a frame no decoder will read.
+fn raise_global_gain(
+    data: &mut [u8],
+    positions: &[usize],
+    max_scalefactor: Option<i32>,
+    steps: u8,
+) {
     let steps = steps as u32;
     let field =
         |data: &[u8], at: usize| (0..8).fold(0u32, |v, n| (v << 1) | bit(data, at + n) as u32);
-    if gains
-        .max_scalefactor
-        .is_some_and(|max| max + steps as i32 > 255)
-        || gains
-            .positions
-            .iter()
-            .any(|&at| field(data, at) + steps > 255)
+    if max_scalefactor.is_some_and(|max| max + steps as i32 > 255)
+        || positions.iter().any(|&at| field(data, at) + steps > 255)
     {
         return;
     }
-    for &at in &gains.positions {
+    for &at in positions {
         let raised = field(data, at) + steps;
         for n in 0..8 {
             let mask = 0x80u8 >> ((at + n) & 7);
@@ -526,6 +424,17 @@ pub enum DualMono {
     Sub,
 }
 
+/// A mono or dual-mono block rebuilt as a channel pair.
+struct Rebuilt {
+    data: Vec<u8>,
+    /// Whether there was a second service to choose from.
+    dual_mono: bool,
+    /// The two channels' `global_gain`, in `data`.
+    global_gains: [usize; 2],
+    /// The largest band scalefactor of the service copied.
+    max_scalefactor: Option<i32>,
+}
+
 /// Turn SCE or SCE+SCE (dual mono) into a CPE with two identical independent
 /// channel streams, built from the service asked for. No spectral value is
 /// decoded or re-encoded either way: what changes is which of the two elements
@@ -535,49 +444,124 @@ pub enum DualMono {
 /// whichever is chosen, because that is what the two-channel configuration
 /// describing the frame names (ISO/IEC 14496-3 Table 1.19) -- the tag says which
 /// element of that configuration this is, not which of the source's it came
-/// from.
+/// from. A `program_config_element` is left out, since the configuration the
+/// frame goes out under is the implicit two-channel one, and so is the service
+/// not taken.
 ///
-/// Reports whether there was a second service to choose from, which is what a
-/// caller offering the choice needs and which nothing else in the frame says:
-/// the ADTS header of a dual-mono stream is the header of a mono one.
-fn sce_to_cpe(
-    data: &[u8],
-    sce: usize,
-    frequency_index: u8,
-    pces: &[(usize, usize)],
-    service: DualMono,
-) -> Result<(Vec<u8>, bool)> {
-    let primary_end = sce_end(data, sce, frequency_index, &mut GlobalGains::default())?;
-    let mut tail = primary_end;
-    let mut chosen = (sce + 7, primary_end);
-    let dual_mono = tail + 7 <= data.len() * 8
-        && bit(data, tail) == 0
-        && bit(data, tail + 1) == 0
-        && bit(data, tail + 2) == 0;
-    if dual_mono {
-        let sub_end = sce_end(data, tail, frequency_index, &mut GlobalGains::default())?;
-        if service == DualMono::Sub {
-            chosen = (tail + 7, sub_end);
-        }
-        tail = sub_end; // whichever was not taken is discarded
-    }
+/// The block is written up to `ID_END` and aligned once. What follows `ID_END`
+/// in the source is the alignment its encoder wrote, and carrying it across
+/// pads a frame that is padded already: about half the time the two come to
+/// more than a byte, which leaves a whole byte hanging off the end of the
+/// block. Decoders that stop reading at `ID_END` never notice; ones that check
+/// the frame against the bytes they consumed reject it, and half the frames of
+/// a mono service went missing that way.
+///
+/// `block` is a walk of `data` whose channel elements are one or two single
+/// channel elements.
+fn sce_to_cpe(data: &[u8], block: &Block, service: DualMono) -> Rebuilt {
+    let mut channels = block.channel_elements();
+    let primary = channels.next().expect("a mono block has a channel element");
+    let secondary = channels.next();
+    let chosen = match (service, secondary) {
+        (DualMono::Sub, Some(secondary)) => secondary,
+        _ => primary,
+    };
     let mut out = Bits {
-        data: Vec::with_capacity(data.len()),
+        data: Vec::with_capacity(data.len() + (chosen.end - chosen.start) / 8 + 1),
         len: 0,
     };
-    let mut prefix = 0;
-    for &(start, end) in pces {
-        out.copy(data, prefix, start);
-        prefix = end;
+    let mut global_gains = [0; 2];
+    for element in &block.elements {
+        if element.id == ID_PCE || Some(element) == secondary {
+            continue;
+        }
+        if element != primary {
+            out.copy(data, element.start, element.end);
+            continue;
+        }
+        out.value(3, ID_CPE as u32);
+        out.value(4, primary.tag as u32);
+        out.push(0); // common_window: each copy carries its own ics_info
+                     // The individual_channel_stream opens with its global_gain.
+        for gain in &mut global_gains {
+            *gain = out.len;
+            out.copy(data, chosen.start + 7, chosen.end);
+        }
     }
-    out.copy(data, prefix, sce);
-    out.value(3, 1); // ID_CPE
-    out.copy(data, sce + 3, sce + 7); // element_instance_tag
-    out.push(0); // common_window: each copy carries its own ics_info
-    out.copy(data, chosen.0, chosen.1);
-    out.copy(data, chosen.0, chosen.1);
-    out.copy(data, tail, raw_data_block_end(data, tail)?);
-    Ok((out.data, dual_mono))
+    out.value(3, ID_END as u32);
+    Rebuilt {
+        data: out.data,
+        dual_mono: secondary.is_some(),
+        global_gains,
+        max_scalefactor: chosen.max_scalefactor,
+    }
+}
+
+/// Whether a block's channel elements are a mono service or ARIB dual mono:
+/// one single channel element, or two.
+fn is_single_channel_service(block: &Block) -> bool {
+    let mut ids = block.channel_elements().map(|element| element.id);
+    matches!(
+        (ids.next(), ids.next(), ids.next()),
+        (Some(ID_SCE), None | Some(ID_SCE), None)
+    )
+}
+
+/// The `adts_error_check` CRC of a frame whose block is `block`
+/// (ISO/IEC 13818-7, as ARIB STD-B32 requires it of every broadcast frame).
+///
+/// It covers the header without the CRC itself, then from each element the
+/// bits after its `id_syn_ele`: the first 192 of a single channel or LFE
+/// element, the first 192 of a channel pair and the first 128 of its second
+/// channel stream, all of a `program_config_element` or `data_stream_element`,
+/// and nothing of a fill element. A span shorter than its count is padded with
+/// zeros; the 192 bits of a channel pair run on into its second channel stream
+/// when the first is shorter. That is the layout every frame of eight broadcast
+/// recordings matched.
+fn adts_crc(frame: &[u8], block: &Block) -> u16 {
+    let raw = &frame[9..];
+    let mut crc = Crc16::default();
+    crc.bits(frame, 0, 56, 56);
+    for element in &block.elements {
+        let after_id = element.start + 3;
+        match element.id {
+            ID_SCE | ID_LFE => crc.bits(raw, after_id, element.end, 192),
+            ID_CPE => {
+                crc.bits(raw, after_id, element.end, 192);
+                let second = element.global_gains[1].expect("a channel pair has two channels");
+                crc.bits(raw, second, element.end, 128);
+            }
+            ID_PCE | ID_DSE => crc.bits(raw, after_id, element.end, element.end - after_id),
+            _ => {}
+        }
+    }
+    crc.value
+}
+
+/// CRC-16 with the polynomial x^16 + x^15 + x^2 + 1, from all ones, most
+/// significant bit first.
+struct Crc16 {
+    value: u16,
+}
+
+impl Default for Crc16 {
+    fn default() -> Self {
+        Self { value: 0xffff }
+    }
+}
+
+impl Crc16 {
+    /// Feed `count` bits from `from`, the ones at or past `limit` as zeros.
+    fn bits(&mut self, data: &[u8], from: usize, limit: usize, count: usize) {
+        for at in from..from + count {
+            let input = if at < limit { bit(data, at) } else { 0 };
+            let top = (self.value >> 15) as u8 ^ input;
+            self.value <<= 1;
+            if top != 0 {
+                self.value ^= 0x8005;
+            }
+        }
+    }
 }
 
 impl AdtsStream {
@@ -606,21 +590,82 @@ impl AdtsStream {
         self.is_dual_mono
     }
 
-    /// Drop an access unit cut by transport loss and search for framing anew.
-    /// The last complete frame's configuration and element chain still
-    /// describe the service after a short reception dropout, so they remain.
+    /// Forget a partial frame and search for framing anew, as where the
+    /// stream begins again on a new time base: what was held belongs to the
+    /// stream before, and none of it is an access unit of this one. The last
+    /// complete frame's configuration and element chain still describe the
+    /// service, so they remain.
     pub fn discard_pending(&mut self) {
         self.pending.clear();
         self.synced = false;
+        self.continues = false;
     }
 
-    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<AacFrame>> {
-        self.pending.extend_from_slice(chunk);
-        let mut output = Vec::new();
+    /// Access units given up as damaged so far.
+    pub fn lost_units(&self) -> u64 {
+        self.lost
+    }
+
+    /// Read the next piece of the stream. `gap_before` says bytes were lost
+    /// in front of it: a frame whose header was reached in step with the ones
+    /// before it and which was cut there is one access unit lost, and framing
+    /// is searched for anew.
+    pub fn push(&mut self, chunk: &[u8], gap_before: bool) -> Result<AdtsOutput> {
+        let mut output = AdtsOutput::default();
+        if gap_before {
+            if self.synced && !self.pending.is_empty() {
+                self.lose(&mut output);
+            }
+            self.discard_pending();
+        }
+        // Out of `self` while it is read, since reading a frame updates what
+        // the stream is known to be.
+        let mut pending = std::mem::take(&mut self.pending);
+        let fresh = pending.len();
+        pending.extend_from_slice(chunk);
+        let read = self.read_frames(&pending, fresh, &mut output);
+        if let Ok(consumed) = read {
+            pending.drain(..consumed);
+        }
+        self.pending = pending;
+        read.map(|_| output)
+    }
+
+    /// Count an access unit lost, and stand a unit in its place where the
+    /// stream has said what it is.
+    fn lose(&mut self, output: &mut AdtsOutput) {
+        self.lost += 1;
+        if let Some(config) = self.current_config.clone() {
+            self.hand_out(output, AacUnit::Lost(config));
+        }
+    }
+
+    /// Add `unit` to `output`, noting a restart where it continues nothing.
+    fn hand_out(&mut self, output: &mut AdtsOutput, unit: AacUnit) {
+        if !self.continues {
+            output.restarts.push(output.units.len());
+            self.continues = true;
+        }
+        output.units.push(unit);
+    }
+
+    /// Read every whole frame of `pending` into `output`, and say how many of
+    /// its bytes are spent. The bytes from `fresh` on are the piece just
+    /// pushed.
+    fn read_frames(
+        &mut self,
+        pending: &[u8],
+        fresh: usize,
+        output: &mut AdtsOutput,
+    ) -> Result<usize> {
+        let mut commencing_seen = false;
         let mut at = 0;
-        while at + 7 <= self.pending.len() {
-            if !self.synced {
-                match frame_start(&self.pending[at..]) {
+        while at + 7 <= pending.len() {
+            // Whether this header was found by a search, which confirmed it by
+            // the header at its end, rather than where the last frame ended.
+            let searched = !self.synced;
+            if searched {
+                match frame_start(&pending[at..]) {
                     FrameStart::At(start) => at += start,
                     FrameStart::Spent(keep) => {
                         at += keep;
@@ -629,200 +674,290 @@ impl AdtsStream {
                 }
                 self.synced = true;
             }
+            // A header where the last frame ended that says the stream is
+            // something else is what a loss inside a header leaves: the first
+            // bytes of the header that was due, and after them bytes from
+            // further on. Its frame length is not to be waited for -- it would
+            // swallow the frames that follow -- so it is searched past, and a
+            // service that really changed is confirmed by the search instead.
+            let in_step = searched
+                || self
+                    .fixed_header
+                    .is_none_or(|fixed| fixed == fixed_fields(pending, at));
             let Some(Framing {
                 header_length,
                 frame_length,
-            }) = framing(&self.pending, at)
+            }) = framing(pending, at).filter(|_| in_step)
             else {
                 // Whatever was being followed, this is not the rest of it, so
                 // where the frames are has to be worked out again.
                 self.synced = false;
+                self.continues = false;
+                // The header due here was the first to begin in the piece,
+                // which is the one the piece's timestamp names, and it is
+                // gone. The one a search finds after it is a later frame.
+                if at >= fresh {
+                    commencing_seen = true;
+                }
                 continue;
             };
-            if at + frame_length > self.pending.len() {
+            if at + frame_length > pending.len() {
                 break;
             }
-
-            let audio_object_type = ((self.pending[at + 2] >> 6) & 3) + 1;
-            let sampling_frequency_index = (self.pending[at + 2] >> 2) & 15;
-            let channel_count = ((self.pending[at + 2] & 1) << 2) | (self.pending[at + 3] >> 6);
-            let raw_blocks = self.pending[at + 6] & 3;
-
-            if audio_object_type != 2 {
-                bail!("unsupported ADTS audio object type {audio_object_type}; AAC-LC is required");
-            }
-            let Some(&sample_rate) = SAMPLE_RATES.get(sampling_frequency_index as usize) else {
-                bail!("unsupported ADTS sampling_frequency_index {sampling_frequency_index}");
-            };
-            if raw_blocks != 0 {
-                bail!("ADTS frames with multiple raw data blocks are unsupported");
-            }
-
-            let raw_data = &self.pending[at + header_length..at + frame_length];
-            let chain = raw_data_block_chain(
-                raw_data,
-                sampling_frequency_index,
-                &mut GlobalGains::default(),
-            );
-            // The header is the frame's own account of the service it belongs
-            // to, and a broadcast switching between 5.1 and stereo at a
-            // programme boundary changes it. The elements in the block change
-            // with it, so the run the walker has been reading ends here rather
-            // than these being damaged frames of what came before -- but only
-            // where the block walks, since a header alone is four bytes that
-            // damage could have written.
-            if self
-                .announced
-                .is_some_and(|previous| previous != (sampling_frequency_index, channel_count))
-                && chain.is_some()
-            {
-                self.chain = None;
-            }
-            // Damaged. A stream this walker has read once it can read, so a
-            // frame it cannot is one a decoder cannot either -- and one whose
-            // elements are not the ones the stream has been carrying will be
-            // refused just the same, since a decoder only has room for the
-            // elements its configuration named. Handing either over does not
-            // cost a frame, it stops the stream.
-            match chain {
-                Some(chain) if self.chain.as_ref().is_none_or(|last| *last == chain) => {
-                    self.chain = Some(chain);
+            let frame = &pending[at..at + frame_length];
+            let units = output.units.len();
+            match self.read_frame(frame, header_length)? {
+                Some(frame) => {
+                    self.fixed_header = Some(fixed_fields(pending, at));
+                    self.hand_out(output, AacUnit::Frame(frame));
                 }
-                // ARIB dual mono can switch from an ordinary stereo CPE whose
-                // ADTS header says two channels to two SCEs with channel
-                // configuration zero. The current two-channel ASC still
-                // describes the CPE rebuilt below; the SCE element chain is
-                // intentionally allowed to vary between mono and dual mono.
-                Some(chain)
-                    if channel_count == 0
-                        && self
-                            .current_config
-                            .as_ref()
-                            .is_some_and(|c| c.channel_count <= 2)
-                        && chain.first().is_some_and(|&(id, _)| id == 0) => {}
-                // A mono or dual-mono service is rebuilt from its primary
-                // element alone and switches between the two as the broadcast
-                // does, so its chain is not fixed and is not judged by this.
-                _ if channel_count != 0 && channel_count <= 2 => {}
-                _ if self.chain.is_none() => {}
-                _ => {
-                    at += frame_length;
-                    continue;
-                }
+                None => self.lose(output),
             }
-
-            // A mono service and ARIB dual-mono both use SCEs. Repackage the
-            // primary SCE as both independent streams of a CPE, so every mode
-            // has the same channel_configuration=2 ASC. Genuine stereo CPEs
-            // pass through unchanged.
-            let (first_element, channel_start, pces, pce) = first_channel_element(raw_data)?;
-            let input_channels = if channel_count != 0 {
-                channel_count
-            } else if let Some(pce) = &pce {
-                pce.channels
-            } else if let Some(current) = &self.current_config {
-                current.channel_count
-            } else {
-                // A broadcast mono or dual-mono service leaves the header's
-                // channel configuration at zero and sends no
-                // program_config_element to carry one either: what the service
-                // is lives in the PMT, which is not where anything reading a
-                // raw ADTS stream would look. The element itself says enough
-                // for the repackaging below -- a single channel element is one
-                // channel, a channel pair is two -- and a stream that opens
-                // mid-way, as one resumed at a seek does, has nothing else to
-                // go on.
-                if first_element == 0 {
-                    1
-                } else {
-                    2
-                }
-            };
-            let sce_service = input_channels <= 2 && (input_channels == 1 || first_element == 0);
-            let output_channels = if sce_service { 2 } else { input_channels };
-            let audio_specific_config = if sce_service {
-                vec![
-                    (audio_object_type << 3) | (sampling_frequency_index >> 1),
-                    ((sampling_frequency_index & 1) << 7) | (2 << 3),
-                ]
-            } else if channel_count == 0 {
-                if let Some(pce) = &pce {
-                    pce_audio_specific_config(
-                        raw_data,
-                        pce,
-                        audio_object_type,
-                        sampling_frequency_index,
-                    )
-                } else if let Some(current) = &self.current_config {
-                    current.audio_specific_config.clone()
-                } else {
-                    vec![
-                        (audio_object_type << 3) | (sampling_frequency_index >> 1),
-                        ((sampling_frequency_index & 1) << 7) | (input_channels << 3),
-                    ]
-                }
-            } else {
-                vec![
-                    (audio_object_type << 3) | (sampling_frequency_index >> 1),
-                    ((sampling_frequency_index & 1) << 7) | (channel_count << 3),
-                ]
-            };
-            let config = AacConfig {
-                audio_object_type,
-                sample_rate,
-                sampling_frequency_index,
-                channel_count: output_channels,
-                audio_specific_config,
-            };
-            // A service that changes what it is -- 5.1 for the programme and
-            // stereo for the announcement after it -- describes itself
-            // differently from there on, and every frame carries the
-            // configuration it was coded under. Whoever is packaging them puts
-            // the change in an initialization segment of its own; refusing to
-            // read past it is what used to end the conversion there.
-            self.current_config = Some(config.clone());
-            self.announced = Some((sampling_frequency_index, channel_count));
-            let (mut data, is_dual_mono) = if sce_service {
-                sce_to_cpe(
-                    raw_data,
-                    channel_start,
-                    sampling_frequency_index,
-                    &pces,
-                    self.dual_mono,
-                )?
-            } else {
-                (raw_data.to_vec(), false)
-            };
-            self.is_dual_mono = is_dual_mono;
-            // After the rebuild, so that what is raised is the frame as it is
-            // handed out: a mono or dual-mono service is a stereo pair by now,
-            // and it is the channel count the listener gets that decides the
-            // step.
-            let steps = if output_channels <= 2 {
-                self.audio_gain.stereo
-            } else {
-                self.audio_gain.surround
-            };
-            if steps != 0 {
-                raise_global_gain(&mut data, sampling_frequency_index, steps);
+            if at >= fresh && !commencing_seen {
+                commencing_seen = true;
+                output.commencing = (output.units.len() > units).then_some(units);
             }
-            output.push(AacFrame { data, config });
             at += frame_length;
         }
-        self.pending.drain(..at);
-        Ok(output)
+        // In step with the frames before it, what is left begins a frame,
+        // whether or not all of its header has arrived.
+        if self.synced && !commencing_seen && at >= fresh && at < pending.len() {
+            output.commencing = Some(output.units.len());
+        }
+        Ok(at)
     }
 
-    pub fn finish(&mut self) -> Result<Vec<AacFrame>> {
-        let output = self.push(&[])?;
+    /// The access unit an ADTS frame carries, or `None` where the frame is
+    /// damaged.
+    fn read_frame(&mut self, frame: &[u8], header_length: usize) -> Result<Option<AacFrame>> {
+        let audio_object_type = ((frame[2] >> 6) & 3) + 1;
+        let sampling_frequency_index = (frame[2] >> 2) & 15;
+        let channel_count = ((frame[2] & 1) << 2) | (frame[3] >> 6);
+        let raw_blocks = frame[6] & 3;
+        let protected = header_length == 9;
+
+        // A stream of a kind this cannot carry is an error, but only before
+        // any frame has been read: a frame's own fields are all that say what
+        // kind it is, and once a stream has been read a header saying something
+        // else is far more likely damaged than true. Its CRC cannot settle it,
+        // since what the CRC covers depends on the very fields in question.
+        let established = self.current_config.is_some();
+        if audio_object_type != 2 {
+            if established {
+                return Ok(None);
+            }
+            bail!("unsupported ADTS audio object type {audio_object_type}; AAC-LC is required");
+        }
+        let Some(&sample_rate) = SAMPLE_RATES.get(sampling_frequency_index as usize) else {
+            if established {
+                return Ok(None);
+            }
+            bail!("unsupported ADTS sampling_frequency_index {sampling_frequency_index}");
+        };
+        if raw_blocks != 0 {
+            if established {
+                return Ok(None);
+            }
+            bail!("ADTS frames with multiple raw data blocks are unsupported");
+        }
+
+        let raw_data = &frame[header_length..];
+        let Some(block) = walk_block(raw_data, sampling_frequency_index) else {
+            return Ok(None);
+        };
+        if protected && adts_crc(frame, &block) != u16::from_be_bytes([frame[7], frame[8]]) {
+            return Ok(None);
+        }
+        if !self.elements_fit((sampling_frequency_index, channel_count), &block) {
+            return Ok(None);
+        }
+
+        // A mono service and ARIB dual-mono both use SCEs. Repackage the
+        // primary SCE as both independent streams of a CPE, so every mode
+        // has the same channel_configuration=2 ASC. Genuine stereo CPEs
+        // pass through unchanged.
+        let single_channel = is_single_channel_service(&block);
+        let input_channels = if channel_count != 0 {
+            channel_count
+        } else if let Some(pce) = &block.pce {
+            pce.channels
+        } else if let Some(current) = &self.current_config {
+            current.channel_count
+        } else {
+            // A broadcast mono or dual-mono service leaves the header's
+            // channel configuration at zero and sends no
+            // program_config_element to carry one either: what the service
+            // is lives in the PMT, which is not where anything reading a
+            // raw ADTS stream would look. The element itself says enough
+            // for the repackaging below -- a single channel element is one
+            // channel, a channel pair is two -- and a stream that opens
+            // mid-way, as one resumed at a seek does, has nothing else to
+            // go on.
+            if single_channel {
+                1
+            } else {
+                2
+            }
+        };
+        let sce_service = single_channel && input_channels <= 2;
+        let output_channels = if sce_service { 2 } else { input_channels };
+        let audio_specific_config = if sce_service {
+            vec![
+                (audio_object_type << 3) | (sampling_frequency_index >> 1),
+                ((sampling_frequency_index & 1) << 7) | (2 << 3),
+            ]
+        } else if channel_count == 0 {
+            if let Some(pce) = &block.pce {
+                pce_audio_specific_config(
+                    raw_data,
+                    pce,
+                    audio_object_type,
+                    sampling_frequency_index,
+                )
+            } else if let Some(current) = &self.current_config {
+                current.audio_specific_config.clone()
+            } else {
+                vec![
+                    (audio_object_type << 3) | (sampling_frequency_index >> 1),
+                    ((sampling_frequency_index & 1) << 7) | (input_channels << 3),
+                ]
+            }
+        } else {
+            vec![
+                (audio_object_type << 3) | (sampling_frequency_index >> 1),
+                ((sampling_frequency_index & 1) << 7) | (channel_count << 3),
+            ]
+        };
+        let config = AacConfig {
+            audio_object_type,
+            sample_rate,
+            sampling_frequency_index,
+            channel_count: output_channels,
+            audio_specific_config,
+        };
+        // A service that changes what it is -- 5.1 for the programme and
+        // stereo for the announcement after it -- describes itself
+        // differently from there on, and every frame carries the
+        // configuration it was coded under. Whoever is packaging them puts
+        // the change in an initialization segment of its own; refusing to
+        // read past it is what used to end the conversion there.
+        self.current_config = Some(config.clone());
+        // After the rebuild, so that what is raised is the frame as it is
+        // handed out: a mono or dual-mono service is a stereo pair by now,
+        // and it is the channel count the listener gets that decides the
+        // step.
+        let steps = if output_channels <= 2 {
+            self.audio_gain.stereo
+        } else {
+            self.audio_gain.surround
+        };
+        let data = if sce_service {
+            let mut rebuilt = sce_to_cpe(raw_data, &block, self.dual_mono);
+            self.is_dual_mono = rebuilt.dual_mono;
+            if steps != 0 {
+                raise_global_gain(
+                    &mut rebuilt.data,
+                    &rebuilt.global_gains,
+                    rebuilt.max_scalefactor,
+                    steps,
+                );
+            }
+            rebuilt.data
+        } else {
+            self.is_dual_mono = false;
+            let mut data = raw_data.to_vec();
+            if steps != 0 {
+                let channels: Vec<&Element> = block.channel_elements().collect();
+                let positions: Vec<usize> = channels
+                    .iter()
+                    .flat_map(|element| element.global_gains.into_iter().flatten())
+                    .collect();
+                let max_scalefactor = channels
+                    .iter()
+                    .filter_map(|element| element.max_scalefactor)
+                    .max();
+                raise_global_gain(&mut data, &positions, max_scalefactor, steps);
+            }
+            data
+        };
+        Ok(Some(AacFrame { data, config }))
+    }
+
+    /// Whether a block's channel elements are the ones its header says the
+    /// stream carries, which is all a decoder has room for; and if they are,
+    /// take them as what the stream is from here on.
+    ///
+    /// The header's channel configuration names the kinds of element and
+    /// their order. A mono or dual-mono service is rebuilt from its first
+    /// element alone, and ARIB switches between the two within a programme,
+    /// under a header of one, two or no channels, so either fits all of those.
+    /// A `program_config_element` names the layout itself, and the block has
+    /// to carry the channels it counts.
+    ///
+    /// Under an unchanged header the elements, tags included, are the last
+    /// frame's: the header is what changes when the service does -- 5.1 for a
+    /// programme, stereo for what follows -- and a block that walks, fits the
+    /// new header and passes its CRC is that change rather than damage.
+    fn elements_fit(&mut self, header: (u8, u8), block: &Block) -> bool {
+        let channel_count = header.1;
+        let single_channel = is_single_channel_service(block);
+        let mut channels = block.channel_elements();
+        let fits_header = if channel_count != 0 {
+            (channel_count <= 2 && single_channel)
+                || implicit_channel_elements(channel_count).is_some_and(|layout| {
+                    layout
+                        .iter()
+                        .map(|&(id, _)| id)
+                        .eq(channels.map(|element| element.id))
+                })
+        } else if let Some(pce) = &block.pce {
+            channels
+                .map(|element| if element.id == ID_CPE { 2 } else { 1 })
+                .sum::<u8>()
+                == pce.channels
+        } else {
+            channels.next().is_some()
+        };
+        if !fits_header {
+            return false;
+        }
+        let elements = block
+            .channel_elements()
+            .map(|element| (element.id, element.tag));
+        let chain: Vec<(u8, u8)> = if single_channel {
+            elements.take(1).collect()
+        } else {
+            elements.collect()
+        };
+        let same_service = self.announced == Some(header) && block.pce.is_none();
+        if same_service && self.chain.as_ref().is_some_and(|last| *last != chain) {
+            return false;
+        }
+        self.announced = Some(header);
+        self.chain = Some(chain);
+        true
+    }
+
+    /// Read what is left at the end of the input. Nothing begins in it, so
+    /// `commencing` is `None`.
+    pub fn finish(&mut self) -> Result<AdtsOutput> {
+        let output = self.push(&[], false)?;
         // Whatever is left is the part of a frame the input was cut in the
         // middle of, which a recording that stopped mid-frame ends with. A
         // fraction of an access unit is not something a decoder can be given,
         // and refusing the whole stream over the last few milliseconds of it
         // would be worse, so it goes. Whatever comes next is the start of
-        // another stream, which is not where this one left off.
+        // another stream, which is not where this one left off -- and not
+        // held to what this one was either: another elementary stream has
+        // a configuration and element tags of its own.
         self.pending.clear();
         self.synced = false;
+        self.current_config = None;
+        self.announced = None;
+        self.chain = None;
+        self.is_dual_mono = false;
+        self.fixed_header = None;
+        self.continues = false;
         Ok(output)
     }
 }

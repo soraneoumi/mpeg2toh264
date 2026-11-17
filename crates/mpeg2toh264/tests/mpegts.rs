@@ -961,10 +961,10 @@ fn marks_an_unbounded_pes_boundary_after_packet_loss_as_damaged() {
         .collect();
 
     assert_eq!(video.len(), 2);
-    assert!(!video[0].damaged_previous_pes);
+    assert!(!video[0].gap_before);
     assert!(
-        video[1].damaged_previous_pes,
-        "the complete PES after the hole discards the damaged GOP prefix"
+        video[1].gap_before,
+        "the PES after the hole reports that the one before it lost its end"
     );
 }
 
@@ -1090,19 +1090,37 @@ fn a_superseded_stream_recovers_after_packet_loss() {
     let mut demuxer = MpegTsAvDemuxer::new();
     let mut packets = demuxer.push(&stream).expect("demuxes across the move");
     packets.extend(demuxer.finish().expect("flushes the new stream"));
-    let video: Vec<(u16, Vec<u8>)> = packets
+    let video: Vec<_> = packets
         .into_iter()
         .filter(|packet| packet.kind == ElementaryKind::Video)
-        .map(|packet| (packet.pid, packet.data))
         .collect();
 
+    // The damaged PES on the old PID is handed on as the parts on either side
+    // of the lost packet, and the stream carries on to the new PID.
+    assert_eq!(video.len(), 5);
     assert_eq!(
-        video,
-        vec![
-            (0x200, vec![0xaa]),
-            (0x200, vec![0xdd]),
-            (0x100, vec![0xbb]),
-        ]
+        (video[0].pid, video[0].data.as_slice()),
+        (0x200, &[0xaa][..])
+    );
+    let (before, after) = (&video[1], &video[2]);
+    // The second map's packets count from zero again on the old PID, which
+    // already reads as a loss before the damaged PES.
+    assert!(before.pid == 0x200 && before.pes_start);
+    assert!(after.pid == 0x200 && !after.pes_start && after.gap_before);
+    assert_eq!(before.data.len() + 184 + after.data.len(), damaged.len());
+    assert!(before
+        .data
+        .iter()
+        .chain(&after.data)
+        .all(|&byte| byte == 0xcc));
+    assert_eq!(
+        (video[3].pid, video[3].data.as_slice()),
+        (0x200, &[0xdd][..])
+    );
+    assert!(!video[3].gap_before);
+    assert_eq!(
+        (video[4].pid, video[4].data.as_slice()),
+        (0x100, &[0xbb][..])
     );
 }
 
@@ -1223,10 +1241,16 @@ fn packet_loss_is_not_a_table_restart_just_because_every_counter_is_zero() {
     let video: Vec<_> = packets
         .into_iter()
         .filter(|packet| packet.kind == ElementaryKind::Video)
-        .map(|packet| packet.data)
         .collect();
 
-    assert_eq!(video, vec![replacement]);
+    // The lost packet cuts the first PES in two; the tables between them do not.
+    assert_eq!(video.len(), 3);
+    let (before, after) = (&video[0], &video[1]);
+    assert!(before.pes_start && !before.gap_before);
+    assert!(!after.pes_start && after.gap_before);
+    assert_eq!(before.data.len() + 184 + after.data.len(), first.len());
+    assert_eq!(video[2].data, replacement);
+    assert!(video[2].pes_start && !video[2].gap_before);
     assert_eq!(demuxer.dropped(), 31);
 }
 
@@ -1422,7 +1446,7 @@ fn marks_packet_loss_ending_at_counter_zero_as_damaged() {
         .find(|packet| packet.kind == ElementaryKind::Video && packet.data == second)
         .expect("complete PES after the hole");
 
-    assert!(replacement.damaged_previous_pes);
+    assert!(replacement.gap_before);
     assert_eq!(demuxer.dropped(), 1);
 }
 
@@ -1459,18 +1483,22 @@ fn detects_loss_immediately_after_a_payload_discontinuity_marker() {
     stream.copy_within(2 * 188 + 4..2 * 188 + 186, 2 * 188 + 6);
     stream[2 * 188 + 4] = 1;
     stream[2 * 188 + 5] = 0x80;
-    // Counter one is now missing, so counter two must damage the open PES.
+    // Counter one is now missing, so counter two must cut the open PES.
     stream.drain(3 * 188..4 * 188);
 
     let mut demuxer = MpegTsAvDemuxer::new();
     let mut packets = demuxer.push(&stream).expect("demuxes after the marker");
     packets.extend(demuxer.finish().expect("flushes the replacement"));
-    let replacement = packets
+    let video: Vec<_> = packets
         .iter()
-        .find(|packet| packet.kind == ElementaryKind::Video && packet.data == second)
-        .expect("complete PES after the hole");
+        .filter(|packet| packet.kind == ElementaryKind::Video)
+        .collect();
 
-    assert!(replacement.damaged_previous_pes);
+    assert_eq!(video.len(), 3);
+    assert!(video[0].pes_start && !video[0].gap_before);
+    assert!(!video[1].pes_start && video[1].gap_before);
+    assert_eq!(video[2].data, second);
+    assert!(!video[2].gap_before);
     assert_eq!(demuxer.dropped(), 1);
 }
 
@@ -1516,7 +1544,7 @@ fn preserves_an_open_video_pes_across_a_payload_discontinuity_marker() {
     assert_eq!(video.len(), 2);
     assert_eq!(video[0].data, first);
     assert_eq!(video[1].data, second);
-    assert!(!video[1].damaged_previous_pes);
+    assert!(!video[1].gap_before);
     assert_eq!(demuxer.dropped(), 0);
 }
 
@@ -1570,17 +1598,17 @@ fn preserves_an_open_video_pes_across_an_adaptation_only_discontinuity() {
     assert_eq!(video.len(), 2);
     assert_eq!(video[0].data, first);
     assert_eq!(video[1].data, second);
-    assert!(!video[1].damaged_previous_pes);
+    assert!(!video[1].gap_before);
     assert_eq!(demuxer.dropped(), 0);
 }
 
 #[test]
-fn discards_an_open_video_pes_after_loss_following_an_adaptation_only_discontinuity() {
+fn cuts_an_open_video_pes_at_loss_following_an_adaptation_only_discontinuity() {
     use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
     use support::{mux_transport_stream, PesUnit, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID};
 
     // An adaptation-only marker anchors the next expected counter, so losing
-    // the first payload after it proves that the open PES was cut.
+    // the first payload after it proves that the open PES was cut there.
     let first = vec![0xaa; 700];
     let second = vec![0xbb; 32];
     let mut stream = mux_transport_stream(
@@ -1622,9 +1650,19 @@ fn discards_an_open_video_pes_after_loss_following_an_adaptation_only_discontinu
         .filter(|packet| packet.kind == ElementaryKind::Video)
         .collect();
 
-    assert_eq!(video.len(), 1);
-    assert_eq!(video[0].data, second);
-    assert!(video[0].damaged_previous_pes);
+    // Both sides of the lost payload are handed on: the part before it opens
+    // the PES, and the part after it reports the gap.
+    assert_eq!(video.len(), 3);
+    let (before, after) = (&video[0], &video[1]);
+    assert!(before.pes_start && !before.gap_before);
+    assert_eq!(before.pts, Some(90_000));
+    assert!(!after.pes_start && after.gap_before);
+    assert_eq!(after.pts, None);
+    assert_eq!(before.data.len() + 184 + after.data.len(), first.len());
+    assert_eq!(before.data, first[..before.data.len()]);
+    assert_eq!(after.data, first[first.len() - after.data.len()..]);
+    assert_eq!(video[2].data, second);
+    assert!(video[2].pes_start && !video[2].gap_before);
 }
 
 #[test]
@@ -1722,7 +1760,8 @@ fn carries_an_adaptation_only_discontinuity_to_the_next_pes() {
     assert_eq!(audio.len(), 2);
     assert_eq!(audio[0].data, first);
     assert_eq!(audio[1].data, second);
-    assert!(audio[1].discontinuity);
+    assert!(audio[1].time_base_break);
+    assert!(!audio[1].gap_before);
 }
 
 #[test]
@@ -1792,4 +1831,222 @@ fn ignores_a_retransmitted_packet_after_another_pid() {
 
     assert_eq!(video.data, payload);
     assert_eq!(demuxer.dropped(), 0);
+}
+
+/// Give the packets of one PID consecutive continuity counters again, which
+/// is what a loss of a multiple of sixteen packets leaves behind.
+fn renumber(stream: &mut [u8], pid: u16) {
+    let mut counter = 0;
+    for packet in stream.chunks_mut(188) {
+        if (((packet[1] & 0x1f) as u16) << 8 | packet[2] as u16) == pid {
+            packet[3] = (packet[3] & 0xf0) | counter;
+            counter = (counter + 1) & 15;
+        }
+    }
+}
+
+/// Indexes of the packets of one PID.
+fn packets_of(stream: &[u8], pid: u16) -> Vec<usize> {
+    stream
+        .chunks(188)
+        .enumerate()
+        .filter(|(_, packet)| (((packet[1] & 0x1f) as u16) << 8 | packet[2] as u16) == pid)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn three_audio_pes(payloads: [&[u8]; 3]) -> Vec<u8> {
+    use support::{
+        mux_transport_stream, PesUnit, AUDIO_PID, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO,
+        VIDEO_PID,
+    };
+    let units: Vec<_> = payloads
+        .iter()
+        .enumerate()
+        .map(|(index, payload)| PesUnit {
+            pid: AUDIO_PID,
+            stream_id: 0xc0,
+            pts: Some(90_000 + 1_920 * index as u64),
+            payload,
+        })
+        .collect();
+    // A service is chosen for its pictures, so the map names a video stream too.
+    mux_transport_stream(
+        &[
+            (VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO),
+            (AUDIO_PID, STREAM_TYPE_AAC_ADTS),
+        ],
+        &units,
+        &mut HashMap::new(),
+    )
+}
+
+#[test]
+fn reports_a_bounded_pes_that_ends_short_of_its_length_as_a_gap() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::AUDIO_PID;
+
+    // Each PES takes three packets. The middle one of the first is lost with
+    // the counters still running on, as they do when sixteen packets go.
+    let (first, second, third) = (vec![0xa1; 500], vec![0xa2; 500], vec![0xa3; 500]);
+    let mut stream = three_audio_pes([&first, &second, &third]);
+    let lost = packets_of(&stream, AUDIO_PID)[1];
+    stream.drain(lost * 188..(lost + 1) * 188);
+    renumber(&mut stream, AUDIO_PID);
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut packets = demuxer.push(&stream).expect("demuxes");
+    packets.extend(demuxer.finish().expect("flushes"));
+    let audio: Vec<_> = packets
+        .iter()
+        .filter(|packet| packet.kind == ElementaryKind::Audio)
+        .collect();
+
+    assert_eq!(audio.len(), 3);
+    assert_eq!(audio[0].data.len(), first.len() - 184);
+    assert!(audio[0].pes_start && !audio[0].gap_before);
+    assert_eq!(audio[1].data, second);
+    assert!(
+        audio[1].gap_before,
+        "the length the header declared was not reached"
+    );
+    assert_eq!(audio[2].data, third);
+    assert!(!audio[2].gap_before);
+    assert_eq!(demuxer.dropped(), 0);
+}
+
+#[test]
+fn hands_on_bytes_past_a_declared_length_as_what_follows_a_gap() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::AUDIO_PID;
+
+    // The last packet of the first PES and the header packet of the second
+    // are lost together, the counters running on, so the second's middle
+    // packet carries the first past the length its header declared.
+    let (first, second, third) = (vec![0xa1; 500], vec![0xa2; 500], vec![0xa3; 500]);
+    let mut stream = three_audio_pes([&first, &second, &third]);
+    let audio_packets = packets_of(&stream, AUDIO_PID);
+    let lost = audio_packets[2];
+    assert_eq!(audio_packets[3], lost + 1);
+    stream.drain(lost * 188..(lost + 2) * 188);
+    renumber(&mut stream, AUDIO_PID);
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut packets = demuxer.push(&stream).expect("demuxes");
+    packets.extend(demuxer.finish().expect("flushes"));
+    let audio: Vec<_> = packets
+        .iter()
+        .filter(|packet| packet.kind == ElementaryKind::Audio)
+        .collect();
+
+    assert_eq!(audio.len(), 3);
+    // The declared length is handed on as the PES, joined bytes and all.
+    assert!(audio[0].pes_start && !audio[0].gap_before);
+    assert_eq!(audio[0].data.len(), first.len());
+    assert_eq!(audio[0].data[..2 * 184 - 14], first[..2 * 184 - 14]);
+    assert!(audio[0].data[2 * 184 - 14..]
+        .iter()
+        .all(|&byte| byte == 0xa2));
+    // What ran past it is the rest of the second PES, after a gap.
+    assert!(!audio[1].pes_start && audio[1].gap_before);
+    assert_eq!(audio[1].pts, None);
+    // 38 bytes past the declared end, then the second PES's last packet.
+    assert_eq!(audio[1].data.len(), 38 + 146);
+    assert!(audio[1].data.iter().all(|&byte| byte == 0xa2));
+    assert_eq!(audio[2].data, third);
+    assert!(!audio[2].gap_before);
+}
+
+#[test]
+fn cuts_a_pes_at_a_payload_that_cannot_be_read() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{mux_transport_stream, PesUnit, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID};
+
+    let first = vec![0xaa; 700];
+    let second = vec![0xbb; 32];
+    let mut stream = mux_transport_stream(
+        &[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)],
+        &[
+            PesUnit {
+                pid: VIDEO_PID,
+                stream_id: 0xe0,
+                pts: Some(90_000),
+                payload: &first,
+            },
+            PesUnit {
+                pid: VIDEO_PID,
+                stream_id: 0xe0,
+                pts: Some(93_000),
+                payload: &second,
+            },
+        ],
+        &mut HashMap::new(),
+    );
+    let scrambled = packets_of(&stream, VIDEO_PID)[1];
+    stream[scrambled * 188 + 3] |= 0x80;
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut packets = demuxer.push(&stream).expect("demuxes");
+    packets.extend(demuxer.finish().expect("flushes"));
+    let video: Vec<_> = packets
+        .iter()
+        .filter(|packet| packet.kind == ElementaryKind::Video)
+        .collect();
+
+    assert_eq!(video.len(), 3);
+    assert!(video[0].pes_start && !video[0].gap_before);
+    assert!(!video[1].pes_start && video[1].gap_before);
+    assert_eq!(video[0].data.len() + 184 + video[1].data.len(), first.len());
+    assert_eq!(video[2].data, second);
+    assert_eq!(demuxer.scrambled(), 1);
+}
+
+#[test]
+fn reads_the_decoding_timestamp_of_a_pes() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{mux_transport_stream, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID};
+
+    fn timestamp(prefix: u8, value: u64) -> [u8; 5] {
+        [
+            prefix << 4 | (((value >> 30) & 7) as u8) << 1 | 1,
+            (value >> 22) as u8,
+            (((value >> 15) & 0x7f) as u8) << 1 | 1,
+            (value >> 7) as u8,
+            ((value & 0x7f) as u8) << 1 | 1,
+        ]
+    }
+
+    let mut stream = mux_transport_stream(
+        &[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)],
+        &[],
+        &mut HashMap::new(),
+    );
+    let mut pes = vec![0, 0, 1, 0xe0, 0, 0, 0x80, 0xc0, 10];
+    pes.extend_from_slice(&timestamp(3, 93_003));
+    pes.extend_from_slice(&timestamp(1, 90_000));
+    pes.extend_from_slice(&[0x55; 16]);
+    let stuffing = 184 - 1 - pes.len();
+    let mut packet = vec![
+        0x47,
+        0x40 | (VIDEO_PID >> 8) as u8,
+        VIDEO_PID as u8,
+        0x30,
+        stuffing as u8,
+        0,
+    ];
+    packet.resize(5 + stuffing, 0xff);
+    packet.extend_from_slice(&pes);
+    assert_eq!(packet.len(), 188);
+    stream.extend_from_slice(&packet);
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut packets = demuxer.push(&stream).expect("demuxes");
+    packets.extend(demuxer.finish().expect("flushes"));
+    let video = packets
+        .iter()
+        .find(|packet| packet.kind == ElementaryKind::Video)
+        .expect("one video PES");
+
+    assert_eq!((video.pts, video.dts), (Some(93_003), Some(90_000)));
+    assert_eq!(video.data, [0x55; 16]);
 }

@@ -201,6 +201,82 @@ fn a_field_without_its_second_field_conceals_the_other_one() {
         .is_err());
 }
 
+/// `data` with the slice at `slice` of `picture` cut at byte `cut`: the rest of
+/// its bytes replaced by a `sequence_error_code`, as a reader that lost the
+/// transport packets after `cut` marks the loss. The slices after it follow.
+fn with_slice_cut(data: &[u8], slice: &mpeg2toh264::mpeg2::headers::Slice, cut: usize) -> Vec<u8> {
+    let end = slice.data_end_bit.expect("the slice ends at a start code") / 8;
+    [&data[..cut], &[0, 0, 1, 0xb4][..], &data[end..]].concat()
+}
+
+/// A slice that ends at a `sequence_error_code` was cut short, and the slices
+/// after the code are still the same picture's.
+#[test]
+fn a_sequence_error_code_marks_the_slice_it_ends_as_cut_short() {
+    let data = read_fixture("i_only.m2v");
+    let pictures = parse_elementary_stream(&data).expect("parses");
+    let slices = &pictures[0].slices;
+    let middle = slices.len() / 2;
+    let cut = slices[middle].data_start_bit / 8 + 4;
+    let damaged =
+        parse_elementary_stream(&with_slice_cut(&data, &slices[middle], cut)).expect("parses");
+    assert_eq!(damaged.len(), pictures.len());
+    let marked: Vec<usize> = damaged[0]
+        .slices
+        .iter()
+        .enumerate()
+        .filter(|(_, slice)| slice.truncated)
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(marked, [middle]);
+    assert_eq!(damaged[0].slices[middle].data_end_bit, Some(cut * 8));
+    assert_eq!(damaged[0].slices.len(), slices.len());
+}
+
+/// What a slice holds before the point it was cut at decodes as it would have;
+/// the macroblock the cut came in the middle of, and everything after it in the
+/// slice, is concealed rather than decoded out of the zeros of the start code.
+/// With no reference to conceal from, a concealed macroblock is mid-grey.
+#[test]
+fn a_slice_cut_short_keeps_what_came_before_the_cut() {
+    let data = read_fixture("i_only.m2v");
+    let pictures = parse_elementary_stream(&data).expect("parses");
+    assert_eq!(
+        pictures[0].coding.picture_structure,
+        PictureStructure::Frame
+    );
+    let clean = Decoder::new()
+        .decode_frame(&data, &pictures[0], None)
+        .expect("decodes");
+    let slice = &pictures[0].slices[pictures[0].slices.len() / 2];
+    let (width, height) = clean.size();
+    for cut in slice.data_start_bit / 8 + 1..slice.data_end_bit.unwrap() / 8 {
+        let damaged_data = with_slice_cut(&data, slice, cut);
+        let damaged_pictures = parse_elementary_stream(&damaged_data).expect("parses");
+        let damaged = Decoder::new()
+            .decode_frame(&damaged_data, &damaged_pictures[0], None)
+            .expect("decodes");
+        assert!(damaged.info().concealed_macroblocks > 0, "cut at {cut}");
+        for mby in 0..height.div_ceil(16) {
+            for mbx in 0..width.div_ceil(16) {
+                let mut same = true;
+                let mut grey = true;
+                for component in 0..3 {
+                    let size = if component == 0 { 16 } else { 8 };
+                    let (a, b) = (clean.plane(component), damaged.plane(component));
+                    for y in mby * size..((mby + 1) * size).min(a.height) {
+                        let span = mbx * size..((mbx + 1) * size).min(a.width);
+                        let (a, b) = (&a.row(y)[span.clone()], &b.row(y)[span]);
+                        same &= a == b;
+                        grey &= b.iter().all(|&sample| sample == 128);
+                    }
+                }
+                assert!(same || grey, "cut at {cut}: macroblock {mbx},{mby}");
+            }
+        }
+    }
+}
+
 #[test]
 fn frames_are_reused_once_released() {
     let data = read_fixture("ibbp.m2v");

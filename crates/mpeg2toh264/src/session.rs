@@ -10,8 +10,8 @@
 use std::sync::Arc;
 
 use crate::container::adts::{
-    aac_frame_count_through_video_time, silent_frame, AacConfig, AacFrame, AdtsStream, AudioGain,
-    DualMono, AAC_FRAME_SAMPLES,
+    aac_frame_count_through_video_time, silent_frame, AacConfig, AacFrame, AacUnit, AdtsOutput,
+    AdtsStream, AudioGain, DualMono, AAC_FRAME_SAMPLES,
 };
 use crate::container::fmp4::{
     mpeg2_decode_unit_to_fmp4, mpeg2_fragment_duration, mpeg2_gop_to_fmp4, timed_mpeg2_unit,
@@ -20,7 +20,7 @@ use crate::container::fmp4::{
 use crate::container::mpegts::{AudioStream, ElementaryKind, ElementaryPacket, MpegTsAvDemuxer};
 use crate::container::rff::RffState;
 use crate::error::{Error, Result};
-use crate::mpeg2::gop_stream::{Mpeg2Gop, Mpeg2GopStream, UnitTimestamp};
+use crate::mpeg2::gop_stream::{DamagedPictures, EsChunk, Mpeg2Gop, Mpeg2GopStream, UnitTimestamp};
 use crate::mpeg2::headers::{stream_sequence_description, Interlacing, SequenceDescription};
 use crate::round_half_up;
 
@@ -44,6 +44,12 @@ const MAX_HELD_TICKS: i64 = 30 * TIMESCALE as i64;
 /// rather than a damaged one: some seconds of it, however the groups are cut.
 const MAX_UNREADABLE_GROUPS: usize = 16;
 
+/// Sound read with no timestamp to place it, past which the stream is taken to
+/// have stopped placing its sound and the count is trusted instead. A stream
+/// stamps its sound at least every 0.7 seconds (ISO/IEC 13818-1 2.7.4), which
+/// at the highest broadcast rate is 33 access units; this is twice that.
+const MAX_UNPLACED_AUDIO_FRAMES: usize = 66;
+
 /// The PES timestamp field is 33 bits and wraps every 26.5 hours (clause
 /// 2.4.3.7), so the distance between two of them is modular.
 const PTS_MODULUS: i64 = 1 << 33;
@@ -51,6 +57,55 @@ const PTS_MODULUS: i64 = 1 << 33;
 /// How far apart two timestamps, or two readings of one, have to be before a
 /// unit is placed again from its own: what the retime check tolerates.
 const RETIME_TOLERANCE: i64 = 2;
+
+/// The timestamp `frames` access units before `pts`.
+fn frames_before(pts: u64, frames: usize, sample_rate: u32) -> u64 {
+    let ticks = round_half_up(
+        (frames as u64 * AAC_FRAME_SAMPLES * TIMESCALE) as f64 / f64::from(sample_rate),
+    ) as i64;
+    (pts as i64 - ticks).rem_euclid(PTS_MODULUS) as u64
+}
+
+/// Cover a run of units lost to damage with copies of `neighbour`, or with
+/// silence where the run is too long for a repeat or the neighbour was coded
+/// in another configuration. Where neither can be had -- a layout no silence
+/// can be made for, and no neighbour coded the same -- the unit is left out,
+/// and false says so: the frames no longer stand one for one for the units.
+fn cover_lost_run(
+    run: &mut Vec<AacConfig>,
+    neighbour: Option<&AacFrame>,
+    frames: &mut Vec<AacFrame>,
+) -> bool {
+    let alike = neighbour.filter(|frame| run.iter().all(|config| *config == frame.config));
+    let short = run.len() as u64 <= MAX_CONCEALED_AUDIO_FRAMES;
+    let mut every_one = true;
+    for config in run.drain(..) {
+        let stand_in = alike
+            .filter(|_| short)
+            .cloned()
+            .or_else(|| silent_frame(&config))
+            .or_else(|| alike.cloned());
+        match stand_in {
+            Some(frame) => frames.push(frame),
+            None => every_one = false,
+        }
+    }
+    every_one
+}
+
+/// How a stretch of sound read with unbroken framing relates to what came
+/// before it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    /// It carries on from the frames before it.
+    Continues,
+    /// Framing was taken up anew after bytes were lost, or after bytes that
+    /// held no frame where one should have begun.
+    Recovers,
+    /// Framing was taken up anew with nothing lost: the first frame of the
+    /// sound, of a stream the sound moved to, or after a new time base.
+    Begins,
+}
 
 /// A difference of timestamps taken across the wrap, so that one a little
 /// before another comes out negative rather than as most of 26.5 hours.
@@ -553,6 +608,17 @@ pub struct Session {
     audio_first_prior: i64,
     /// Where the audio track begins on the shared timeline, once it is fixed.
     audio_origin_ticks: u64,
+    /// The last access unit read from the sound being followed, which a short
+    /// run of units lost to damage is covered with.
+    last_audio_frame: Option<AacFrame>,
+    /// Whether the sound being read has no place yet, framing having been
+    /// taken up anew with no timestamp since; see [`Session::lay_audio`].
+    audio_awaiting_place: bool,
+    /// What has been read since, in order.
+    audio_unplaced: Vec<AacFrame>,
+    /// A timestamp that arrived for it before the frame it names was read:
+    /// that frame's position in `audio_unplaced`, and the timestamp.
+    audio_unplaced_anchor: Option<(usize, u64)>,
     /// The PES timestamp presentation time zero stands for. Supplied by a
     /// caller resuming mid-file, and worked out from the stream otherwise.
     timeline_origin: Option<i64>,
@@ -686,7 +752,15 @@ impl Session {
             // has arrived.
             gops: Mpeg2GopStream::with_split_groups(
                 options.split_groups || options.video == VideoMode::Decode,
-            ),
+            )
+            // A picture with slices missing is ours to conceal when we decode
+            // it. Passed through, it goes to a platform decoder nobody has
+            // seen take one, and an error there ends playback, so only whole
+            // pictures go that way.
+            .with_damaged_pictures(match options.video {
+                VideoMode::Passthrough => DamagedPictures::Drop,
+                VideoMode::Decode => DamagedPictures::Conceal,
+            }),
             adts: AdtsStream::new(),
             video: match options.video {
                 VideoMode::Passthrough => VideoPipeline::Passthrough {
@@ -727,6 +801,10 @@ impl Session {
             audio_first: None,
             audio_first_prior: 0,
             audio_origin_ticks: 0,
+            last_audio_frame: None,
+            audio_awaiting_place: false,
+            audio_unplaced: Vec::new(),
+            audio_unplaced_anchor: None,
             timeline_origin: origin_ticks.map(|ticks| ticks as i64),
             timelines_aligned: false,
             expected_pts: None,
@@ -767,7 +845,8 @@ impl Session {
         if let Some(first) = self.audio_first.take() {
             self.audio_start_pts = Some(first);
         }
-        let final_audio = self.adts.finish()?;
+        let read = self.adts.finish()?;
+        let final_audio = self.last_of_audio_stream(read);
         if self.audio_config.is_none() {
             self.audio_config = final_audio.first().map(|frame| frame.config.clone());
         }
@@ -792,40 +871,38 @@ impl Session {
         {
             match packet.kind {
                 ElementaryKind::Video => {
-                    if packet.damaged_previous_pes {
-                        self.pending_gops.extend(
-                            self.gops
-                                .take_complete_prefix_before_gap()
-                                .into_iter()
-                                .map(WaitingUnit::new),
-                        );
-                    }
                     // A discontinuity marker leaves the bytes on both sides of it
                     // whole and the stream broken, which the units after it have
-                    // to know. A loss of packets is told by `damaged_previous_pes`
-                    // above as well.
-                    if packet.discontinuity {
+                    // to know. A loss the splitter is told of with the bytes.
+                    if packet.time_base_break {
                         self.gops.note_break();
                     }
-                    let units = self.gops.push_with_restart(
-                        &packet.data,
-                        packet.pts,
-                        packet.restart_offset,
-                    );
+                    let units = self.gops.push(EsChunk {
+                        data: &packet.data,
+                        pes_start: packet.pes_start,
+                        pts: packet.pts,
+                        dts: packet.dts,
+                        restart_offset: packet.restart_offset,
+                        gap_before: packet.gap_before,
+                    });
                     self.pending_gops
                         .extend(units.into_iter().map(WaitingUnit::new));
                 }
                 ElementaryKind::Audio => {
+                    let switching = self.audio_pid.is_some_and(|pid| pid != packet.pid);
+                    // Framing taken up at the start of what was read lost
+                    // nothing where the sound itself begins anew.
+                    let begins = !packet.gap_before
+                        && (switching || self.audio_pid.is_none() || packet.time_base_break);
                     // Whatever the claim in hand turns out to be, its frames
                     // come before this packet's. A packet from another stream
                     // cannot confirm what the stream before it claimed, so
                     // the claim is not believed.
-                    if self.audio_pid.is_some_and(|pid| pid != packet.pid) {
+                    if switching {
                         self.lay_audio_claim_by_count();
-                    } else {
-                        self.settle_audio_claim(packet.pts);
                     }
-                    if packet.discontinuity {
+                    let break_reported = packet.gap_before || packet.time_base_break;
+                    if packet.time_base_break {
                         self.adts.discard_pending();
                     }
                     // A programme that moves its sound to another elementary
@@ -836,8 +913,11 @@ impl Session {
                     // and a browser's audio decoder refuses it outright rather
                     // than concealing it -- which ends playback. So the old
                     // stream is finished off before the new one begins.
-                    if self.audio_pid.is_some_and(|pid| pid != packet.pid) {
-                        let tail = self.adts.finish()?;
+                    if switching {
+                        let read = self.adts.finish()?;
+                        let tail = self.last_of_audio_stream(read);
+                        // The new stream's units are not the old one's to stand in for.
+                        self.last_audio_frame = None;
                         self.audio_clock_frames += tail.len() as u64;
                         self.pending_audio.extend(tail);
                         // The stream being joined carries the same moments as
@@ -846,27 +926,57 @@ impl Session {
                         self.audio_realigning = true;
                     }
                     self.audio_pid = Some(packet.pid);
-                    let mut frames = self.adts.push(&packet.data)?;
-                    // The newest, not the first ever: it is what a fragment
-                    // with no frames of its own is described by, and what the
-                    // frame count of the next one is measured in.
-                    if let Some(config) = frames.last().map(|frame| frame.config.clone()) {
-                        self.audio_config = Some(config);
+                    let output = self.adts.push(&packet.data, packet.gap_before)?;
+                    // A PES timestamp names the first access unit that begins
+                    // in the PES (ISO/IEC 13818-1 2.4.3.7), which comes after
+                    // any finished here that began in the PES before: those
+                    // are that many frames earlier. Taking it for the first
+                    // unit read would lay every such packet a frame late.
+                    let named = packet.pts.and(output.commencing);
+                    // The stretches of unbroken framing in what was read,
+                    // last first, each with whether it opens with a restart.
+                    let mut units = output.units;
+                    let mut stretches = Vec::new();
+                    for &restart in output.restarts.iter().rev() {
+                        let framing = if restart == 0 && begins {
+                            Framing::Begins
+                        } else {
+                            Framing::Recovers
+                        };
+                        stretches.push((restart, framing, units.split_off(restart)));
                     }
-                    let carried_frames = !frames.is_empty();
-                    self.conceal_audio_gap(packet.pts, packet.discontinuity, &mut frames);
-                    self.pending_audio.extend(frames);
-                    // The first timestamp of the sound places the whole track,
-                    // and nothing yet says it is right: the next packet that
-                    // carries one is measured against it. A packet with no
-                    // frame in it starts nothing the count can be measured
-                    // from, so it is not the first.
-                    if carried_frames
-                        && self.audio_start_pts.is_none()
-                        && self.audio_first.is_none()
-                    {
-                        self.audio_first = packet.pts;
-                        self.audio_first_prior = 0;
+                    if !units.is_empty() || stretches.is_empty() {
+                        stretches.push((0, Framing::Continues, units));
+                    }
+                    stretches.reverse();
+                    let last = stretches.len() - 1;
+                    let mut laid = Vec::with_capacity(stretches.len());
+                    for (index, (start, framing, units)) in stretches.into_iter().enumerate() {
+                        let count = units.len();
+                        let (frames, one_for_one) = self.stand_in_for_lost(units);
+                        // The unit named may be one this stretch has not
+                        // finished yet, but only in the last stretch.
+                        let anchor = named
+                            .filter(|&n| n >= start && (n < start + count || index == last))
+                            .filter(|_| one_for_one)
+                            .zip(packet.pts)
+                            .map(|(n, pts)| (n - start, pts));
+                        laid.push((framing, frames, anchor));
+                    }
+                    // The claim in hand is decided by this packet only where
+                    // its first frame carries on from the claim's and has its
+                    // place from this packet's timestamp.
+                    if !switching {
+                        let next = laid.first().and_then(|(framing, frames, anchor)| {
+                            let (position, pts) = (*anchor)?;
+                            let rate = frames.get(position).or(frames.last())?.config.sample_rate;
+                            (*framing == Framing::Continues && !self.audio_awaiting_place)
+                                .then(|| frames_before(pts, position, rate))
+                        });
+                        self.settle_audio_claim(next);
+                    }
+                    for (framing, frames, anchor) in laid {
+                        self.lay_audio(framing, frames, anchor, break_reported);
                     }
                 }
                 ElementaryKind::PrivateStream1 | ElementaryKind::PrivateStream2 => {
@@ -1069,6 +1179,146 @@ impl Session {
             self.audio_clock_frames = 0;
         }
         self.audio_clock_frames += frames.len() as u64;
+    }
+
+    /// The frames of what the ADTS reader gave, with one stood in for each
+    /// access unit lost to damage, in its place.
+    ///
+    /// A unit lost here still took its frame's time, and leaving it out would
+    /// move the rest of the packet up into it until the next timestamp put it
+    /// back. It is covered the way a hole the timestamps reveal is: a short run
+    /// with the unit after it -- or the one before, where the run ends what
+    /// was read -- and a longer one with silence.
+    ///
+    /// Also says whether the frames stand one for one for the units, which
+    /// they do unless a unit could not be covered at all.
+    fn stand_in_for_lost(&mut self, units: Vec<AacUnit>) -> (Vec<AacFrame>, bool) {
+        let mut frames = Vec::with_capacity(units.len());
+        let mut run = Vec::new();
+        let mut one_for_one = true;
+        for unit in units {
+            match unit {
+                AacUnit::Lost(config) => run.push(config),
+                AacUnit::Frame(frame) => {
+                    one_for_one &= cover_lost_run(&mut run, Some(&frame), &mut frames);
+                    frames.push(frame);
+                }
+            }
+        }
+        if !run.is_empty() {
+            let before = frames
+                .last()
+                .cloned()
+                .or_else(|| self.last_audio_frame.clone());
+            one_for_one &= cover_lost_run(&mut run, before.as_ref(), &mut frames);
+        }
+        if let Some(last) = frames.last() {
+            self.last_audio_frame = Some(last.clone());
+        }
+        (frames, one_for_one)
+    }
+
+    /// Lay down sound read in one stretch of unbroken framing, as `framing`
+    /// says it follows on, with `anchor` where a timestamp names one of its frames
+    /// (by position in `frames`, possibly past the end, and the timestamp).
+    ///
+    /// Where a frame goes is known from a timestamp, or from framing unbroken
+    /// back to a frame whose place is known. Framing taken up anew -- after a
+    /// loss, a new time base, or bytes that held no frame where one should
+    /// have begun -- continues nothing before it: what was lost is not known,
+    /// a joined-on run of later frames least of all. Laid down by count, those
+    /// frames would play early by however much was lost, and the hole would be
+    /// filled after them. So they wait for the next timestamp, which places
+    /// them as the frames just before the one it names, and the hole in front
+    /// of them is filled then. Framing broken again before that leaves them
+    /// with no place at all, and they are given up for the fill to cover.
+    /// Framing that begins with nothing lost starts afresh in place.
+    fn lay_audio(
+        &mut self,
+        framing: Framing,
+        frames: Vec<AacFrame>,
+        anchor: Option<(usize, u64)>,
+        break_reported: bool,
+    ) {
+        if framing != Framing::Continues {
+            self.audio_unplaced.clear();
+            self.audio_unplaced_anchor = None;
+            self.audio_awaiting_place = framing == Framing::Recovers;
+        }
+        if !self.audio_awaiting_place {
+            let pts = anchor.and_then(|(position, pts)| {
+                let rate = frames.get(position).or(frames.last())?.config.sample_rate;
+                Some(frames_before(pts, position, rate))
+            });
+            self.place_audio(pts, break_reported, frames);
+            return;
+        }
+        let held = self.audio_unplaced.len();
+        if let Some((position, pts)) = anchor {
+            self.audio_unplaced_anchor
+                .get_or_insert((held + position, pts));
+        }
+        self.audio_unplaced.extend(frames);
+        let anchored = self.audio_unplaced_anchor.and_then(|(position, pts)| {
+            let rate = self
+                .audio_unplaced
+                .get(position)
+                .or(self.audio_unplaced.last())?
+                .config
+                .sample_rate;
+            Some(frames_before(pts, position, rate))
+        });
+        if anchored.is_some() || self.audio_unplaced.len() > MAX_UNPLACED_AUDIO_FRAMES {
+            // A stream that goes on this long with no timestamp for its sound
+            // has stopped placing it, and counting is all that is left.
+            let frames = std::mem::take(&mut self.audio_unplaced);
+            self.audio_unplaced_anchor = None;
+            self.audio_awaiting_place = false;
+            self.place_audio(anchored, true, frames);
+        }
+    }
+
+    /// Lay frames whose first is at `pts`, or by count where that is not
+    /// known, into the track.
+    fn place_audio(&mut self, pts: Option<u64>, break_reported: bool, mut frames: Vec<AacFrame>) {
+        // The newest, not the first ever: it is what a fragment with no frames
+        // of its own is described by, and what the frame count of the next one
+        // is measured in.
+        if let Some(config) = frames.last().map(|frame| frame.config.clone()) {
+            self.audio_config = Some(config);
+        }
+        let carried_frames = !frames.is_empty();
+        self.conceal_audio_gap(pts, break_reported, &mut frames);
+        self.pending_audio.extend(frames);
+        // The first timestamp of the sound places the whole track, and nothing
+        // yet says it is right: the next packet that carries one is measured
+        // against it. A packet with no frame in it starts nothing the count can
+        // be measured from, so it is not the first.
+        if carried_frames && self.audio_start_pts.is_none() && self.audio_first.is_none() {
+            self.audio_first = pts;
+            self.audio_first_prior = 0;
+        }
+    }
+
+    /// The frames of the last read of a stream that ends, to be laid down by
+    /// count: those that carry on from sound already placed. What waits for a
+    /// timestamp gets none now and is given up -- unless nothing of the sound
+    /// has a place at all, when counting from the start is as good as any.
+    fn last_of_audio_stream(&mut self, read: AdtsOutput) -> Vec<AacFrame> {
+        let never_placed = self.audio_clock_start_pts.is_none();
+        let mut units = read.units;
+        if let Some(&restart) = read.restarts.first().filter(|_| !never_placed) {
+            units.truncate(restart);
+        }
+        let (frames, _) = self.stand_in_for_lost(units);
+        let unplaced = std::mem::take(&mut self.audio_unplaced);
+        self.audio_unplaced_anchor = None;
+        let awaiting = std::mem::replace(&mut self.audio_awaiting_place, false);
+        match (never_placed, awaiting) {
+            (true, _) => unplaced.into_iter().chain(frames).collect(),
+            (false, false) => frames,
+            (false, true) => Vec::new(),
+        }
     }
 
     /// Decide the claim in hand against the next packet of sound, which was

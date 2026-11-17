@@ -222,17 +222,26 @@ pub struct ElementaryPacket {
     pub kind: ElementaryKind,
     pub pid: u16,
     pub data: Vec<u8>,
+    /// Whether `data` opens a PES payload, so that `pts` and `dts` are its
+    /// header's. Audio or video cut by packet loss is handed on as two
+    /// packets: what arrived before the gap, which opens the PES, and what
+    /// arrived after it, which does not and has `gap_before` set.
+    pub pes_start: bool,
     /// The PES presentation timestamp in 90 kHz units, when one is present.
     /// Video and audio rarely start at the same timestamp in a broadcast
     /// stream, so this is what puts the two tracks on a common timeline.
     pub pts: Option<u64>,
-    /// Bytes belonging to this elementary stream were lost before this PES.
-    /// Stateful parsers discard unfinished access units before reading it.
-    pub discontinuity: bool,
-    /// The preceding PES itself lost bytes, so video parsing must finish or
-    /// discard its pending tail before reading this packet. The demuxer never
-    /// emits bytes received after the gap as part of that tail.
-    pub damaged_previous_pes: bool,
+    /// The PES decoding timestamp, which a header carries only where it
+    /// differs from the presentation timestamp: the anchor pictures of a
+    /// stream with B pictures.
+    pub dts: Option<u64>,
+    /// Bytes of this elementary stream were lost immediately before `data`:
+    /// the continuity counter skipped, a payload could not be read, or the PES
+    /// before ended short of or ran past the length its header declared.
+    pub gap_before: bool,
+    /// A discontinuity marker opened a new time base at or before this packet.
+    /// The bytes on either side of it are whole.
+    pub time_base_break: bool,
     /// Earliest recent program-table packet a new demuxer for the same service
     /// can start at and still discover this PES packet's PID.
     pub restart_offset: Option<u64>,
@@ -824,6 +833,23 @@ fn pes_pts(packet: &[u8]) -> Option<u64> {
     )
 }
 
+fn pes_dts(packet: &[u8]) -> Option<u64> {
+    if packet.len() < 19
+        || packet[3] == 0xbf
+        || packet[6] & 0xc0 != 0x80
+        || packet[7] & 0xc0 != 0xc0
+    {
+        return None;
+    }
+    Some(
+        (((packet[14] >> 1) & 0x07) as u64) << 30
+            | (packet[15] as u64) << 22
+            | (((packet[16] >> 1) & 0x7f) as u64) << 15
+            | (packet[17] as u64) << 7
+            | (packet[18] >> 1) as u64,
+    )
+}
+
 fn pes_payload(packet: &[u8], kind: ElementaryKind) -> Option<&[u8]> {
     if packet.len() < 9 || packet[0] != 0 || packet[1] != 0 || packet[2] != 1 {
         return None;
@@ -891,23 +917,50 @@ fn is_pes_start(packet: &[u8], kind: ElementaryKind) -> bool {
         && kind.accepts_stream_id(packet[3])
 }
 
+/// What the bytes a [`PesState`] holds are.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Held {
+    /// Nothing that can be handed on: no PES of this kind has opened since
+    /// the last one was handed on or given up.
+    #[default]
+    Nothing,
+    /// A PES packet, header first.
+    Pes,
+    /// The bytes that arrived after a gap in an open PES. They carry no header
+    /// of their own, and are handed on as what follows the gap.
+    Tail,
+}
+
 /// One elementary stream's PES packet as it accumulates across TS packets.
+///
+/// Sound and pictures lose only what was not received. Each parser after this
+/// one recovers at a point of its own -- the next AAC frame header, the next
+/// MPEG-2 slice -- and conceals what is gone, which a whole PES discarded for a
+/// lost packet would deny it: one lost packet would cost the whole picture or
+/// every frame of the PES. A private stream's PES is one caption or data unit
+/// that is read whole or not at all, so a cut one is still given up.
 #[derive(Default)]
 struct PesState {
     parts: Vec<u8>,
-    /// Whether the next complete PES follows a transport-stream continuity gap.
-    discontinuity_before: bool,
-    /// Whether packet loss cut the preceding PES rather than falling between PES packets.
-    damaged_before: bool,
-    started: bool,
+    held: Held,
+    /// The bytes just before the next packet handed on were lost.
+    gap_before: bool,
+    /// A discontinuity marker opened a new time base at or before the next
+    /// packet handed on.
+    time_base_break: bool,
     restart_offset: Option<u64>,
 }
 
 impl PesState {
-    /// Whether a bounded PES ended before reaching the length in its header.
+    /// Whether the PES being held is bounded and ended before reaching the
+    /// length in its header. The counter cannot tell when a multiple of
+    /// sixteen packets went missing, and a length that comes up short can.
     fn is_declared_pes_incomplete(&self) -> bool {
+        if self.held != Held::Pes {
+            return false;
+        }
         let Some(length) = self.parts.get(4..6) else {
-            return !self.parts.is_empty();
+            return true;
         };
         let length = u16::from_be_bytes([length[0], length[1]]) as usize;
         length != 0 && self.parts.len() < 6 + length
@@ -920,44 +973,57 @@ impl PesState {
         output: &mut Vec<ElementaryPacket>,
         fallback_pts: Option<u64>,
     ) {
-        if self.parts.is_empty() {
-            self.started = false;
-            self.restart_offset = None;
-            return;
-        }
-        let Some(data) = pes_payload(&self.parts, kind) else {
-            self.parts.clear();
-            self.started = false;
-            self.restart_offset = None;
-            return;
+        let restart_offset = self.restart_offset.take();
+        let packet = match std::mem::take(&mut self.held) {
+            Held::Nothing => None,
+            Held::Pes => pes_payload(&self.parts, kind).map(|data| ElementaryPacket {
+                kind,
+                pid,
+                data: data.to_vec(),
+                pes_start: true,
+                pts: pes_pts(&self.parts).or(fallback_pts),
+                dts: pes_dts(&self.parts),
+                gap_before: false,
+                time_base_break: false,
+                restart_offset,
+            }),
+            // An empty tail leaves the gap to be reported by what comes next.
+            Held::Tail if self.parts.is_empty() => None,
+            Held::Tail => Some(ElementaryPacket {
+                kind,
+                pid,
+                data: std::mem::take(&mut self.parts),
+                pes_start: false,
+                pts: None,
+                dts: None,
+                gap_before: false,
+                time_base_break: false,
+                restart_offset: None,
+            }),
         };
-        if !self.started {
-            self.parts.clear();
-            self.restart_offset = None;
-            return;
-        }
-        self.started = false;
-        let data = data.to_vec();
-        let pts = pes_pts(&self.parts).or(fallback_pts);
         self.parts.clear();
-        output.push(ElementaryPacket {
-            kind,
-            pid,
-            data,
-            pts,
-            discontinuity: std::mem::take(&mut self.discontinuity_before),
-            damaged_previous_pes: std::mem::take(&mut self.damaged_before),
-            restart_offset: self.restart_offset.take(),
-        });
+        if let Some(mut packet) = packet {
+            packet.gap_before = std::mem::take(&mut self.gap_before);
+            packet.time_base_break = std::mem::take(&mut self.time_base_break);
+            output.push(packet);
+        }
     }
 
-    /// Forget a PES cut by packet loss and mark the first complete replacement.
-    fn discard_at_discontinuity(&mut self) {
-        self.parts.clear();
-        self.started = false;
-        self.restart_offset = None;
-        self.discontinuity_before = true;
-        self.damaged_before = true;
+    /// Payload of this stream after what is held was lost or unreadable. What
+    /// arrived before the gap is handed on, and sound or pictures arriving
+    /// after it are held as the tail of the same PES.
+    fn cut(&mut self, kind: ElementaryKind, pid: u16, output: &mut Vec<ElementaryPacket>) {
+        let keeps_tail = matches!(kind, ElementaryKind::Video | ElementaryKind::Audio)
+            && self.held != Held::Nothing;
+        if keeps_tail {
+            self.flush(kind, pid, output, None);
+            self.held = Held::Tail;
+        } else {
+            self.parts.clear();
+            self.held = Held::Nothing;
+            self.restart_offset = None;
+        }
+        self.gap_before = true;
     }
 
     fn push(
@@ -971,41 +1037,52 @@ impl PesState {
         restart_offset: Option<u64>,
     ) {
         if payload.payload_unit_start {
-            let was_previous_pes_incomplete = self.is_declared_pes_incomplete();
-            let was_previous_pes_damaged = match continuity_change {
-                ContinuityChange::Loss => true,
-                ContinuityChange::Reset => was_previous_pes_incomplete,
-                ContinuityChange::None | ContinuityChange::Duplicate => false,
+            let cut_short = self.is_declared_pes_incomplete();
+            self.flush(kind, pid, output, fallback_pts);
+            match continuity_change {
+                ContinuityChange::Loss => self.gap_before = true,
+                ContinuityChange::Reset => self.time_base_break = true,
+                ContinuityChange::None | ContinuityChange::Duplicate => {}
+            }
+            self.gap_before |= cut_short;
+            self.held = if is_pes_start(payload.data, kind) {
+                Held::Pes
+            } else {
+                Held::Nothing
             };
-            // A partially received PES may still contain complete video units
-            // or AAC frames, so hand its usable prefix to the stateful parser.
-            if !self.parts.is_empty() {
-                self.flush(kind, pid, output, fallback_pts);
+            self.restart_offset = (self.held == Held::Pes).then_some(restart_offset).flatten();
+        } else {
+            match continuity_change {
+                ContinuityChange::Loss => self.cut(kind, pid, output),
+                // A clean marker within one PES changes the transport time
+                // base while leaving all elementary-stream bytes intact.
+                ContinuityChange::Reset => self.time_base_break = true,
+                ContinuityChange::None | ContinuityChange::Duplicate => {}
             }
-            self.parts.clear();
-            self.started = is_pes_start(payload.data, kind);
-            self.restart_offset = self.started.then_some(restart_offset).flatten();
-            if continuity_change != ContinuityChange::None {
-                self.discontinuity_before = true;
-                self.damaged_before |= was_previous_pes_damaged;
-            }
-        } else if continuity_change == ContinuityChange::Loss {
-            self.discard_at_discontinuity();
+        }
+        if self.held == Held::Nothing {
             return;
-        } else if continuity_change == ContinuityChange::Reset {
-            // A clean marker within one PES changes the transport time base
-            // while leaving all elementary-stream bytes intact.
-            self.discontinuity_before = true;
         }
         self.parts.extend_from_slice(payload.data);
-        if let Some(length) = pes_packet_length(&self.parts) {
-            if length == 0 {
-            } else if length + 6 == self.parts.len() {
-                self.flush(kind, pid, output, fallback_pts);
-            } else if length + 6 < self.parts.len() {
-                self.parts.clear();
-                self.started = false;
-                self.restart_offset = None;
+        if self.held != Held::Pes {
+            return;
+        }
+        let Some(length) = pes_packet_length(&self.parts).filter(|&length| length != 0) else {
+            return;
+        };
+        let end = 6 + length;
+        if self.parts.len() == end {
+            self.flush(kind, pid, output, fallback_pts);
+        } else if self.parts.len() > end {
+            // A PES ends with a transport packet: what is left of the packet
+            // is stuffing in its adaptation field (ISO/IEC 13818-1 2.4.3.5).
+            // Bytes past the declared length are therefore a later PES's,
+            // joined on by a loss of a multiple of sixteen packets that took
+            // that PES's header with it.
+            let rest = self.parts.split_off(end);
+            self.cut(kind, pid, output);
+            if self.held == Held::Tail {
+                self.parts = rest;
             }
         }
     }
@@ -1190,20 +1267,14 @@ impl MpegTsAvDemuxer {
                 if self.note_continuity(&packet) == ContinuityChange::Duplicate {
                     continue;
                 }
-                // A skipped payload leaves the PES on either side unrelated,
-                // so the next payload-unit start becomes the new assembly point.
-                self.discard_partial(packet.pid);
+                // A payload that cannot be read is as good as lost.
+                self.cut_partial(packet.pid, &mut output);
                 self.scrambled += 1;
                 continue;
             }
             let continuity_change = self.note_continuity(&packet);
             if continuity_change == ContinuityChange::Duplicate {
                 continue;
-            }
-            if continuity_change == ContinuityChange::Loss && !packet.payload_unit_start {
-                // Bytes after a continuity hole are the tail of a PES whose
-                // middle is gone, so the next complete PES becomes the recovery point.
-                self.discard_partial(packet.pid);
             }
             if self.program.wants(packet.pid) {
                 let prev_service = self.program.service;
@@ -1463,39 +1534,31 @@ impl MpegTsAvDemuxer {
         continuity_change
     }
 
-    /// Drop the unfinished PES owned by one PID after its payload loses continuity.
-    fn discard_partial(&mut self, pid: u16) {
+    /// Cut the PES open on one PID at a payload that could not be read.
+    fn cut_partial(&mut self, pid: u16, output: &mut Vec<ElementaryPacket>) {
         if self.program.video_pid == Some(pid) {
-            self.video.discard_at_discontinuity();
+            self.video.cut(ElementaryKind::Video, pid, output);
         }
         if self.program.audio_pid == Some(pid) {
-            self.audio.discard_at_discontinuity();
+            self.audio.cut(ElementaryKind::Audio, pid, output);
         }
-        if self
+        if let Some(stream) = self
             .superseded_video
             .as_mut()
-            .is_some_and(|stream| stream.pid == pid)
+            .filter(|stream| stream.pid == pid)
         {
-            self.superseded_video
-                .as_mut()
-                .expect("just matched")
-                .state
-                .discard_at_discontinuity();
+            stream.state.cut(ElementaryKind::Video, pid, output);
         }
-        if self
+        if let Some(stream) = self
             .superseded_audio
             .as_mut()
-            .is_some_and(|stream| stream.pid == pid)
+            .filter(|stream| stream.pid == pid)
         {
-            self.superseded_audio
-                .as_mut()
-                .expect("just matched")
-                .state
-                .discard_at_discontinuity();
+            stream.state.cut(ElementaryKind::Audio, pid, output);
         }
         for (stream, state) in &mut self.private {
             if stream.pid == pid {
-                state.discard_at_discontinuity();
+                state.cut(stream.kind(), pid, output);
             }
         }
     }

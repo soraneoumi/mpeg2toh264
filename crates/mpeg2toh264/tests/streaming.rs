@@ -5,18 +5,19 @@ mod support;
 
 use std::collections::HashMap;
 
-use mpeg2toh264::container::adts::AdtsStream;
+use mpeg2toh264::container::adts::{AacFrame, AacUnit, AdtsOutput, AdtsStream};
 use mpeg2toh264::mpeg2::constants::PictureType;
 use mpeg2toh264::mpeg2::gop_stream::Mpeg2Gop;
-use mpeg2toh264::mpeg2::gop_stream::Mpeg2GopStream;
+use mpeg2toh264::mpeg2::gop_stream::{DamagedPictures, EsChunk, Mpeg2GopStream};
 use mpeg2toh264::mpeg2::headers::parse_elementary_stream;
 use mpeg2toh264::{AudioGain, DualMono, Fragment, OpenGopRecovery, Session, SessionOptions};
 use support::{
-    adts_frame, adts_frame_with_payload, adts_stream, assert_decode_matches_passthrough, decode,
-    decoding, fragments_digest, init_segments, mux_programs, mux_transport_stream, mux_with_sound,
-    non_intra_matrix_extension, passthrough, passthrough_like_decode, picture_starts, read_fixture,
-    track_samples, with_extension_in_pictures, with_pts_shifted, wrap_mpeg2_es_in_ts, PesUnit,
-    TrackSample, AUDIO_PID, FIXTURES, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID,
+    adts_frame, adts_frame_filled, adts_frame_protected, adts_frame_with_payload, adts_stream,
+    assert_decode_matches_passthrough, decode, decoding, fragments_digest, init_segments,
+    mux_programs, mux_transport_stream, mux_with_sound, non_intra_matrix_extension, passthrough,
+    passthrough_like_decode, picture_starts, read_fixture, track_samples,
+    with_extension_in_pictures, with_pts_shifted, wrap_mpeg2_es_in_ts, PesUnit, TrackSample,
+    AUDIO_PID, FIXTURES, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID,
 };
 
 /// Offset of the first `00 00 01 B8` group header.
@@ -43,7 +44,7 @@ fn splits_a_stream_into_one_unit_per_group() {
     let mut units = Vec::new();
     // A chunk size that lines up with nothing, so boundaries fall mid-header.
     for chunk in stream.chunks(97) {
-        units.extend(splitter.push(chunk, None));
+        units.extend(splitter.push(EsChunk::new(chunk, None)));
     }
     units.extend(splitter.finish());
 
@@ -83,7 +84,7 @@ fn cuts_a_unit_where_the_description_changes_without_a_group_behind_it() {
     stream.extend_from_slice(&one);
 
     let mut splitter = Mpeg2GopStream::new();
-    let mut units = splitter.push(&stream, None);
+    let mut units = splitter.push(EsChunk::new(&stream, None));
     units.extend(splitter.finish());
 
     assert_eq!(
@@ -118,7 +119,7 @@ fn re_injects_the_sequence_header_a_later_unit_lacks() {
     stream.extend_from_slice(&one[first_gop_offset(&one)..]);
 
     let mut splitter = Mpeg2GopStream::new();
-    let mut units = splitter.push(&stream, None);
+    let mut units = splitter.push(EsChunk::new(&stream, None));
     units.extend(splitter.finish());
 
     assert_eq!(units.len(), 2);
@@ -147,7 +148,7 @@ fn gives_each_unit_the_timestamp_of_the_packet_that_opens_it() {
         .into_iter()
         .enumerate()
     {
-        units.extend(splitter.push(chunk, Some(900_000 + index as u64 * 15_000)));
+        units.extend(splitter.push(EsChunk::new(chunk, Some(900_000 + index as u64 * 15_000))));
     }
     units.extend(splitter.finish());
 
@@ -167,11 +168,10 @@ fn gives_each_unit_its_transport_restart_position() {
         .enumerate()
     {
         let restart = 9_500 + index as u64 * 1_000;
-        units.extend(splitter.push_with_restart(
-            chunk,
-            Some(900_000 + index as u64 * 15_000),
-            Some(restart),
-        ));
+        units.extend(splitter.push(EsChunk {
+            restart_offset: Some(restart),
+            ..EsChunk::new(chunk, Some(900_000 + index as u64 * 15_000))
+        }));
     }
     units.extend(splitter.finish());
 
@@ -189,9 +189,18 @@ fn restart_only_mark_does_not_hide_the_previous_timestamp() {
     let one = read_fixture("ibbp.m2v");
     let mut splitter = Mpeg2GopStream::new();
     let mut units = Vec::new();
-    units.extend(splitter.push_with_restart(&one, Some(900_000), Some(9_500)));
-    units.extend(splitter.push_with_restart(&one, None, Some(10_500)));
-    units.extend(splitter.push_with_restart(&one, Some(930_000), Some(11_500)));
+    units.extend(splitter.push(EsChunk {
+        restart_offset: Some(9_500),
+        ..EsChunk::new(&one, Some(900_000))
+    }));
+    units.extend(splitter.push(EsChunk {
+        restart_offset: Some(10_500),
+        ..EsChunk::new(&one, None)
+    }));
+    units.extend(splitter.push(EsChunk {
+        restart_offset: Some(11_500),
+        ..EsChunk::new(&one, Some(930_000))
+    }));
     units.extend(splitter.finish());
 
     assert_eq!(units.len(), 3);
@@ -199,16 +208,380 @@ fn restart_only_mark_does_not_hide_the_previous_timestamp() {
     assert_eq!(units[1].restart_offset, Some(10_500));
 }
 
+/// Every `00 00 01 <code>` start code in `data`, as offset and code byte.
+fn start_codes(data: &[u8]) -> Vec<(usize, u8)> {
+    (0..data.len().saturating_sub(3))
+        .filter(|&at| data[at..at + 3] == [0, 0, 1])
+        .map(|at| (at, data[at + 3]))
+        .collect()
+}
+
+fn is_slice(code: u8) -> bool {
+    (0x01..=0xaf).contains(&code)
+}
+
+/// Where each PES packet of `es` begins when it is sent the way a broadcast
+/// sends it, one coded frame to a packet: at the picture, or at the sequence
+/// and group headers in front of it.
+fn picture_packets(es: &[u8]) -> Vec<usize> {
+    let mut packets = Vec::new();
+    let mut headers = None;
+    let mut after_slice = true;
+    for (at, code) in start_codes(es) {
+        if code == 0 {
+            packets.push(headers.take().unwrap_or(at));
+        } else if !is_slice(code) && after_slice {
+            headers.get_or_insert(at);
+        }
+        after_slice = is_slice(code);
+    }
+    packets.push(es.len());
+    packets
+}
+
+/// The offset half way into the `index`th slice of the picture whose packet
+/// runs from `from` to `to`.
+fn inside_slice(es: &[u8], from: usize, to: usize, index: usize) -> usize {
+    let slices: Vec<usize> = start_codes(&es[from..to])
+        .into_iter()
+        .filter(|&(_, code)| is_slice(code))
+        .map(|(at, _)| from + at)
+        .collect();
+    let end = slices.get(index + 1).copied().unwrap_or(to);
+    (slices[index] + end) / 2
+}
+
+/// Three groups of `ibbp.m2v`, 25 frames a second, one picture to a PES
+/// packet, as one entry per packet: its bytes and its decode time.
+struct Broadcast {
+    es: Vec<u8>,
+    packets: Vec<usize>,
+}
+
+impl Broadcast {
+    fn new() -> Self {
+        let es = repeat_fixture("ibbp.m2v", 3);
+        let packets = picture_packets(&es);
+        Self { es, packets }
+    }
+
+    fn packet(&self, index: usize) -> std::ops::Range<usize> {
+        self.packets[index]..self.packets[index + 1]
+    }
+
+    /// The opening piece of packet `index`, up to `end`.
+    fn opening(&self, index: usize, end: usize) -> EsChunk<'_> {
+        let decode_time = 900_000 + index as u64 * FRAME_TICKS;
+        EsChunk {
+            data: &self.es[self.packets[index]..end],
+            pes_start: true,
+            pts: Some(decode_time),
+            dts: Some(decode_time),
+            restart_offset: None,
+            gap_before: false,
+        }
+    }
+
+    fn whole(&self, index: usize) -> EsChunk<'_> {
+        self.opening(index, self.packets[index + 1])
+    }
+
+    /// Bytes from `from` to `to` arriving after a loss, with no PES header.
+    fn tail(&self, from: usize, to: usize) -> EsChunk<'_> {
+        EsChunk {
+            gap_before: true,
+            ..EsChunk::new(&self.es[from..to], None)
+        }
+    }
+
+    fn pictures(&self) -> usize {
+        self.packets.len() - 1
+    }
+}
+
+/// Pictures in `units`, and the units' data one after another.
+fn unit_pictures(units: &[Mpeg2Gop]) -> (usize, Vec<u8>) {
+    let pictures = units
+        .iter()
+        .map(|unit| parse_elementary_stream(&unit.data).expect("parses").len())
+        .sum();
+    (
+        pictures,
+        units.iter().flat_map(|unit| unit.data.clone()).collect(),
+    )
+}
+
+fn contains(data: &[u8], wanted: &[u8]) -> bool {
+    data.windows(wanted.len()).any(|window| window == wanted)
+}
+
+const SEQUENCE_ERROR: [u8; 4] = [0, 0, 1, 0xb4];
+
+/// A loss inside a picture whose rest arrives before the next PES packet,
+/// which is the next picture: the cut slice ends at a sequence_error_code,
+/// the slices after the loss are the same picture's, and the group goes on.
+#[test]
+fn a_loss_inside_a_picture_keeps_the_rest_of_it_and_the_group() {
+    let broadcast = Broadcast::new();
+    let damaged = 4;
+    let packet = broadcast.packet(damaged);
+    let cut = inside_slice(&broadcast.es, packet.start, packet.end, 8);
+    let resume = inside_slice(&broadcast.es, packet.start, packet.end, 12);
+    let mut splitter = Mpeg2GopStream::new();
+    let mut units = Vec::new();
+    for index in 0..broadcast.pictures() {
+        if index == damaged {
+            units.extend(splitter.push(broadcast.opening(index, cut)));
+            units.extend(splitter.push(broadcast.tail(resume, packet.end)));
+        } else {
+            units.extend(splitter.push(broadcast.whole(index)));
+        }
+    }
+    units.extend(splitter.finish());
+
+    let (pictures, data) = unit_pictures(&units);
+    assert_eq!(pictures, broadcast.pictures());
+    let rest = [&SEQUENCE_ERROR[..], &broadcast.es[resume..packet.end]].concat();
+    assert!(
+        contains(&data, &rest),
+        "the rest of the picture follows the mark"
+    );
+    let truncated: usize = units
+        .iter()
+        .flat_map(|unit| parse_elementary_stream(&unit.data).expect("parses"))
+        .map(|picture| {
+            picture
+                .slices
+                .iter()
+                .filter(|slice| slice.truncated)
+                .count()
+        })
+        .sum();
+    assert_eq!(truncated, 1);
+    assert_eq!(
+        units.iter().filter(|unit| unit.after_break).count(),
+        1,
+        "only the first unit follows a break"
+    );
+}
+
+/// A loss that took the start of the next PES packet with it: the bytes after
+/// it are another picture's, whose header is gone, and what was lost may have
+/// opened a group. The cut picture goes out marked, and nothing more until
+/// the next group.
+#[test]
+fn a_loss_of_a_whole_picture_gives_up_the_rest_of_the_group() {
+    let broadcast = Broadcast::new();
+    let damaged = 4;
+    let packet = broadcast.packet(damaged);
+    let cut = inside_slice(&broadcast.es, packet.start, packet.end, 8);
+    let next = broadcast.packet(damaged + 1);
+    let resume = inside_slice(&broadcast.es, next.start, next.end, 12);
+    let mut splitter = Mpeg2GopStream::new();
+    let mut units = Vec::new();
+    for index in 0..broadcast.pictures() {
+        if index == damaged {
+            units.extend(splitter.push(broadcast.opening(index, cut)));
+            units.extend(splitter.push(broadcast.tail(resume, next.end)));
+        } else if index != damaged + 1 {
+            units.extend(splitter.push(broadcast.whole(index)));
+        }
+    }
+    units.extend(splitter.finish());
+
+    let (pictures, _) = unit_pictures(&units);
+    // The group of fifteen keeps the five up to the cut one.
+    assert_eq!(pictures, broadcast.pictures() - 10);
+    // The bytes after the loss are not joined on: the cut picture's unit ends
+    // at the mark.
+    assert!(units[0].data.ends_with(&SEQUENCE_ERROR));
+    assert_eq!(
+        units
+            .iter()
+            .map(|unit| unit.after_break)
+            .collect::<Vec<_>>(),
+        [true, true, false]
+    );
+}
+
+/// Slices after a loss that start again higher up than the one the loss cut
+/// are not the rest of that picture -- a second field whose header was lost
+/// starts again at the top -- even when the next packet is the next picture.
+#[test]
+fn slices_that_go_back_up_after_a_loss_are_not_the_rest_of_the_picture() {
+    let broadcast = Broadcast::new();
+    let damaged = 4;
+    let packet = broadcast.packet(damaged);
+    let cut = inside_slice(&broadcast.es, packet.start, packet.end, 8);
+    let resume = inside_slice(&broadcast.es, packet.start, packet.end, 3);
+    let mut splitter = Mpeg2GopStream::new();
+    let mut units = Vec::new();
+    for index in 0..broadcast.pictures() {
+        if index == damaged {
+            units.extend(splitter.push(broadcast.opening(index, cut)));
+            units.extend(splitter.push(broadcast.tail(resume, packet.end)));
+        } else {
+            units.extend(splitter.push(broadcast.whole(index)));
+        }
+    }
+    units.extend(splitter.finish());
+
+    let (pictures, _) = unit_pictures(&units);
+    assert_eq!(pictures, broadcast.pictures() - 10);
+}
+
+/// A loss right before a PES packet begins cuts the picture in front of it,
+/// and the next picture starts whole.
+#[test]
+fn a_loss_before_a_packet_begins_only_ends_the_picture_before_it() {
+    let broadcast = Broadcast::new();
+    let damaged = 4;
+    let packet = broadcast.packet(damaged);
+    let cut = inside_slice(&broadcast.es, packet.start, packet.end, 8);
+    let mut splitter = Mpeg2GopStream::new();
+    let mut units = Vec::new();
+    for index in 0..broadcast.pictures() {
+        if index == damaged {
+            units.extend(splitter.push(broadcast.opening(index, cut)));
+        } else if index == damaged + 1 {
+            units.extend(splitter.push(EsChunk {
+                gap_before: true,
+                ..broadcast.whole(index)
+            }));
+        } else {
+            units.extend(splitter.push(broadcast.whole(index)));
+        }
+    }
+    units.extend(splitter.finish());
+
+    let (pictures, data) = unit_pictures(&units);
+    assert_eq!(pictures, broadcast.pictures());
+    let next = broadcast.packet(damaged + 1);
+    let joined = [
+        &SEQUENCE_ERROR[..],
+        &broadcast.es[next.start..next.start + 32],
+    ]
+    .concat();
+    assert!(contains(&data, &joined));
+    assert_eq!(units.iter().filter(|unit| unit.after_break).count(), 1);
+}
+
+/// Cut into anchor units, a B picture that a loss ended just before the next
+/// anchor's packet keeps the mark that ends it: the mark belongs to the picture
+/// it cuts, not to the headers of the anchor after it.
+#[test]
+fn an_anchor_unit_keeps_the_mark_ending_the_b_picture_before_it() {
+    let broadcast = Broadcast::new();
+    let pictures = parse_elementary_stream(&broadcast.es[..broadcast.packets[15]]).expect("parses");
+    // A B picture coded right before an anchor.
+    let damaged = (1..14)
+        .find(|&index| {
+            pictures[index].header.picture_coding_type == PictureType::B
+                && pictures[index + 1].header.picture_coding_type != PictureType::B
+        })
+        .expect("the group has one");
+    let packet = broadcast.packet(damaged);
+    let cut = inside_slice(&broadcast.es, packet.start, packet.end, 8);
+    let mut splitter = Mpeg2GopStream::with_split_groups(true);
+    let mut units = Vec::new();
+    for index in 0..broadcast.pictures() {
+        if index == damaged {
+            units.extend(splitter.push(broadcast.opening(index, cut)));
+        } else if index == damaged + 1 {
+            units.extend(splitter.push(EsChunk {
+                gap_before: true,
+                ..broadcast.whole(index)
+            }));
+        } else {
+            units.extend(splitter.push(broadcast.whole(index)));
+        }
+    }
+    units.extend(splitter.finish());
+
+    let marked: Vec<&Mpeg2Gop> = units
+        .iter()
+        .filter(|unit| contains(&unit.data, &SEQUENCE_ERROR))
+        .collect();
+    assert_eq!(marked.len(), 1);
+    let truncated = parse_elementary_stream(&marked[0].data)
+        .expect("parses")
+        .iter()
+        .flat_map(|picture| picture.slices.iter())
+        .filter(|slice| slice.truncated)
+        .count();
+    assert_eq!(truncated, 1, "the cut slice ends at the mark");
+}
+
+/// What arrives after a loss at the very end of the input has nothing after it
+/// to say whose it is, and is left out.
+#[test]
+fn bytes_after_a_loss_at_the_end_of_the_input_are_left_out() {
+    let broadcast = Broadcast::new();
+    let damaged = broadcast.pictures() - 1;
+    let packet = broadcast.packet(damaged);
+    let cut = inside_slice(&broadcast.es, packet.start, packet.end, 8);
+    let resume = inside_slice(&broadcast.es, packet.start, packet.end, 12);
+    let mut splitter = Mpeg2GopStream::new();
+    let mut units = Vec::new();
+    for index in 0..damaged {
+        units.extend(splitter.push(broadcast.whole(index)));
+    }
+    units.extend(splitter.push(broadcast.opening(damaged, cut)));
+    units.extend(splitter.push(broadcast.tail(resume, packet.end)));
+    units.extend(splitter.finish());
+
+    let (pictures, data) = unit_pictures(&units);
+    assert_eq!(pictures, broadcast.pictures());
+    assert!(data.ends_with(&SEQUENCE_ERROR));
+}
+
+/// For a decoder whose handling of damage is not known, only whole pictures
+/// go out: those before the loss, then nothing until the next group, and no
+/// mark anywhere.
+#[test]
+fn dropping_damaged_pictures_keeps_only_whole_ones() {
+    let broadcast = Broadcast::new();
+    let damaged = 4;
+    let packet = broadcast.packet(damaged);
+    let cut = inside_slice(&broadcast.es, packet.start, packet.end, 8);
+    let resume = inside_slice(&broadcast.es, packet.start, packet.end, 12);
+    let mut splitter = Mpeg2GopStream::new().with_damaged_pictures(DamagedPictures::Drop);
+    let mut units = Vec::new();
+    for index in 0..broadcast.pictures() {
+        if index == damaged {
+            units.extend(splitter.push(broadcast.opening(index, cut)));
+            units.extend(splitter.push(broadcast.tail(resume, packet.end)));
+        } else {
+            units.extend(splitter.push(broadcast.whole(index)));
+        }
+    }
+    units.extend(splitter.finish());
+
+    let (pictures, data) = unit_pictures(&units);
+    assert_eq!(pictures, broadcast.pictures() - 11);
+    assert!(!contains(&data, &SEQUENCE_ERROR));
+    assert_eq!(
+        units
+            .iter()
+            .map(|unit| unit.after_break)
+            .collect::<Vec<_>>(),
+        [true, true, false]
+    );
+}
+
 #[test]
 fn transport_discontinuity_discards_both_pending_marks() {
     let one = read_fixture("ibbp.m2v");
     let mut splitter = Mpeg2GopStream::new();
     assert!(splitter
-        .push_with_restart(&one, Some(900_000), Some(9_500))
+        .push(EsChunk {
+            restart_offset: Some(9_500),
+            ..EsChunk::new(&one, Some(900_000))
+        })
         .is_empty());
     splitter.discard_pending();
 
-    let mut units = splitter.push_with_restart(&one, None, None);
+    let mut units = splitter.push(EsChunk::new(&one, None));
     units.extend(splitter.finish());
 
     assert_eq!(units.len(), 1);
@@ -222,7 +595,7 @@ fn holds_an_unfinished_group_back() {
     let mut splitter = Mpeg2GopStream::new();
     // One whole group is not enough: the splitter cannot know it has ended
     // until the next one starts.
-    assert!(splitter.push(&one, None).is_empty());
+    assert!(splitter.push(EsChunk::new(&one, None)).is_empty());
     assert_eq!(splitter.finish().len(), 1, "and it comes out at the end");
 }
 
@@ -238,6 +611,34 @@ fn packed_bits(bits: &str) -> Vec<u8> {
     out
 }
 
+/// An ADTS stream read for its frames, as most of these tests want it: the
+/// access units lost to damage are left out.
+trait ReadFrames {
+    fn read(&mut self, data: &[u8]) -> mpeg2toh264::Result<Vec<AacFrame>>;
+    fn read_rest(&mut self) -> mpeg2toh264::Result<Vec<AacFrame>>;
+}
+
+impl ReadFrames for AdtsStream {
+    fn read(&mut self, data: &[u8]) -> mpeg2toh264::Result<Vec<AacFrame>> {
+        self.push(data, false).map(frames_of)
+    }
+
+    fn read_rest(&mut self) -> mpeg2toh264::Result<Vec<AacFrame>> {
+        self.finish().map(frames_of)
+    }
+}
+
+fn frames_of(output: AdtsOutput) -> Vec<AacFrame> {
+    output
+        .units
+        .into_iter()
+        .filter_map(|unit| match unit {
+            AacUnit::Frame(frame) => Some(frame),
+            AacUnit::Lost(_) => None,
+        })
+        .collect()
+}
+
 #[test]
 fn strips_adts_headers_without_touching_the_payload() {
     let expected: Vec<Vec<u8>> = (0..4)
@@ -249,8 +650,8 @@ fn strips_adts_headers_without_touching_the_payload() {
     let stream: Vec<u8> = (0..4).flat_map(|i| adts_frame(3, 2, 32 + i)).collect();
 
     let mut adts = AdtsStream::new();
-    let mut frames = adts.push(&stream).expect("frames decode");
-    frames.extend(adts.finish().expect("nothing is left over"));
+    let mut frames = adts.read(&stream).expect("frames decode");
+    frames.extend(adts.read_rest().expect("nothing is left over"));
 
     assert_eq!(frames.len(), 4);
     for (frame, payload) in frames.iter().zip(&expected) {
@@ -266,7 +667,7 @@ fn strips_adts_headers_without_touching_the_payload() {
 fn takes_a_single_channel_element_with_no_channel_configuration() {
     // The empty SCE of the mono case, with the header saying nothing.
     let frame = adts_frame_with_payload(3, 0, &[0, 0, 0, 7]);
-    let frames = AdtsStream::new().push(&frame).expect("frame decodes");
+    let frames = AdtsStream::new().read(&frame).expect("frame decodes");
     let config = &frames[0].config;
     // Every single-element service comes out as a stereo pair, so the track
     // keeps one configuration however the broadcast switches about.
@@ -302,7 +703,7 @@ fn takes_either_service_of_a_dual_mono_stream() {
     let rebuilt = |gain| packed_bits(&format!("00100000{ics}{ics}111", ics = empty_ics(gain)));
 
     let mut main = AdtsStream::new();
-    let played = main.push(&frame).expect("the main service decodes");
+    let played = main.read(&frame).expect("the main service decodes");
     assert_eq!(played[0].data, rebuilt(0xa5));
     assert_eq!(played[0].config.channel_count, 2);
     assert!(
@@ -313,11 +714,11 @@ fn takes_either_service_of_a_dual_mono_stream() {
 
     let mut sub = AdtsStream::new();
     sub.select_dual_mono(DualMono::Sub);
-    let played = sub.push(&frame).expect("the second service decodes");
+    let played = sub.read(&frame).expect("the second service decodes");
     assert_eq!(played[0].data, rebuilt(0x5a));
     assert_eq!(
         played[0].config,
-        AdtsStream::new().push(&frame).expect("decodes")[0].config,
+        AdtsStream::new().read(&frame).expect("decodes")[0].config,
         "the two services are described identically, so nothing is redescribed"
     );
 
@@ -330,16 +731,18 @@ fn takes_either_service_of_a_dual_mono_stream() {
     );
     let mut asked = AdtsStream::new();
     asked.select_dual_mono(DualMono::Sub);
-    let played = asked.push(&mono).expect("the mono service decodes");
+    let played = asked.read(&mono).expect("the mono service decodes");
     assert_eq!(played[0].data, rebuilt(0x33));
     assert!(!asked.is_dual_mono());
 }
 
 #[test]
 fn takes_a_channel_pair_with_no_channel_configuration() {
-    let mut frame = adts_frame(3, 0, 16);
-    frame[7] = 0x20; // id_syn_ele=CPE
-    let frames = AdtsStream::new().push(&frame).expect("frame decodes");
+    let mut frame = adts_frame(3, 2, 16);
+    // channel_configuration zero, leaving the channel pair to say it.
+    frame[2] &= !1;
+    frame[3] &= 0x3f;
+    let frames = AdtsStream::new().read(&frame).expect("frame decodes");
     assert_eq!(frames[0].config.channel_count, 2);
     assert_eq!(frames[0].config.audio_specific_config, [0x11, 0x90]);
 }
@@ -357,7 +760,7 @@ fn raises_every_channels_global_gain_by_the_steps_asked_for() {
         let mut stream = AdtsStream::new();
         stream.set_audio_gain(gain);
         stream
-            .push(frame)
+            .read(frame)
             .expect("the frame decodes")
             .remove(0)
             .data
@@ -413,9 +816,416 @@ fn drops_a_frame_packet_loss_made_unreadable() {
     stream.extend_from_slice(&good);
 
     let mut adts = AdtsStream::new();
-    let mut frames = adts.push(&stream).expect("the readable frames decode");
-    frames.extend(adts.finish().expect("nothing is left over"));
+    let mut frames = adts.read(&stream).expect("the readable frames decode");
+    frames.extend(adts.read_rest().expect("nothing is left over"));
     assert_eq!(frames.len(), 3, "the damaged frame is not passed on");
+}
+
+/// Reads `stream` whole and returns the frames handed out and how many were
+/// given up as damaged.
+fn read_adts(stream: &[u8]) -> (Vec<AacFrame>, u64) {
+    let mut adts = AdtsStream::new();
+    let mut frames = adts.read(stream).expect("damage is not an error");
+    frames.extend(adts.read_rest().expect("nothing is left over"));
+    (frames, adts.lost_units())
+}
+
+/// A frame whose bytes after the first were replaced, as a loss of transport
+/// packets leaves one: the header still frames it, the block in it does not
+/// read. It is one access unit lost, for a mono service rebuilt as a pair as
+/// much as for stereo passed through, and the frames on either side of it go
+/// out as they were.
+#[test]
+fn a_frame_whose_body_was_replaced_is_lost_not_an_error() {
+    for channels in [1u8, 2] {
+        let good = adts_frame(3, channels, 32);
+        let mut damaged = good.clone();
+        // From the second byte of the block on: a global_gain, then an
+        // ics_info naming 63 bands, which no rate has.
+        damaged[8..].fill(0xff);
+        let stream = [good.clone(), damaged, good].concat();
+        let (frames, lost) = read_adts(&stream);
+        assert_eq!((frames.len(), lost), (2, 1), "{channels} channels");
+    }
+}
+
+/// A block that ends inside a fill element's escape count is lost, rather than
+/// read past the end of the frame it is in.
+#[test]
+fn a_block_cut_inside_a_fill_element_is_lost() {
+    let cut = [0xff, 0xf1, 0x4c, 0x40, 0x01, 0x1f, 0xfc, 0xde];
+    let stream = [cut.as_slice(), &adts_frame(3, 1, 16)].concat();
+    let (frames, lost) = read_adts(&stream);
+    assert_eq!((frames.len(), lost), (1, 1));
+}
+
+/// A frame is exactly as long as its block, so bytes after `ID_END` are what a
+/// frame cut short and run on into another's looks like.
+#[test]
+fn a_frame_longer_than_its_block_is_lost() {
+    let mut payload = adts_frame(3, 2, 16)[7..].to_vec();
+    payload.push(0);
+    let stream = [
+        adts_frame(3, 2, 16),
+        adts_frame_with_payload(3, 2, &payload),
+    ]
+    .concat();
+    let (frames, lost) = read_adts(&stream);
+    assert_eq!((frames.len(), lost), (1, 1));
+}
+
+/// The CRC a broadcast frame carries covers its header and the start of each
+/// channel element. A frame it fails for is lost; a fill element, which it does
+/// not cover, can say anything.
+#[test]
+fn a_frame_whose_crc_fails_is_lost() {
+    for channels in [1u8, 2, 6] {
+        let good = adts_frame_protected(3, channels, 40);
+        let (frames, lost) = read_adts(&good);
+        assert_eq!((frames.len(), lost), (1, 0), "{channels} channels read");
+        if channels != 1 {
+            assert_eq!(
+                frames[0].data,
+                good[9..],
+                "{channels} channels pass through"
+            );
+        }
+
+        // A bit of the first channel's global_gain, which reads either way.
+        let mut gain = good.clone();
+        gain[9 + 1] ^= 0x20;
+        // A bit of adts_buffer_fullness, which nothing else reads.
+        let mut header = good.clone();
+        header[5] ^= 0x01;
+        // A byte of fill.
+        let mut fill = good.clone();
+        let at = fill.len() - 3;
+        fill[at] ^= 0xff;
+        let (frames, lost) = read_adts(&[gain, header, fill].concat());
+        assert_eq!((frames.len(), lost), (1, 2), "{channels} channels");
+    }
+}
+
+/// A stream finished is over: what is read after it is another stream, as when
+/// a programme moves its sound to another elementary stream, and it is not
+/// held to the elements of the one before.
+#[test]
+fn the_stream_after_a_finished_one_is_read_as_its_own() {
+    let pair = |tag: &str| {
+        let empty = "0".repeat(22);
+        packed_bits(&format!("001{tag}0{empty}{empty}111"))
+    };
+    let first = adts_frame_with_payload(3, 2, &pair("0000"));
+    let second = adts_frame_with_payload(3, 2, &pair("0001"));
+    let mut adts = AdtsStream::new();
+    assert_eq!(
+        adts.read(&[first.clone(), first].concat())
+            .expect("reads")
+            .len(),
+        2
+    );
+    adts.read_rest().expect("nothing is left over");
+    let frames = adts
+        .read(&[second.clone(), second].concat())
+        .expect("reads");
+    assert_eq!(frames.len(), 2);
+    assert_eq!(adts.lost_units(), 0);
+}
+
+/// A broadcast that goes from stereo to 5.1 changes its header with its
+/// elements, and the frames after the change carry their own CRC: that is the
+/// service changing, not damage.
+#[test]
+fn a_change_of_configuration_with_its_crc_is_read() {
+    let stream = [
+        adts_frame_protected(3, 2, 32),
+        adts_frame_protected(3, 6, 40),
+        adts_frame_protected(3, 6, 40),
+        adts_frame_protected(3, 2, 32),
+    ]
+    .concat();
+    let (frames, lost) = read_adts(&stream);
+    assert_eq!(lost, 0);
+    let channels: Vec<u8> = frames
+        .iter()
+        .map(|frame| frame.config.channel_count)
+        .collect();
+    assert_eq!(channels, [2, 6, 6, 2]);
+}
+
+/// A data_stream_element is part of AAC-LC and is stepped over.
+#[test]
+fn reads_a_block_with_a_data_stream_element() {
+    let empty_pair = format!("001 0000 0 {} {}", "0".repeat(22), "0".repeat(22));
+    let payload = packed_bits(
+        &format!("{empty_pair} 100 0000 0 00000010 1010101111001101 111").replace(' ', ""),
+    );
+    let (frames, lost) = read_adts(&adts_frame_with_payload(3, 2, &payload));
+    assert_eq!((frames.len(), lost), (1, 0));
+    assert_eq!(frames[0].data, payload);
+}
+
+/// Every sampling rate the header can name is walked against its own bands.
+#[test]
+fn reads_every_sampling_rate() {
+    for index in 0..13u8 {
+        let (frames, lost) = read_adts(&adts_frame(index, 2, 32));
+        assert_eq!((frames.len(), lost), (1, 0), "index {index}");
+    }
+}
+
+/// Once a stream has been read, a header saying it is of another kind is
+/// damage to that header: what an ADTS stream is does not change frame by frame.
+#[test]
+fn a_header_of_another_kind_inside_a_stream_is_lost() {
+    let good = adts_frame(3, 2, 32);
+    let mut main = good.clone();
+    main[2] &= 0x3f; // profile 0, AAC Main
+    let mut blocks = good.clone();
+    blocks[6] |= 1; // two raw_data_blocks
+    let stream = [good.clone(), main, blocks, good].concat();
+    let (frames, lost) = read_adts(&stream);
+    assert_eq!((frames.len(), lost), (2, 2));
+}
+
+/// What a piece of the stream gave, as `F` for a frame and `L` for a unit
+/// lost, with where the first unit to begin in the piece is.
+fn shape(output: &AdtsOutput) -> (String, Option<usize>) {
+    let units = output
+        .units
+        .iter()
+        .map(|unit| match unit {
+            AacUnit::Frame(_) => 'F',
+            AacUnit::Lost(_) => 'L',
+        })
+        .collect();
+    (units, output.commencing)
+}
+
+/// A damaged frame stands in the stream as one lost access unit where it was,
+/// in the configuration the stream is in, so that what fills its place keeps
+/// the ones after it where they belong.
+#[test]
+fn a_damaged_frame_is_a_lost_unit_in_its_place() {
+    let good = adts_frame(3, 2, 32);
+    let mut damaged = good.clone();
+    damaged[8..].fill(0xff);
+    let mut adts = AdtsStream::new();
+    let output = adts
+        .push(&[good.clone(), damaged, good].concat(), false)
+        .expect("damage is not an error");
+    assert_eq!(shape(&output), ("FLF".into(), Some(0)));
+    let (AacUnit::Frame(frame), AacUnit::Lost(config)) = (&output.units[0], &output.units[1])
+    else {
+        unreachable!()
+    };
+    assert_eq!(*config, frame.config);
+}
+
+/// A loss in front of a piece cuts the frame being read when it fell. That
+/// frame's header was reached in step with the frames before it, so it is
+/// one access unit, lost; where nothing of a frame was held, nothing is.
+#[test]
+fn a_loss_cuts_the_frame_it_fell_in() {
+    let frame = adts_frame(3, 2, 32);
+    let half = frame.len() / 2;
+    let mut adts = AdtsStream::new();
+    let output = adts
+        .push(&[&frame[..], &frame[..half]].concat(), false)
+        .expect("reads");
+    assert_eq!(shape(&output), ("F".into(), Some(0)));
+    let output = adts.push(&frame, true).expect("reads");
+    assert_eq!(
+        shape(&output),
+        ("LF".into(), Some(1)),
+        "the cut frame began before"
+    );
+    assert_eq!(adts.lost_units(), 1);
+
+    let output = adts.push(&frame, true).expect("reads");
+    assert_eq!(shape(&output), ("F".into(), Some(0)), "nothing was cut");
+}
+
+/// Where the reader took up framing anew: the units that continue nothing
+/// before them, whose place only a timestamp can give.
+fn restarts(output: &AdtsOutput) -> &[usize] {
+    &output.restarts
+}
+
+/// The first frame a stream yields follows nothing; the ones after it, read
+/// in step, do -- a damaged one among them too, since its header was where
+/// the frame before ended and it keeps its place.
+#[test]
+fn framing_begins_with_the_first_frame_and_holds_over_damage_in_step() {
+    let good = adts_frame(3, 2, 32);
+    let mut damaged = good.clone();
+    damaged[8..].fill(0xff);
+    let mut adts = AdtsStream::new();
+    let output = adts.push(&good, false).expect("reads");
+    assert_eq!(restarts(&output), [0]);
+    let output = adts
+        .push(&[good.clone(), damaged, good].concat(), false)
+        .expect("reads");
+    assert_eq!(shape(&output).0, "FLF");
+    assert!(restarts(&output).is_empty());
+}
+
+/// Where a frame ends somewhere no header is, framing is searched for, and
+/// the first frame found again follows nothing.
+#[test]
+fn framing_taken_up_again_inside_a_piece_is_a_restart() {
+    let good = adts_frame(3, 2, 32);
+    let mut adts = AdtsStream::new();
+    adts.push(&good, false).expect("reads");
+    let output = adts
+        .push(&[&good[..], &[0; 50], &good, &good].concat(), false)
+        .expect("reads");
+    assert_eq!(shape(&output).0, "FFF");
+    assert_eq!(restarts(&output), [1]);
+}
+
+/// The frame a reported gap cut belongs to the framing before the gap; the
+/// first frame after it follows nothing.
+#[test]
+fn a_reported_gap_restarts_after_the_frame_it_cut() {
+    let frame = adts_frame(3, 2, 32);
+    let half = frame.len() / 2;
+    let mut adts = AdtsStream::new();
+    adts.push(&[&frame[..], &frame[..half]].concat(), false)
+        .expect("reads");
+    let output = adts.push(&frame, true).expect("reads");
+    assert_eq!(shape(&output).0, "LF");
+    assert_eq!(restarts(&output), [1]);
+}
+
+/// Framing lost at the end of one piece and found in the next is reported
+/// with the first unit found, in the piece that has it.
+#[test]
+fn a_restart_found_in_a_later_piece_is_reported_there() {
+    let good = adts_frame(3, 2, 32);
+    let mut adts = AdtsStream::new();
+    adts.push(&good, false).expect("reads");
+    let output = adts.push(&[0; 50], true).expect("reads");
+    assert!(output.units.is_empty() && output.restarts.is_empty());
+    let output = adts.push(&[0; 20], false).expect("reads");
+    assert!(output.units.is_empty() && output.restarts.is_empty());
+    let output = adts
+        .push(&[good.clone(), good].concat(), false)
+        .expect("reads");
+    assert_eq!(shape(&output).0, "FF");
+    assert_eq!(restarts(&output), [0]);
+}
+
+/// A new time base, and the end of a stream, begin framing again too.
+#[test]
+fn a_new_time_base_and_a_new_stream_restart_framing() {
+    let good = adts_frame(3, 2, 32);
+    let mut adts = AdtsStream::new();
+    adts.push(&good, false).expect("reads");
+    adts.discard_pending();
+    let output = adts.push(&good, false).expect("reads");
+    assert_eq!(restarts(&output), [0]);
+    adts.finish().expect("reads");
+    let output = adts.push(&good, false).expect("reads");
+    assert_eq!(restarts(&output), [0]);
+}
+
+/// A PES timestamp names the first access unit that begins in the packet, and
+/// a frame begun in the packet before it is finished before that one.
+#[test]
+fn says_which_unit_begins_in_the_piece() {
+    let frames = [
+        adts_frame(3, 2, 32),
+        adts_frame(3, 2, 33),
+        adts_frame(3, 2, 34),
+    ];
+    let stream = frames.concat();
+    let first = frames[0].len();
+    let split = first + 10;
+    let mut adts = AdtsStream::new();
+    let output = adts.push(&stream[..split], false).expect("reads");
+    assert_eq!(shape(&output), ("F".into(), Some(0)));
+    // The second frame began in the piece before; the third begins here.
+    let output = adts.push(&stream[split..], false).expect("reads");
+    assert_eq!(shape(&output), ("FF".into(), Some(1)));
+
+    // A piece holding the end of one frame and only the start of the next: the
+    // next is the unit after the one finished here, which a later piece ends.
+    let second = first + frames[1].len();
+    for head in [3, 10] {
+        let mut adts = AdtsStream::new();
+        adts.push(&stream[..split], false).expect("reads");
+        let output = adts
+            .push(&stream[split..second + head], false)
+            .expect("reads");
+        assert_eq!(shape(&output), ("F".into(), Some(1)), "{head} bytes of it");
+        let output = adts.push(&stream[second + head..], false).expect("reads");
+        assert_eq!(shape(&output), ("F".into(), None));
+    }
+
+    // A piece in the middle of a frame has no frame beginning in it.
+    let mut adts = AdtsStream::new();
+    adts.push(&stream[..first + 2], false).expect("reads");
+    let output = adts
+        .push(&stream[first + 2..first + 20], false)
+        .expect("reads");
+    assert_eq!(shape(&output), ("".into(), None));
+    let output = adts.finish().expect("reads");
+    assert_eq!(output.commencing, None);
+}
+
+/// A frame due in step inside the piece that is not there is the one the
+/// piece's timestamp names; the frame a search finds after it is a later one,
+/// so nothing in the piece is named by the timestamp.
+#[test]
+fn a_header_missing_where_it_was_due_leaves_nothing_named() {
+    let good = adts_frame(3, 2, 32);
+    let mut damaged = good.clone();
+    damaged[8..].fill(0xff);
+    let half = damaged.len() / 2;
+    let mut adts = AdtsStream::new();
+    let output = adts
+        .push(&[&good[..], &damaged[..half]].concat(), false)
+        .expect("reads");
+    assert_eq!(shape(&output), ("F".into(), Some(0)));
+    let output = adts
+        .push(&[&damaged[half..], &[0; 50], &good, &good].concat(), false)
+        .expect("reads");
+    assert_eq!(shape(&output), ("LFF".into(), None));
+    assert_eq!(restarts(&output), [1]);
+}
+
+/// A loss that falls inside a header leaves the header's first bytes where
+/// the next frame was due, followed by bytes from much later in the stream.
+/// What they say is not this stream's -- another profile, a frame length of
+/// its own -- and the frames after them are not swallowed waiting for it.
+#[test]
+fn a_header_cut_by_a_loss_does_not_swallow_the_frames_after_it() {
+    let good = adts_frame(3, 2, 32);
+    let mut adts = AdtsStream::new();
+    adts.push(&[good.clone(), good.clone()].concat(), false)
+        .expect("reads");
+    // A syncword, then fill bytes that read as profile 3 and 1807 bytes.
+    let cut = [0xff, 0xf0, 0xdf, 0xe0, 0xe1, 0xe2, 0xe3];
+    let output = adts
+        .push(&[&cut[..], &good, &good, &good].concat(), false)
+        .expect("reads");
+    assert_eq!(shape(&output), ("FFF".into(), None));
+    assert_eq!(restarts(&output), [0]);
+}
+
+/// A frame lost before the stream has said what it is has no configuration
+/// for a unit to stand in its place, and the timestamp of the piece it began
+/// in names it, so the piece says no unit begins in it.
+#[test]
+fn a_frame_lost_before_the_stream_is_known_stands_for_nothing() {
+    let good = adts_frame(3, 2, 32);
+    let mut damaged = good.clone();
+    damaged[8..].fill(0xff);
+    let output = AdtsStream::new()
+        .push(&[damaged, good.clone(), good].concat(), false)
+        .expect("damage is not an error");
+    assert_eq!(shape(&output), ("FF".into(), None));
 }
 
 #[test]
@@ -423,21 +1233,21 @@ fn a_transport_discontinuity_does_not_join_two_aac_frames() {
     // A continuity hole can cut one ADTS access unit between PES packets. The
     // next PES starts with a complete frame, and joining its bytes to the old
     // prefix creates a structurally plausible frame that a browser refuses.
-    // Discarding the parser's pending prefix makes the complete replacement
-    // frame the next unit handed to the decoder.
+    // A gap reported in front of the next piece drops the reader's pending
+    // prefix, which makes the complete replacement frame the next unit.
     let frame = adts_frame_with_payload(3, 6, &five_point_one_payload(0));
     let split = frame.len() / 2;
     let mut adts = AdtsStream::new();
     assert!(adts
-        .push(&frame[..split])
+        .push(&frame[..split], false)
         .expect("a partial frame is held")
+        .units
         .is_empty());
 
-    adts.discard_pending();
-    let frames = adts
-        .push(&frame)
+    let after = adts
+        .push(&frame, true)
         .expect("the complete frame after the hole decodes");
-    assert_eq!(frames.len(), 1);
+    assert!(matches!(after.units.as_slice(), [AacUnit::Frame(_)]));
 }
 
 /// What a hole in the sound is filled with. Every channel the configuration
@@ -450,7 +1260,7 @@ fn builds_silence_a_decoder_can_read_for_each_configuration() {
 
     for channels in [2u8, 6] {
         let config = AdtsStream::new()
-            .push(&adts_frame(3, channels, 16))
+            .read(&adts_frame(3, channels, 32))
             .expect("a frame of this configuration")[0]
             .config
             .clone();
@@ -461,7 +1271,7 @@ fn builds_silence_a_decoder_can_read_for_each_configuration() {
         // handed on is something this walker calls whole.
         let mut framed = adts_frame(3, channels, silence.data.len());
         framed[7..].copy_from_slice(&silence.data);
-        let read = AdtsStream::new().push(&framed).expect("silence decodes");
+        let read = AdtsStream::new().read(&framed).expect("silence decodes");
         assert_eq!(read.len(), 1, "{channels} channels");
         assert_eq!(read[0].data, silence.data);
         assert_eq!(read[0].config.channel_count, channels);
@@ -478,8 +1288,8 @@ fn reads_past_a_change_of_configuration() {
     stream.extend_from_slice(&adts_frame_with_payload(3, 6, &five_point_one_payload(0)));
 
     let mut adts = AdtsStream::new();
-    let mut frames = adts.push(&stream).expect("both configurations decode");
-    frames.extend(adts.finish().expect("nothing is left over"));
+    let mut frames = adts.read(&stream).expect("both configurations decode");
+    frames.extend(adts.read_rest().expect("nothing is left over"));
 
     assert_eq!(frames.len(), 4, "no frame is dropped at the change");
     assert_eq!(frames[0].config.channel_count, 2);
@@ -504,8 +1314,8 @@ fn drops_a_frame_whose_elements_are_not_the_streams() {
     stream.extend_from_slice(&good);
 
     let mut adts = AdtsStream::new();
-    let mut frames = adts.push(&stream).expect("decodes");
-    frames.extend(adts.finish().expect("nothing is left over"));
+    let mut frames = adts.read(&stream).expect("decodes");
+    frames.extend(adts.read_rest().expect("nothing is left over"));
     assert_eq!(frames.len(), 2, "the frame with a stray element tag goes");
 }
 
@@ -550,8 +1360,8 @@ fn steps_over_a_syncword_the_spectral_data_made() {
         stream.extend_from_slice(&adts_stream(4, 3, 2));
 
         let mut adts = AdtsStream::new();
-        let mut frames = adts.push(&stream).expect("the frames after it decode");
-        frames.extend(adts.finish().expect("nothing is left over"));
+        let mut frames = adts.read(&stream).expect("the frames after it decode");
+        frames.extend(adts.read_rest().expect("nothing is left over"));
         assert_eq!(frames.len(), 4, "cut {cut}");
     }
 }
@@ -566,7 +1376,7 @@ fn refuses_a_run_of_frames_that_are_not_aac_lc() {
     let stream: Vec<u8> = std::iter::repeat_n(frame, 4).flatten().collect();
 
     let error = AdtsStream::new()
-        .push(&stream)
+        .read(&stream)
         .expect_err("the stream is refused");
     assert!(error.to_string().contains("audio object type 3"), "{error}");
 }
@@ -577,9 +1387,9 @@ fn reassembles_frames_split_across_chunks() {
     let mut adts = AdtsStream::new();
     let mut frames = Vec::new();
     for chunk in stream.chunks(7) {
-        frames.extend(adts.push(chunk).expect("frames decode"));
+        frames.extend(adts.read(chunk).expect("frames decode"));
     }
-    frames.extend(adts.finish().expect("nothing is left over"));
+    frames.extend(adts.read_rest().expect("nothing is left over"));
     assert_eq!(frames.len(), 8);
 }
 
@@ -587,9 +1397,8 @@ fn reassembles_frames_split_across_chunks() {
 fn derives_the_audio_specific_config_from_the_header() {
     // 48 kHz stereo: object type 2, frequency index 3, channel configuration 2.
     let mut adts = AdtsStream::new();
-    let mut frame = adts_frame(3, 2, 16);
-    frame[7] = 0x20; // id_syn_ele=CPE
-    let frames = adts.push(&frame).expect("frame decodes");
+    let frame = adts_frame(3, 2, 16);
+    let frames = adts.read(&frame).expect("frame decodes");
     let config = &frames[0].config;
     assert_eq!(config.audio_object_type, 2);
     assert_eq!(config.sample_rate, 48_000);
@@ -602,7 +1411,7 @@ fn maps_mono_sce_to_primary_audio_on_both_stereo_channels() {
     // max_sfb=0 gives a valid empty ICS: SCE/tag 0, global_gain, ics_info,
     // three absent-tool flags, END and byte alignment.
     let frame = adts_frame_with_payload(3, 1, &[0, 0, 0, 7]);
-    let frames = AdtsStream::new().push(&frame).expect("mono frame decodes");
+    let frames = AdtsStream::new().read(&frame).expect("mono frame decodes");
     let config = &frames[0].config;
     assert_eq!(config.channel_count, 2);
     assert_eq!(config.audio_specific_config, [0x11, 0x90]);
@@ -616,15 +1425,21 @@ fn maps_mono_sce_to_primary_audio_on_both_stereo_channels() {
 /// went missing.
 #[test]
 fn the_rewrite_ends_the_block_at_id_end() {
-    // The empty SCE and ID_END of the mono case, then a byte of padding.
-    let frame = adts_frame_with_payload(3, 1, &[0, 0, 0, 7, 0]);
+    // A single channel element whose stream has eight short windows and no
+    // bands (26 bits), three empty fill elements and ID_END: 57 bits, which
+    // the encoder aligned with seven more.
+    let short_ics = "00000000 0 10 0 0000 0000000 000";
+    let payload = packed_bits(
+        &format!("000 0000 {short_ics} 110 0000 110 0000 110 0000 111 0000000").replace(' ', ""),
+    );
+    assert_eq!(payload.len(), 8);
     let frames = AdtsStream::new()
-        .push(&frame)
-        .expect("padded frame decodes");
-    // ID_CPE, tag, common_window, two 22-bit channel streams and ID_END: 55
-    // bits, which is seven bytes once aligned. Carrying the input's tail
-    // across would make it eight.
-    assert_eq!(frames[0].data.len(), 7);
+        .read(&adts_frame_with_payload(3, 1, &payload))
+        .expect("the padded frame decodes");
+    // ID_CPE, tag, common_window, two 26-bit channel streams, the fill
+    // elements and ID_END: 84 bits, which is eleven bytes once aligned.
+    // Carrying the input's seven bits of alignment across would make it twelve.
+    assert_eq!(frames[0].data.len(), 11);
 }
 
 /// A fill element's escape form spans `count + esc_count - 1` bytes, and
@@ -642,7 +1457,7 @@ fn reads_a_fill_element_written_with_an_escape_count_of_zero() {
     payload.push(0x0e);
     let frame = adts_frame_with_payload(3, 1, &payload);
     let frames = AdtsStream::new()
-        .push(&frame)
+        .read(&frame)
         .expect("the fill element is fourteen bytes, not fifteen");
     assert_eq!(frames[0].data[0] >> 5, 1, "SCE became a CPE");
     // ID_CPE, tag, common_window, two 22-bit channel streams, and the 130 bits
@@ -660,8 +1475,8 @@ fn accepts_mono_to_dual_mono_changes_when_the_primary_sce_is_stable() {
     // Two empty SCEs (tags 0 and 1) followed by END.
     let dual = adts_frame_with_payload(3, 2, &[0, 0, 0, 0, 0x10, 0, 0, 0x38]);
     let mut adts = AdtsStream::new();
-    let first = adts.push(&mono).expect("mono frame");
-    let second = adts.push(&dual).expect("dual-mono frame");
+    let first = adts.read(&mono).expect("mono frame");
+    let second = adts.read(&dual).expect("dual-mono frame");
     assert_eq!(first[0].config, second[0].config);
     assert_eq!(second[0].config.channel_count, 2);
     assert_eq!(second[0].data.len(), 7, "the secondary SCE is discarded");
@@ -674,14 +1489,13 @@ fn accepts_mono_to_dual_mono_changes_when_the_primary_sce_is_stable() {
 
 #[test]
 fn accepts_stereo_to_zero_config_dual_mono_changes() {
-    let mut stereo = adts_frame(3, 2, 16);
-    stereo[7] = 0x20; // ID_CPE
-                      // Two empty SCEs while channel_configuration is zero, as ARIB dual mono
-                      // signals itself after an ordinary stereo programme.
+    let stereo = adts_frame(3, 2, 16);
+    // Two empty SCEs while channel_configuration is zero, as ARIB dual mono
+    // signals itself after an ordinary stereo programme.
     let dual = adts_frame_with_payload(3, 0, &[0, 0, 0, 0, 0x10, 0, 0, 0x38]);
     let mut adts = AdtsStream::new();
-    assert_eq!(adts.push(&stereo).expect("stereo frame").len(), 1);
-    let frames = adts.push(&dual).expect("dual-mono frame");
+    assert_eq!(adts.read(&stereo).expect("stereo frame").len(), 1);
+    let frames = adts.read(&dual).expect("dual-mono frame");
 
     assert_eq!(
         frames.len(),
@@ -716,7 +1530,7 @@ fn reads_an_in_band_pce_when_adts_channel_configuration_is_zero() {
         "111",                           // ID_END
     ));
     let frame = adts_frame_with_payload(3, 0, &payload);
-    let frames = AdtsStream::new().push(&frame).expect("PCE frame decodes");
+    let frames = AdtsStream::new().read(&frame).expect("PCE frame decodes");
     assert_eq!(frames[0].config.channel_count, 2);
     assert_eq!(frames[0].config.audio_specific_config, [0x11, 0x90]);
     assert_eq!(frames[0].data[0] >> 5, 1, "the PCE/SCE became a CPE");
@@ -724,9 +1538,9 @@ fn reads_an_in_band_pce_when_adts_channel_configuration_is_zero() {
 
 #[test]
 fn preserves_an_implicit_five_point_one_configuration() {
-    let frame = adts_frame(3, 6, 16);
+    let frame = adts_frame(3, 6, 32);
     let expected = frame[7..].to_vec();
-    let frames = AdtsStream::new().push(&frame).expect("5.1 frame decodes");
+    let frames = AdtsStream::new().read(&frame).expect("5.1 frame decodes");
     assert_eq!(frames[0].config.channel_count, 6);
     assert_eq!(frames[0].config.audio_specific_config, [0x11, 0xb0]);
     assert_eq!(frames[0].data, expected, "5.1 payload passes through");
@@ -734,34 +1548,22 @@ fn preserves_an_implicit_five_point_one_configuration() {
 
 #[test]
 fn moves_an_explicit_five_point_one_pce_into_the_asc() {
-    let payload = packed_bits(concat!(
+    let mut payload = packed_bits(concat!(
         "101", // ID_PCE
-        "0000",
-        "01",
-        "0011", // tag, AAC-LC, 48 kHz
-        "0010",
-        "0000",
-        "0001",
-        "01",
-        "000",
-        "0000", // 2 front, 1 back, 1 LFE
-        "0",
-        "0",
-        "0", // no mixdown metadata
-        "0",
-        "0000", // front centre SCE 0
-        "1",
-        "0000", // front left/right CPE 0
-        "1",
-        "0001",                          // back left/right CPE 1
-        "0000",                          // LFE tag 0
-        "00000000",                      // no PCE comment (already byte aligned)
-        "00000000000000000000000000000", // first SCE; rest is opaque here
-        "111",                           // ID_END
+        "0000", "01", "0011", // tag, AAC-LC, 48 kHz
+        "0010", "0000", "0001", "01", "000", "0000", // 2 front, 1 back, 1 LFE
+        "0", "0", "0", // no mixdown metadata
+        "0", "0000", // front centre SCE 0
+        "1", "0000", // front left/right CPE 0
+        "1", "0001",     // back left/right CPE 1
+        "0000",     // LFE tag 0
+        "00000000", // no PCE comment (already byte aligned)
     ));
+    // The elements the PCE names, after it.
+    payload.extend_from_slice(&five_point_one_payload(0));
     let frame = adts_frame_with_payload(3, 0, &payload);
     let frames = AdtsStream::new()
-        .push(&frame)
+        .read(&frame)
         .expect("PCE 5.1 frame decodes");
     assert_eq!(frames[0].config.channel_count, 6);
     assert_eq!(&frames[0].config.audio_specific_config[..2], &[0x11, 0x80]);
@@ -778,7 +1580,7 @@ fn rejects_audio_that_is_not_aac_lc() {
     // profile the muxer will claim in its esds has to be refused up front.
     let mut frame = adts_frame(3, 2, 16);
     frame[2] &= 0x3f; // profile 0, i.e. AAC Main
-    let error = AdtsStream::new().push(&frame).expect_err("must fail");
+    let error = AdtsStream::new().read(&frame).expect_err("must fail");
     assert!(error.to_string().contains("audio object type 1"), "{error}");
 }
 
@@ -790,11 +1592,11 @@ fn drops_a_truncated_final_frame() {
     let stream = adts_stream(2, 3, 2);
     let mut adts = AdtsStream::new();
     let frames = adts
-        .push(&stream[..stream.len() - 4])
+        .read(&stream[..stream.len() - 4])
         .expect("frames decode");
     assert_eq!(frames.len(), 1, "the frame that did arrive whole");
     assert!(adts
-        .finish()
+        .read_rest()
         .expect("the partial frame is dropped")
         .is_empty());
 }
@@ -1669,9 +2471,11 @@ fn a_transport_hole_keeps_pictures_completed_before_the_missing_packet() {
         final_packet_missing, 23,
         "pictures bounded before a loss at the PES tail remain available"
     );
+    // The part of the PES before the hole is handed on whichever packet of it
+    // went missing, and the same pictures are complete before it.
     assert_eq!(
-        earlier_packet_missing, 19,
-        "an earlier loss retains only the shorter byte-complete prefix"
+        earlier_packet_missing, 23,
+        "a loss inside the PES keeps the pictures completed before it too"
     );
 }
 
@@ -1684,7 +2488,7 @@ fn a_transport_hole_still_uses_the_field_and_open_gop_rules() {
     // at two loss positions; the splitter does not duplicate their policy.
     for (name, copies, expected_tail, expected_earlier) in [
         ("hd1080i.m2v", 4, 45, 45),
-        ("open_gop_leading_bb.m2v", 2, 87, 83),
+        ("open_gop_leading_bb.m2v", 2, 87, 87),
     ] {
         let stream = video_stream_from_fixture(name, copies);
         let video_starts: Vec<usize> = stream
@@ -2015,17 +2819,14 @@ fn moving_the_sound_to_another_stream_does_not_splice_a_frame_across_the_change(
     );
 }
 
-/// A second sound stream, one AAC access unit of it, filled with a byte that
-/// says which stream it came from.
+/// A second sound stream, one AAC access unit of it, whose fill bytes say which
+/// stream it came from.
 ///
-/// The first byte is what makes it a channel pair rather than a single channel
-/// element, which is what keeps the frame passing through to the fragment
+/// It is a channel pair, which keeps the frame passing through to the fragment
 /// unchanged: a single channel element is rebuilt as a pair, and the rebuilt
 /// bytes are no longer the ones fed in.
 fn marked_adts_frame(mark: u8) -> Vec<u8> {
-    let mut payload = vec![mark; 32];
-    payload[0] = 0x20;
-    adts_frame_with_payload(3, 2, &payload)
+    adts_frame_filled(3, 2, 32, false, |_| mark)
 }
 
 /// A bilingual broadcast: one picture and two sounds, sent at once on streams
@@ -2873,7 +3674,7 @@ fn a_picture_whose_slot_an_earlier_unit_covered_is_dropped() {
 fn split_into_units(splitter: &mut Mpeg2GopStream, chunks: &[(&[u8], u64)]) -> Vec<Mpeg2Gop> {
     let mut units = Vec::new();
     for &(chunk, pts) in chunks {
-        units.extend(splitter.push(chunk, Some(pts)));
+        units.extend(splitter.push(EsChunk::new(chunk, Some(pts))));
     }
     units.extend(splitter.finish());
     units
@@ -3038,12 +3839,12 @@ fn does_not_cut_in_the_rest_of_a_group_after_a_gap() {
     let one = read_fixture("ibbp.m2v");
     let starts = picture_starts(&one);
     let mut splitter = Mpeg2GopStream::with_split_groups(true);
-    let mut units = splitter.push(&one[..starts[8]], None);
+    let mut units = splitter.push(EsChunk::new(&one[..starts[8]], None));
     // The tail of the group arrives after the gap, with picture starts of every
     // kind in it, and none of it is a unit: what it follows was lost.
     splitter.discard_pending();
-    units.extend(splitter.push(&one[starts[8]..], None));
-    units.extend(splitter.push(&one, None));
+    units.extend(splitter.push(EsChunk::new(&one[starts[8]..], None)));
+    units.extend(splitter.push(EsChunk::new(&one, None)));
     units.extend(splitter.finish());
 
     let types: Vec<Vec<PictureType>> = units.iter().map(picture_types).collect();
@@ -3070,10 +3871,10 @@ fn drops_the_rest_of_a_group_after_a_gap_at_the_end() {
     let starts = picture_starts(&one);
     for split_groups in [false, true] {
         let mut splitter = Mpeg2GopStream::with_split_groups(split_groups);
-        let mut units = splitter.push(&one[..starts[8]], None);
+        let mut units = splitter.push(EsChunk::new(&one[..starts[8]], None));
         splitter.discard_pending();
         // The input ends in the tail of the group the gap cut into.
-        units.extend(splitter.push(&one[starts[8]..], None));
+        units.extend(splitter.push(EsChunk::new(&one[starts[8]..], None)));
         units.extend(splitter.finish());
 
         let types: Vec<Vec<PictureType>> = units.iter().map(picture_types).collect();
@@ -3105,7 +3906,7 @@ fn keeps_a_stream_without_group_headers_to_the_end() {
     let headerless = [&one[..header], &one[next..]].concat();
     for split_groups in [false, true] {
         let mut splitter = Mpeg2GopStream::with_split_groups(split_groups);
-        let mut units = splitter.push(&headerless, None);
+        let mut units = splitter.push(EsChunk::new(&headerless, None));
         units.extend(splitter.finish());
         let pictures: usize = units.iter().map(|unit| picture_types(unit).len()).sum();
         assert_eq!(
@@ -3163,18 +3964,95 @@ fn decode_mode_is_the_passthrough_timeline_without_the_video() {
     }
 }
 
+/// Decode mode on a stream that lost pictures' bytes, against the same stream
+/// whole: every picture it hands out is shown where the whole stream shows it,
+/// the stream still ends where it did, and the sound is laid down at the same
+/// times for the same durations.
+///
+/// This is not the passthrough timeline. Decode mode conceals what a picture
+/// is missing and hands it out, where passthrough gives a platform decoder
+/// whole pictures only, so the two keep different pictures of a damaged group.
+fn assert_decode_mode_keeps_its_timeline(label: &str, lossy: &[u8], whole: &[u8]) {
+    let run = |stream: &[u8]| run_session_with_options(stream, 64 * 1024, decode());
+    let (lossy, whole) = (run(lossy), run(whole));
+    let shown = |fragments: &[Fragment]| -> Vec<f64> {
+        fragments
+            .iter()
+            .flat_map(|fragment| match fragment {
+                Fragment::Video { pictures, .. } => {
+                    pictures.iter().map(|picture| picture.time).collect()
+                }
+                _ => Vec::new(),
+            })
+            .collect()
+    };
+    let (kept, all) = (shown(&lossy), shown(&whole));
+    assert!(!kept.is_empty(), "{label}: pictures are handed out");
+    for time in &kept {
+        assert!(
+            all.iter().any(|shown| (shown - time).abs() < 1e-6),
+            "{label}: a picture at {time}s, where the whole stream shows none"
+        );
+    }
+    assert_eq!(kept.last(), all.last(), "{label}: the stream ends in place");
+    let sound = |fragments: &[Fragment]| -> Vec<(u64, u32)> {
+        track_samples(fragments)
+            .audio
+            .iter()
+            .map(|sample| (sample.decode_time, sample.duration))
+            .collect()
+    };
+    assert_eq!(sound(&lossy), sound(&whole), "{label}: the sound's timing");
+    assert_sound_in_place(
+        label,
+        &track_samples(&lossy).audio,
+        &track_samples(&whole).audio,
+    );
+}
+
+/// Every access unit of the sound of a damaged stream is the one the whole
+/// stream has in that slot, or stands in for one that was lost: silence, which
+/// is no frame of the stream, or a copy of the nearest frame on either side
+/// that is in its own slot. A frame of the stream anywhere else is sound played
+/// at the wrong time, which timing alone cannot show.
+fn assert_sound_in_place(label: &str, lossy: &[TrackSample], whole: &[TrackSample]) {
+    assert_eq!(lossy.len(), whole.len(), "{label}: as many access units");
+    let in_place = |index: usize| lossy[index].data == whole[index].data;
+    for (index, sample) in lossy.iter().enumerate() {
+        if in_place(index) || whole.iter().all(|frame| frame.data != sample.data) {
+            continue;
+        }
+        let before = (0..index).rev().find(|&at| in_place(at));
+        let after = (index + 1..lossy.len()).find(|&at| in_place(at));
+        assert!(
+            [before, after]
+                .into_iter()
+                .flatten()
+                .any(|at| whole[at].data == sample.data),
+            "{label}: access unit {index} holds a frame of the stream from elsewhere"
+        );
+    }
+}
+
 #[test]
 fn decode_mode_holds_over_holes_and_keeps_a_group_in_place_after_one() {
     let stream = timed_av_stream(10);
     let packets = stream.len() / 188;
     let lossy = with_packets_dropped(&stream, packets / 2, packets / 20);
-    assert_decode_mode_agrees("a hole", &lossy, passthrough());
+    assert_decode_mode_keeps_its_timeline("a hole", &lossy, &stream);
     // Single packets inside groups, which leave later units of the group
-    // lagging behind its display clock.
+    // lagging behind its display clock. A lost packet of sound is handled the
+    // same way in either mode, so there the passthrough timeline still holds.
     let mut cases = 0;
     for at in (packets / 3..packets * 2 / 3).step_by(41) {
         let lossy = with_packets_dropped(&stream, at, 1);
-        assert_decode_mode_agrees(&format!("packet {at} lost"), &lossy, passthrough());
+        let label = format!("packet {at} lost");
+        let packet = &stream[at * 188..];
+        if ((packet[1] & 0x1f) as u16) << 8 | packet[2] as u16 == VIDEO_PID {
+            assert_decode_mode_keeps_its_timeline(&label, &lossy, &stream);
+        } else {
+            assert_decode_mode_agrees(&label, &lossy, passthrough());
+        }
         cases += 1;
     }
     assert!(cases > 4);
@@ -3788,11 +4666,11 @@ fn units_carry_every_timestamp_that_begins_in_them_and_say_when_the_stream_broke
     assert!(units[1..].iter().all(|unit| !unit.after_break));
 
     let mut splitter = Mpeg2GopStream::with_split_groups(true);
-    let mut units = splitter.push(&one, Some(900_000));
+    let mut units = splitter.push(EsChunk::new(&one, Some(900_000)));
     let before = units.len();
     splitter.discard_pending();
-    units.extend(splitter.push(&one, Some(910_000)));
-    units.extend(splitter.push(&one, Some(920_000)));
+    units.extend(splitter.push(EsChunk::new(&one, Some(910_000))));
+    units.extend(splitter.push(EsChunk::new(&one, Some(920_000))));
     units.extend(splitter.finish());
     assert_eq!(
         units
@@ -4131,4 +5009,246 @@ fn a_first_timestamp_waiting_across_a_change_of_sample_rate_places_the_whole_tra
             assert_eq!(times(&damaged), times(&intact), "{shift} ticks");
         }
     }
+}
+
+// ------------------------------------------------- loss in a broadcast stream
+
+/// AAC frames of the stream [`broadcast_like_stream`] carries.
+const BROADCAST_AAC_FRAMES: usize = 160;
+
+/// A stream muxed the way an ISDB-T broadcaster muxes one: each picture in a
+/// PES of its own, and mono sound in PES of one fixed size that cut through its
+/// frames, each stamped with the first frame that begins in it (ISO/IEC
+/// 13818-1 2.4.3.7). The sound frames carry the CRC a broadcast's do, and no
+/// two of them are alike.
+fn broadcast_like_stream() -> Vec<u8> {
+    const BASE: u64 = 900_000;
+    const AAC_TICKS: u64 = 1024 * 90_000 / 48_000;
+    // Bytes of sound in a PES: four transport packets of 730 bytes, as a
+    // broadcaster sends them.
+    const SOUND_PER_PES: usize = 730 - 14;
+
+    let one = read_fixture("ip.m2v");
+    let period = u64::from(
+        mpeg2toh264::mpeg2_video_timeline(&one, false)
+            .expect("a timeline")
+            .sample_duration,
+    );
+    let es = one.repeat(6);
+    // A picture's PES opens with the sequence and group headers in front of
+    // it, so each cut is moved back to the first header of the run.
+    let mut cuts: Vec<usize> = Vec::new();
+    let mut run_start = None;
+    for at in 0..es.len() - 3 {
+        if es[at..at + 3] != [0, 0, 1] {
+            continue;
+        }
+        match es[at + 3] {
+            0xb3 | 0xb8 => {
+                run_start.get_or_insert(at);
+            }
+            0x00 => cuts.push(run_start.take().unwrap_or(at)),
+            _ => {}
+        }
+    }
+    cuts.push(es.len());
+    let pictures: Vec<&[u8]> = cuts.windows(2).map(|cut| &es[cut[0]..cut[1]]).collect();
+
+    let frames: Vec<Vec<u8>> = (0..BROADCAST_AAC_FRAMES)
+        .map(|index| {
+            adts_frame_filled(3, 1, 280 + index % 7 * 3, true, move |at| {
+                ((at + 7 * index) % 251) as u8
+            })
+        })
+        .collect();
+    let mut sound = Vec::new();
+    let mut frame_starts = Vec::new();
+    for frame in &frames {
+        frame_starts.push(sound.len());
+        sound.extend_from_slice(frame);
+    }
+    let sound_pes: Vec<(&[u8], u64)> = sound
+        .chunks(SOUND_PER_PES)
+        .enumerate()
+        .map(|(index, chunk)| {
+            let begin = index * SOUND_PER_PES;
+            let first = frame_starts
+                .iter()
+                .position(|&start| start >= begin)
+                .expect("a frame begins in every PES");
+            (chunk, BASE + first as u64 * AAC_TICKS)
+        })
+        .collect();
+
+    let mut units: Vec<(u64, PesUnit)> = pictures
+        .iter()
+        .enumerate()
+        .map(|(index, picture)| {
+            let pts = BASE + index as u64 * period;
+            let unit = PesUnit {
+                pid: VIDEO_PID,
+                stream_id: 0xe0,
+                pts: Some(pts),
+                payload: picture,
+            };
+            (pts, unit)
+        })
+        .collect();
+    units.extend(sound_pes.iter().map(|&(payload, pts)| {
+        let unit = PesUnit {
+            pid: AUDIO_PID,
+            stream_id: 0xc0,
+            pts: Some(pts),
+            payload,
+        };
+        (pts, unit)
+    }));
+    units.sort_by_key(|(pts, _)| *pts);
+    let units: Vec<PesUnit> = units.into_iter().map(|(_, unit)| unit).collect();
+    mux_transport_stream(
+        &[
+            (VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO),
+            (AUDIO_PID, STREAM_TYPE_AAC_ADTS),
+        ],
+        &units,
+        &mut HashMap::new(),
+    )
+}
+
+/// The indexes of the transport packets of `pid`, and whether each opens a PES.
+fn packets_on(stream: &[u8], pid: u16) -> Vec<(usize, bool)> {
+    stream
+        .chunks(188)
+        .enumerate()
+        .filter(|(_, packet)| ((packet[1] & 0x1f) as u16) << 8 | packet[2] as u16 == pid)
+        .map(|(index, packet)| (index, packet[1] & 0x40 != 0))
+        .collect()
+}
+
+/// `stream` with `count` packets of `pid` removed from its `first`-th on, and
+/// the counters of the rest renumbered: a multiple of sixteen lost leaves
+/// them running on, and so nothing at the transport says anything was lost.
+fn with_packets_of_pid_lost(stream: &[u8], pid: u16, first: usize, count: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(stream.len());
+    let mut seen = 0;
+    let mut counter = 0u8;
+    for packet in stream.chunks(188) {
+        if ((packet[1] & 0x1f) as u16) << 8 | packet[2] as u16 != pid {
+            out.extend_from_slice(packet);
+            continue;
+        }
+        seen += 1;
+        if (first + 1..=first + count).contains(&seen) {
+            continue;
+        }
+        let mut packet = packet.to_vec();
+        packet[3] = (packet[3] & 0xf0) | counter;
+        counter = (counter + 1) & 15;
+        out.extend_from_slice(&packet);
+    }
+    out
+}
+
+#[test]
+fn sound_cut_across_pes_is_laid_where_its_timestamps_put_it() {
+    // Each PES's timestamp is that of the first frame beginning in it, not of
+    // the frame finished first in it; taken for the latter, the count reads a
+    // frame short at every PES and covers a hole that is not there.
+    let stream = broadcast_like_stream();
+    for options in [passthrough(), decode()] {
+        let fragments = run_session_with_options(&stream, 64 * 1024, options);
+        let sound = track_samples(&fragments).audio;
+        assert_eq!(sound.len(), BROADCAST_AAC_FRAMES, "{:?}", options.video);
+        for (index, sample) in sound.iter().enumerate() {
+            assert_eq!(
+                sample.decode_time,
+                sound[0].decode_time + index as u64 * 1024,
+                "{:?}: frame {index}",
+                options.video
+            );
+        }
+    }
+}
+
+#[test]
+fn sixteen_lost_packets_of_sound_neither_end_the_stream_nor_move_it() {
+    // Sixteen packets leave the counter where it was, and a PES of fixed size
+    // that lost its header can come out at exactly its declared length, so the
+    // join reaches the frames themselves; it must cost only frames.
+    let stream = broadcast_like_stream();
+    let whole = track_samples(&run_session_with_options(&stream, 64 * 1024, passthrough()));
+    let timing = |samples: &[TrackSample]| -> Vec<(u64, u32)> {
+        samples
+            .iter()
+            .map(|sample| (sample.decode_time, sample.duration))
+            .collect()
+    };
+    let sound_packets = packets_on(&stream, AUDIO_PID).len();
+    let mut cases = 0;
+    for first in (8..sound_packets - 24).step_by(5) {
+        let lossy = with_packets_of_pid_lost(&stream, AUDIO_PID, first, 16);
+        for options in [passthrough(), decode()] {
+            let label = format!("{:?}, sixteen from {first}", options.video);
+            let mut session = Session::new(options);
+            let mut fragments = Vec::new();
+            for chunk in lossy.chunks(64 * 1024) {
+                fragments.extend(
+                    session
+                        .push(chunk)
+                        .unwrap_or_else(|error| panic!("{label}: {error}")),
+                );
+            }
+            fragments.extend(
+                session
+                    .finish()
+                    .unwrap_or_else(|error| panic!("{label}: {error}")),
+            );
+            let sound = track_samples(&fragments).audio;
+            assert_eq!(timing(&sound), timing(&whole.audio), "{label}");
+            assert_sound_in_place(&label, &sound, &whole.audio);
+            cases += 1;
+        }
+    }
+    assert!(cases > 10);
+}
+
+#[test]
+fn decode_mode_conceals_a_picture_that_lost_a_packet() {
+    // A lost packet inside a picture costs that picture its slices from there
+    // on, which the decoder conceals; the pictures after it are whole and are
+    // kept. Passthrough gives a platform decoder whole pictures only.
+    let stream = broadcast_like_stream();
+    let shown = |fragments: &[Fragment]| -> usize {
+        fragments
+            .iter()
+            .map(|fragment| match fragment {
+                Fragment::Video { pictures, .. } => pictures.len(),
+                _ => 0,
+            })
+            .sum()
+    };
+    let all = shown(&run_session_with_options(&stream, 64 * 1024, decode()));
+    let inside: Vec<usize> = packets_on(&stream, VIDEO_PID)
+        .into_iter()
+        .filter(|&(_, opens)| !opens)
+        .map(|(index, _)| index)
+        .collect();
+    let mut cases = 0;
+    for &at in inside.iter().skip(40).step_by(97) {
+        let lossy = with_packets_dropped(&stream, at, 1);
+        let label = format!("packet {at} lost");
+        assert_decode_mode_keeps_its_timeline(&label, &lossy, &stream);
+        let decoded = run_session_with_options(&lossy, 64 * 1024, decode());
+        assert_eq!(shown(&decoded), all, "{label}: every picture is kept");
+        let muxed = track_samples(&run_session_with_options(&lossy, 64 * 1024, passthrough()));
+        assert!(
+            muxed
+                .video
+                .iter()
+                .all(|sample| !sample.data.windows(4).any(|code| code == [0, 0, 1, 0xb4])),
+            "{label}: passthrough is not handed a picture marked as cut"
+        );
+        cases += 1;
+    }
+    assert!(cases > 4);
 }

@@ -361,6 +361,11 @@ pub struct Slice {
     pub data_start_bit: usize,
     /// Bit offset one past the last macroblock (start of the next start code).
     pub data_end_bit: Option<usize>,
+    /// Whether the slice was cut short where data was lost: it ends at a
+    /// `sequence_error_code`, which is how whoever read the stream in marks a
+    /// loss (ITU-T H.262 6.2.1). Its bits are good up to there, and the
+    /// macroblock they run out in is not whole.
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -558,11 +563,15 @@ pub fn parse_elementary_stream(data: &[u8]) -> Result<Vec<Picture>> {
     let mut saw_gop_header = false;
 
     for sc in &codes {
-        // A start code terminates whatever slice was in progress.
+        // A start code terminates whatever slice was in progress. The slices
+        // after a sequence_error_code are the rest of the same picture: a
+        // loss that took a picture header with it leaves nothing to resume at
+        // but the next one, which ends the picture in the ordinary way.
         if let Some(index) = current {
             if let Some(last) = pictures[index].slices.last_mut() {
                 if last.data_end_bit.is_none() {
                     last.data_end_bit = Some(sc.offset * 8);
+                    last.truncated = sc.code == start_code::SEQUENCE_ERROR;
                 }
             }
         }
@@ -646,6 +655,7 @@ pub fn parse_elementary_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 quantiser_scale_code,
                 data_start_bit: r.bit_pos(),
                 data_end_bit: None,
+                truncated: false,
             });
         }
     }
