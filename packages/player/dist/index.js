@@ -174,7 +174,7 @@ class b {
    * bytes that are no longer there.
    */
   reset() {
-    this.#c || (this.#d++, this.#h = [], this.#S = 0, this.#l = [], this.#b = !1, this.#D = !1, this.#u = !1, this.#v(), this.#t && (this.#y = !0), this.#O(!0), this.#p(), this.#E());
+    this.#c || (this.#d++, this.#h = [], this.#S = 0, this.#l = [], this.#b = !1, this.#D = !1, this.#u = !1, this.#v(), this.#t && (this.#y = !0), this.#B(!0), this.#p(), this.#E());
   }
   async finish() {
     if (this.#D = !0, this.#c || !this.#t) return;
@@ -190,7 +190,7 @@ class b {
     ), this.mediaSource.removeEventListener(
       "endstreaming",
       this.#C
-    )), this.#t?.removeEventListener("updateend", this.#L), this.#t?.removeEventListener("error", this.#W), this.#t = null, this.#h = [], this.#S = 0, this.#l = [], this.#s.abandon(), this.#O(!0));
+    )), this.#t?.removeEventListener("updateend", this.#L), this.#t?.removeEventListener("error", this.#W), this.#t = null, this.#h = [], this.#S = 0, this.#l = [], this.#s.abandon(), this.#B(!0));
   }
   /** Tell the sink where playback has got to, so it can evict what is behind. */
   setCurrentTime(e) {
@@ -215,7 +215,7 @@ class b {
     if (this.#u) return;
     const t = this.#h[0];
     if (!t) {
-      this.#O(!1);
+      this.#B(!1);
       return;
     }
     if (!(!t.init && this.#U())) {
@@ -353,7 +353,7 @@ class b {
     e !== this.#k && (this.#k = e, this.#r.onBlocked?.(e));
   }
   /** Wake `finish`, either because everything is appended or because we gave up. */
-  #O(e) {
+  #B(e) {
     if (!e && (!this.#D || this.#h.length > 0 || this.#a))
       return;
     const t = this.#R;
@@ -366,7 +366,7 @@ class b {
     );
   }
 }
-const w = "" + new URL("assets/worker-hZ2zdemf.js", import.meta.url).href, M = w, u = 0.1, f = [
+const w = "" + new URL("assets/worker-ByEefXv0.js", import.meta.url).href, M = w, u = 0.1, f = [
   "loadedmetadata",
   "loadeddata",
   "canplay",
@@ -679,7 +679,7 @@ class I extends EventTarget {
     });
   };
   /** Show a picture of the current run, and hand back one of an older run. */
-  #O(e, t) {
+  #B(e, t) {
     const i = this.#i?.decodedVideo;
     if (e !== this.#U || !i) {
       this.#G(t.data);
@@ -726,19 +726,19 @@ class I extends EventTarget {
           type: "module"
         }
       );
-      e.onmessage = this.#Z, e.onerror = (t) => this.#w(new Error(t.message || "the worker failed")), this.#n = e;
+      e.onmessage = this.#$, e.onerror = (t) => this.#w(new Error(t.message || "the worker failed")), this.#n = e;
     }
     return this.#n;
   }
-  #Z = (e) => {
+  #$ = (e) => {
     const t = e.data;
     if (t.id === this.#t)
       switch (t.type) {
         case "handle":
-          t.managed && this.#z(), this.video.srcObject = t.handle, this.#B("attached", a());
+          t.managed && this.#z(), this.video.srcObject = t.handle, this.#O("attached", a());
           break;
         case "open":
-          this.#$(t.mimeCodec, t.data);
+          this.#J(t.mimeCodec, t.data);
           break;
         case "video-config":
           this.#s || this.#C(
@@ -764,7 +764,7 @@ class I extends EventTarget {
           this.#_(), this.#o?.reset(), this.#s && this.#p();
           break;
         case "picture":
-          this.#O(t.epoch, t.picture);
+          this.#B(t.epoch, t.picture);
           break;
         case "pictures-end":
           this.#s && t.epoch === this.#U && this.#i?.decodedVideo?.finish();
@@ -786,7 +786,7 @@ class I extends EventTarget {
           this.#m(t.type, t.stream);
           break;
         case "mark":
-          this.#B(t.name, t.at);
+          this.#O(t.name, t.at);
           break;
         case "seek":
           this.#j(t.time);
@@ -818,11 +818,11 @@ class I extends EventTarget {
       }
   };
   /** Open a MediaSource here, for browsers that cannot have one in a worker. */
-  #$(e, t) {
+  #J(e, t) {
     const i = this.#t;
     let s;
     try {
-      s = this.#o ?? this.#J(i), s.holdStart(this.#y);
+      s = this.#o ?? this.#Z(i), s.holdStart(this.#y);
     } catch (r) {
       this.#w(o(r));
       return;
@@ -837,14 +837,14 @@ class I extends EventTarget {
       }
     );
   }
-  #J(e) {
+  #Z(e) {
     const t = new b({
       preferManaged: this.#e.preferManagedMediaSource,
       queueHighWaterMark: this.#e.queueHighWaterMark ?? 33554432,
       maxAheadSeconds: this.#e.maxAheadSeconds ?? 8,
       keepBehindSeconds: this.#e.keepBehindSeconds ?? 10,
       seek: (i) => this.#j(i),
-      onMark: (i) => this.#B(i, a()),
+      onMark: (i) => this.#O(i, a()),
       onReadyChange: (i) => this.#Q(e, { type: "flow", id: e, ready: i }),
       onBlocked: (i) => {
         e === this.#t && this.#A(i ? "buffer-full" : "converting");
@@ -853,7 +853,7 @@ class I extends EventTarget {
         e === this.#t && this.#w(i);
       }
     });
-    return this.#o = t, this.#h = URL.createObjectURL(t.mediaSource), t.managed ? this.#ee(this.#h) : this.video.src = this.#h, this.#B("attached", a()), this.#k !== null && t.setDuration(this.#k), t;
+    return this.#o = t, this.#h = URL.createObjectURL(t.mediaSource), t.managed ? this.#ee(this.#h) : this.video.src = this.#h, this.#O("attached", a()), this.#k !== null && t.setDuration(this.#k), t;
   }
   /**
    * Put a Managed Media Source on the element, which takes more than a `src`.
@@ -918,7 +918,7 @@ class I extends EventTarget {
     }));
   };
   #K = (e) => {
-    this.#g !== "idle" && (this.#B(e.type, a()), e.type === "waiting" && this.#ie());
+    this.#g !== "idle" && (this.#O(e.type, a()), e.type === "waiting" && this.#ie());
   };
   /**
    * Move the playhead over a hole in the media, where playback has stopped at
@@ -958,7 +958,7 @@ class I extends EventTarget {
    * reading the two contexts share; what a caller wants is how long it waited,
    * which is measured from here.
    */
-  #B(e, t) {
+  #O(e, t) {
     if (this.#l === 0) return;
     const i = t - this.#l, s = Math.max(0, t - this.#b);
     this.#b = Math.max(this.#b, t), this.#m("timing", { name: e, sinceLoad: i, sincePrevious: s });
