@@ -2,17 +2,36 @@
  * A steady estimate of the media element's playback position.
  *
  * `currentTime` is the position when the element last updated it, and some
- * browsers update it in steps of tens of milliseconds, so a reading is at or
- * a little behind the true position and never ahead of it. The clock runs on
+ * browsers update it in steps of tens of milliseconds, so while the element
+ * plays a reading is at or a little behind the true position and never ahead
+ * of it (as it starts it can be, see below). The clock runs on
  * the caller's wall clock at the playback rate and is pulled, slowly, towards
  * the highest reading of the last second relative to itself: the reading
  * taken nearest a step is the closest to the truth.
  *
- * After a hold the clock stays on the readings until two changes of the
- * reading in a row are as far apart as playing takes. One change is not
- * enough: an element that has been told to play may move its time by a few
- * milliseconds and then stand still for a tenth of a second before the sound
- * starts, and a clock started on that first change would run ahead of it.
+ * After a hold the clock stays on the readings until they show the element
+ * playing, and a start is shown only by the change after it. An element that
+ * has been told to play may move its time a little and then stand still
+ * before the sound starts: Chromium, for one, extrapolates the position from
+ * wall time from its first audio callback, before the device has played any
+ * of it, and then holds the position until the sound catches up. A clock
+ * started on that move runs ahead of the sound.
+ *
+ * Where the reading changes at every reading, the next reading settles the
+ * question, so the clock waits for it: it runs once two changes in a row
+ * have come at playing pace. Where the element updates its reading in steps,
+ * waiting costs a whole step: the readings between two updates stand still
+ * whether the element plays or not, so they cannot tell, and the pictures
+ * due in that step pass meanwhile. So a clock that has seen the reading stand
+ * between updates in all of its last second of running runs from the first
+ * change after a hold, and stops again if the next change is overdue or out
+ * of pace. A start taken back that way is not tried again until a start on
+ * two changes has confirmed that the element plays.
+ *
+ * A running clock stops when the reading stands longer than it has been
+ * seen to stand while the element played, and one reading more: the element
+ * has stopped, though it has not said so, and pictures shown on would run
+ * ahead of the sound.
  */
 export declare class MediaClock {
     #private;

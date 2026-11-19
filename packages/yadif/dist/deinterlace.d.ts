@@ -52,7 +52,8 @@ export interface DeinterlaceStats {
      * frame. Climbing during steady playback means the cadence is not holding.
      * (otya) With decoded pictures, times the media clock started again from
      * `currentTime`: after a seek, a pause, a rate change or a stall, or on a
-     * reading too far from it.
+     * reading too far from it. A start on the first change after a hold that
+     * the readings then take back counts, and so does the start after it.
      */
     resynced: number;
     /**
