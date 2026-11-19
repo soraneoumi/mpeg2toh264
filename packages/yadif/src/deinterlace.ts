@@ -161,6 +161,16 @@ const FILM_HOLD_FRAMES = 90;
 const LOOKAHEAD_REFRESHES = 1.5;
 
 /**
+ * How long before the next refresh the page reads the element's clock for a
+ * Worker renderer: the time allowed for its timer to fire late and for the
+ * message to reach the Worker before the Worker's own animation frame. Too
+ * little, and the reading misses that frame and is a refresh old when used;
+ * too much, and a change of the element's clock in the last part of the
+ * refresh waits a refresh to be seen.
+ */
+const CLOCK_LEAD_MS = 4;
+
+/**
  * Decoded pictures held before being taken in, per unit of playback rate.
  * About 0.8 s of 29.97 pictures: well above what the producer sends ahead.
  */
@@ -345,7 +355,8 @@ export interface DeinterlaceStats {
    * frame. Climbing during steady playback means the cadence is not holding.
    * (otya) With decoded pictures, times the media clock started again from
    * `currentTime`: after a seek, a pause, a rate change or a stall, or on a
-   * reading too far from it.
+   * reading too far from it. A start on the first change after a hold that
+   * the readings then take back counts, and so does the start after it.
    */
   resynced: number;
   /**
@@ -539,6 +550,23 @@ const moduleAnimationFrames: AnimationFrames = {
   cancelAnimationFrame: (handle) => cancelAnimationFrame(handle),
 };
 
+/**
+ * Somewhere timers come from: the window whose animation frames the loop
+ * follows. While a document picture-in-picture window shows the canvas, the
+ * page that opened it may be hidden and its timers held back; the
+ * picture-in-picture window's keep time.
+ */
+interface Timers {
+  setTimeout(handler: () => void, timeout: number): number;
+  clearTimeout(handle: number): void;
+}
+
+const moduleTimers: Timers = {
+  setTimeout: (handler, timeout) =>
+    setTimeout(handler, timeout) as unknown as number,
+  clearTimeout: (handle) => clearTimeout(handle),
+};
+
 /** An outstanding request, with the source that must be used to cancel it. */
 interface AnimationRequest {
   frames: AnimationFrames;
@@ -618,6 +646,10 @@ export class Deinterlacer extends EventTarget {
   #queue: Ready[] = [];
   /** The requestAnimationFrame() loop that puts them up, which is all that draws on the canvas. */
   #loopRequest: AnimationRequest | null = null;
+  /** The reading of the element's clock a Worker renderer is to be sent before its next frame. */
+  #clockPost: { timers: Timers; handle: number } | null = null;
+  /** When the last reading went to the Worker renderer. */
+  #clockPostedAt = Number.NEGATIVE_INFINITY;
   #lastLoopAt = 0;
   /** Deliver captured pictures on the page's refresh during faster playback. */
   #captureRequest: AnimationRequest | null = null;
@@ -827,6 +859,9 @@ export class Deinterlacer extends EventTarget {
    * The position when the page last became visible again, and the clock's
    * origin then. The position bounds what passed while it was hidden only for
    * as long as playback has been continuous since, which the origin tells.
+   * It is the element's own position where the clock has not caught up with
+   * it: a hidden page sends no readings, so playback resumed while it was
+   * hidden finds the clock still where the element was paused.
    */
   #unseenUntil = Number.NaN;
   #unseenOrigin = Number.NaN;
@@ -1304,6 +1339,7 @@ export class Deinterlacer extends EventTarget {
       worker.postMessage({
         type: "pageVisibility",
         hidden: true,
+        video: this.#workerVideoState(),
       } satisfies WorkerCommand);
   }
 
@@ -2329,9 +2365,14 @@ export class Deinterlacer extends EventTarget {
     this.#worker?.postMessage({
       type: "pageVisibility",
       hidden,
+      video: this.#workerVideoState(),
     } satisfies WorkerCommand);
     if (hidden) return;
-    this.#unseenUntil = this.#clock.at(performance.now());
+    const clock = this.#clock.at(performance.now());
+    const element = this.#video.currentTime;
+    this.#unseenUntil = Number.isNaN(clock)
+      ? element
+      : Math.max(clock, element);
     this.#unseenOrigin = this.#clock.origin;
   }
 
@@ -2373,8 +2414,62 @@ export class Deinterlacer extends EventTarget {
     this.#observeClock(this.#localTime(at, timeOrigin));
   }
 
+  /**
+   * Send the Worker renderer a reading of the element's clock just before its
+   * next animation frame.
+   *
+   * The Worker fills a refresh in its own frame, which comes at the same
+   * refresh as the page's and runs within a millisecond or so of it, before a
+   * message posted from the page's frame can arrive. A reading taken there is
+   * a refresh old by the time it is used; when it is the one that starts the
+   * clock, the pictures due in that refresh are not shown. Taken late in the
+   * refresh instead, the reading is used in the frame it was taken for.
+   *
+   * One reading per refresh, as before, and never two closer together than
+   * a refresh less the lead: the clock tells an element that plays from one
+   * that merely moves by the pace of readings taken about a refresh apart,
+   * and two taken together look like a jump. A reading still waiting when
+   * this frame comes (the page was busy past its time) goes now, unless a
+   * late timer has only just sent one; either way the next is set for the
+   * coming refresh.
+   */
+  #postClockBeforeRefresh(): void {
+    if (this.#clockPost !== null) {
+      this.#cancelClockPost();
+      this.#postSpacedClock();
+    }
+    const timers = this.#timerSource();
+    const due = this.#gridAt + this.#refreshMs - CLOCK_LEAD_MS;
+    const handle = timers.setTimeout(
+      () => {
+        this.#clockPost = null;
+        this.#postSpacedClock();
+      },
+      Math.max(0, due - performance.now()),
+    );
+    this.#clockPost = { timers, handle };
+  }
+
+  /** Send a reading unless the last one went less than a refresh less the lead ago. */
+  #postSpacedClock(): void {
+    if (
+      performance.now() - this.#clockPostedAt <
+      this.#refreshMs - CLOCK_LEAD_MS
+    )
+      return;
+    this.#postClock();
+  }
+
+  #cancelClockPost(): void {
+    const post = this.#clockPost;
+    if (post === null) return;
+    this.#clockPost = null;
+    post.timers.clearTimeout(post.handle);
+  }
+
   /** Send the page's reading of the element's clock to the Worker renderer. */
   #postClock(): void {
+    this.#clockPostedAt = performance.now();
     this.#worker?.postMessage({
       type: "clock",
       video: this.#workerVideoState(),
@@ -3500,6 +3595,7 @@ export class Deinterlacer extends EventTarget {
   #stopLoop(): void {
     this.#cancelAnimationRequest(this.#loopRequest);
     this.#loopRequest = null;
+    this.#cancelClockPost();
     this.#dropQueue();
   }
 
@@ -3511,7 +3607,7 @@ export class Deinterlacer extends EventTarget {
     if (this.#decoded) {
       if (this.#externalHost || this.#workerState === "main")
         this.#presentPictures();
-      else this.#postClock();
+      else this.#postClockBeforeRefresh();
     } else {
       this.#videoFrames.flush(now);
       if (!this.#frameIsCurrent(revision)) return;
@@ -3563,10 +3659,7 @@ export class Deinterlacer extends EventTarget {
     const externalHost = this.#externalHost;
     if (externalHost)
       return { frames: externalHost, origin: performance.timeOrigin };
-    const view =
-      this.#displayCanvas.ownerDocument?.defaultView ??
-      this.#video.ownerDocument?.defaultView ??
-      null;
+    const view = this.#ownerView();
     return view === null
       ? { frames: moduleAnimationFrames, origin: performance.timeOrigin }
       : { frames: view, origin: view.performance.timeOrigin };
@@ -3587,6 +3680,20 @@ export class Deinterlacer extends EventTarget {
       callback(this.#localTime(timestamp, origin)),
     );
     return { frames, handle };
+  }
+
+  /** Timers of the window the loop's animation frames come from. */
+  #timerSource(): Timers {
+    return this.#ownerView() ?? moduleTimers;
+  }
+
+  /** The window that composites the canvas, or null in none. */
+  #ownerView() {
+    return (
+      this.#displayCanvas.ownerDocument?.defaultView ??
+      this.#video.ownerDocument?.defaultView ??
+      null
+    );
   }
 
   /** Cancel a pending animation frame through the source that issued it. */

@@ -385,6 +385,9 @@ class FakeDocument {
     this.visibilityState = "visible";
     this.observers = new Set();
   }
+  get hidden() {
+    return this.visibilityState === "hidden";
+  }
   addEventListener(type, listener) {
     if (type === "visibilitychange") this.#listeners.add(listener);
   }

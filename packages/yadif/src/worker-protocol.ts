@@ -89,7 +89,8 @@ export type WorkerCommand =
       timeOrigin: number;
     }
   /** Whether the page showing the canvas is hidden, which a Worker cannot see. */
-  | { type: "pageVisibility"; hidden: boolean }
+  /** Whether the page showing the canvas is hidden, which a Worker cannot see, with the element's state then. */
+  | { type: "pageVisibility"; hidden: boolean; video: WorkerVideoState }
   | {
       type: "event";
       name:

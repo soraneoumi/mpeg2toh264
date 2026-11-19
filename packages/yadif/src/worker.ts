@@ -202,6 +202,7 @@ workerScope.onmessage = (event: MessageEvent<WorkerCommand>) => {
         deinterlacer.observeMediaClock(command.at, command.timeOrigin);
         break;
       case "pageVisibility":
+        video.update(command.video);
         deinterlacer.observePageVisibility(command.hidden);
         break;
       case "event":

@@ -19,6 +19,8 @@ import { build } from "esbuild";
 import { BASE_MS, buildBundles, run } from "./yadif-clock-harness.mjs";
 
 const FRAME = 1001 / 30000;
+/** The renderer's lead for the reading it sends a Worker; see deinterlace.ts. */
+const CLOCK_LEAD_MS = 4;
 const WIDTH = 13;
 const HEIGHT = 11;
 
@@ -48,11 +50,16 @@ function layout(width, height) {
 // Colour and chroma siting.
 
 async function conversionModule() {
+  return sourceModule("decoded-video.ts");
+}
+
+/** One module of the deinterlacer's sources, built on its own. */
+async function sourceModule(file) {
   const directory = await mkdtemp(join(tmpdir(), "yadif-decoded-"));
-  const outfile = join(directory, "decoded.mjs");
+  const outfile = join(directory, "module.mjs");
   try {
     await build({
-      entryPoints: [join(process.cwd(), "packages/yadif/src/decoded-video.ts")],
+      entryPoints: [join(process.cwd(), "packages/yadif/src", file)],
       outfile,
       bundle: true,
       format: "esm",
@@ -657,6 +664,389 @@ function playing(options) {
 const bundles = await buildBundles(process.cwd());
 
 await testConversion();
+
+// ---------------------------------------------------------------------------
+// The media clock on its own, with readings given at chosen times.
+
+{
+  const { MediaClock } = await sourceModule("media-clock.ts");
+  const READING_MS = 1000 / 60;
+
+  /** Feed `count` readings `READING_MS` apart from `wall`; returns the next wall time and the starts seen. */
+  function feed(clock, wall, count, reading, rate = 1) {
+    let starts = 0;
+    for (let index = 0; index < count; index++, wall += READING_MS)
+      if (clock.observe(wall, reading(wall), rate, true)) starts++;
+    return { wall, starts };
+  }
+
+  // A reading read as the element plays, with two readings taken 1.5 ms
+  // apart just as the element moves a little after a hold and then stands
+  // still: the reading has never stood between updates, so the clock does
+  // not take it for one that steps, and waits for changes at playing pace.
+  {
+    const clock = new MediaClock();
+    let { wall } = feed(clock, 1000, 70, (w) => 10 + (w - 1000) / 1000);
+    clock.hold();
+    const held = 10 + (wall - 1000) / 1000;
+    ({ wall } = feed(clock, wall, 2, () => held));
+    const started = clock.observe(
+      wall - READING_MS + 1.5,
+      held + 0.004,
+      1,
+      true,
+    );
+    assert.equal(started, false, "a continuous reading started on one move");
+    ({ wall } = feed(clock, wall, 7, () => held + 0.004));
+    assert.equal(clock.rate, 0, "the clock ran through the standstill");
+    const from = wall;
+    const { starts } = feed(
+      clock,
+      wall,
+      4,
+      (w) => held + 0.004 + (w - from) / 1000,
+    );
+    assert.equal(starts, 1, "the clock did not start when the element played");
+    console.log(
+      "ok clock, continuous reading: two readings close together start nothing",
+    );
+  }
+
+  // A reading in steps of 40 ms of media, then half the rate, then a seek.
+  // The steps are kept in media time, so at the new rate a step is seen to
+  // take twice the wall time and the clock, which starts on the first change
+  // after the seek, waits that long for the next before taking the start
+  // back. A stand kept in wall time would be half as long, and the start
+  // would be taken back before the next step came.
+  {
+    const clock = new MediaClock();
+    const stepped = (origin, start, rate) => (w) =>
+      start + 0.04 * Math.floor(((w - origin) * rate) / 40);
+    let { wall } = feed(clock, 1000, 70, stepped(1000, 10, 1));
+    clock.hold();
+    const changed = wall;
+    // Seek as soon as the clock runs at the new rate, before it has seen a
+    // step at that rate: what it knows of the steps is from before.
+    for (
+      let index = 0;
+      index < 40 && clock.rate !== 0.5;
+      index++, wall += READING_MS
+    )
+      clock.observe(wall, stepped(changed, 11, 0.5)(wall), 0.5, true);
+    assert.equal(clock.rate, 0.5, "the clock did not run at the new rate");
+    clock.hold();
+    ({ wall } = feed(clock, wall, 2, () => 20, 0.5));
+    const seeked = wall;
+    let firstChangeStarted = null;
+    let starts = 0;
+    let stopped = false;
+    for (let index = 0; index < 30; index++, wall += READING_MS) {
+      const reading =
+        20 + 0.01 + 0.04 * Math.floor(((wall - seeked) * 0.5) / 40);
+      const started = clock.observe(wall, reading, 0.5, true);
+      if (started) starts++;
+      if (firstChangeStarted === null && reading !== 20)
+        firstChangeStarted = started;
+      if (starts > 0 && clock.rate === 0) stopped = true;
+    }
+    assert.equal(
+      firstChangeStarted,
+      true,
+      "the clock waited for a second change",
+    );
+    assert.equal(starts, 1, `the clock started ${starts} times`);
+    assert.equal(stopped, false, "the start was taken back");
+    console.log(
+      "ok clock, stepped reading after a rate change: starts on the first change",
+    );
+  }
+
+  // Chromium at a start: the reading runs ahead with wall time for one audio
+  // callback, about 20 ms, while the device is still playing the silence it
+  // began with; then it is clamped where it got to until the sound, which
+  // starts from where the element was held, catches up. The clock does not
+  // run on the early move: it starts on the line the sound is on.
+  {
+    const clock = new MediaClock();
+    let { wall } = feed(clock, 1000, 70, (w) => 10 + (w - 1000) / 1000);
+    clock.hold();
+    const held = 20;
+    ({ wall } = feed(clock, wall, 2, () => held));
+    const resumed = wall;
+    const sound = resumed + 50;
+    const truth = (w) => held + Math.max(0, w - sound) / 1000;
+    const reading = (w) =>
+      w < resumed + READING_MS
+        ? held + 0.002
+        : Math.max(held + 0.019, truth(w));
+    let startedAt = null;
+    for (let index = 0; index < 20; index++, wall += READING_MS)
+      if (clock.observe(wall, reading(wall), 1, true) && startedAt === null)
+        startedAt = wall;
+    assert.ok(startedAt !== null, "the clock never started");
+    assert.ok(
+      startedAt > sound + 19,
+      "the clock started before the reading followed the sound",
+    );
+    const off = (clock.at(wall) - truth(wall)) * 1000;
+    assert.ok(Math.abs(off) <= 2, `${off.toFixed(2)} ms off the sound`);
+    console.log(
+      "ok clock, continuous reading that runs ahead and stands: starts with the sound",
+    );
+  }
+
+  // The element stops in mid-playback without saying so. A running clock
+  // stops once the reading has stood longer than it does between updates and
+  // one reading more, and runs again when the reading moves on: with a
+  // reading read as it plays, and with one in steps of 40 ms.
+  for (const [label, stepMs, standMs] of [
+    ["continuous", 0, 60],
+    ["stepped", 40, 120],
+  ]) {
+    const clock = new MediaClock();
+    const at = (origin, start) => (w) =>
+      start +
+      (stepMs === 0
+        ? (w - origin) / 1000
+        : 0.04 * Math.floor((w - origin) / stepMs));
+    let { wall } = feed(clock, 1000, 70, at(1000, 10));
+    assert.ok(clock.rate === 1, `${label}: the clock is not running`);
+    const stopAt = wall;
+    const stopped = at(1000, 10)(wall);
+    let ranAhead = 0;
+    let stops = 0;
+    for (; wall < stopAt + standMs; wall += READING_MS) {
+      clock.observe(wall, stopped, 1, true);
+      if (clock.rate === 0) stops++;
+      else ranAhead = Math.max(ranAhead, (clock.at(wall) - stopped) * 1000);
+    }
+    assert.ok(
+      stops > 0,
+      `${label}: the clock ran through a ${standMs} ms standstill`,
+    );
+    const bound = (stepMs === 0 ? 0 : 40) + 2 * READING_MS + 2;
+    assert.ok(
+      ranAhead <= bound,
+      `${label}: ${ranAhead.toFixed(1)} ms ahead before it stopped`,
+    );
+    const { starts } = feed(clock, wall, 12, at(wall, stopped));
+    assert.equal(
+      starts,
+      1,
+      `${label}: started ${starts} times after the standstill`,
+    );
+    console.log(
+      `ok clock, ${label} reading stands mid-playback: stopped within ${ranAhead.toFixed(1)} ms, started again once`,
+    );
+  }
+
+  // A stepped reading whose update comes late: the clock stops when it is
+  // overdue, and the late update, which moves as far as the time the reading
+  // stood, starts it again at once.
+  {
+    const clock = new MediaClock();
+    const stepped = (origin, start) => (w) =>
+      start + 0.04 * Math.floor((w - origin) / 40);
+    let { wall } = feed(clock, 1000, 70, stepped(1000, 10));
+    const last = stepped(1000, 10)(wall);
+    // The update due next is held back for 100 ms; then the reading is where
+    // playing would have taken it.
+    const resumeAt = wall + 100;
+    let stopped = false;
+    for (; wall < resumeAt; wall += READING_MS) {
+      clock.observe(wall, last, 1, true);
+      if (clock.rate === 0) stopped = true;
+    }
+    assert.ok(stopped, "the clock ran on past the overdue update");
+    // The reading is where playing took it while the update was held back.
+    const started = clock.observe(wall, stepped(1000, 10)(wall), 1, true);
+    assert.equal(
+      started,
+      true,
+      "the late update did not start the clock again",
+    );
+    console.log(
+      "ok clock, stepped reading with a late update: starts again at once",
+    );
+  }
+
+  // A reading read as the element plays that once happened to repeat is not
+  // taken for one that steps: after a hold the clock still waits for changes
+  // at playing pace and does not run on the first.
+  {
+    const clock = new MediaClock();
+    let wall = 1000;
+    for (let index = 0; index < 70; index++, wall += READING_MS) {
+      const w = index === 40 ? wall - READING_MS : wall;
+      clock.observe(wall, 10 + (w - 1000) / 1000, 1, true);
+    }
+    clock.hold();
+    const held = 20;
+    ({ wall } = feed(clock, wall, 2, () => held));
+    const from = wall;
+    const started = clock.observe(wall, held + READING_MS / 1000, 1, true);
+    assert.equal(
+      started,
+      false,
+      "one repeated reading made the reading stepped",
+    );
+    const { starts } = feed(
+      clock,
+      wall + READING_MS,
+      4,
+      (w) => held + (w - from) / 1000 + READING_MS / 1000,
+    );
+    assert.equal(
+      starts,
+      1,
+      "the clock did not start on changes at playing pace",
+    );
+    console.log(
+      "ok clock, one repeated reading: still waits for changes at playing pace",
+    );
+  }
+
+  // A stepped reading after the rate falls: the steps are as long in media
+  // time as before and so take longer, and each was seen a whole number of
+  // readings, up to a reading short of the step. The first longer stand stops
+  // the clock; the update that ends it moves at playing pace over the whole
+  // stand, which is then known, and the clock plays on without stopping
+  // again, wherever the updates fall between the readings.
+  for (const [from, to] of [
+    [1.25, 0.5],
+    [1.5, 0.25],
+  ]) {
+    let mostStoppedMs = 0;
+    for (let phase = 0; phase < 10; phase++) {
+      const clock = new MediaClock();
+      const offset = (phase * READING_MS) / 10;
+      const stepped = (origin, start, rate) => (w) =>
+        start + 0.04 * Math.floor(((w - origin - offset) * rate) / 40);
+      let { wall } = feed(clock, 1000, 70, stepped(1000, 10, from), from);
+      const changed = wall;
+      const start = stepped(1000, 10, from)(wall);
+      // Once the clock has run at the new rate, every reading it spends
+      // stopped counts.
+      let running = false;
+      let stoppedMs = 0;
+      for (let index = 0; index < 240; index++, wall += READING_MS) {
+        clock.observe(wall, stepped(changed, start, to)(wall), to, true);
+        if (clock.rate > 0) running = true;
+        else if (running) stoppedMs += READING_MS;
+      }
+      mostStoppedMs = Math.max(mostStoppedMs, stoppedMs);
+    }
+    assert.ok(
+      mostStoppedMs <= 4 * READING_MS,
+      `rate ${from} to ${to}: stopped for ${mostStoppedMs.toFixed(0)} ms of 4 s`,
+    );
+    console.log(
+      `ok clock, stepped reading from rate ${from} to ${to}: stopped ${mostStoppedMs.toFixed(0)} ms at most, then played on`,
+    );
+  }
+
+  // A start still to be confirmed, where the reading steps, followed by a
+  // change too small for playing: the element only moved a little, and the
+  // start is taken back.
+  {
+    const clock = new MediaClock();
+    const stepped = (origin, start) => (w) =>
+      start + 0.04 * Math.floor((w - origin) / 40);
+    let { wall } = feed(clock, 1000, 70, stepped(1000, 10));
+    clock.hold();
+    const held = 20;
+    ({ wall } = feed(clock, wall, 2, () => held));
+    const started = clock.observe(wall, held + 0.01, 1, true);
+    assert.equal(
+      started,
+      true,
+      "a stepped reading did not start on its first change",
+    );
+    ({ wall } = feed(clock, wall + READING_MS, 1, () => held + 0.01));
+    clock.observe(wall, held + 0.012, 1, true);
+    assert.equal(
+      clock.rate,
+      0,
+      "a start followed by a change too small for playing held",
+    );
+    console.log("ok clock, start followed by too small a change: taken back");
+  }
+
+  // A reading read as the element plays stands in mid-playback and then
+  // jumps to where playing would have taken it: an update that came late.
+  // The clock, stopped on the standstill, waits for the change after, which
+  // shows the element playing, and is then where the element is.
+  {
+    const clock = new MediaClock();
+    const playing = (w) => 10 + (w - 1000) / 1000;
+    let { wall } = feed(clock, 1000, 70, playing);
+    const stuck = playing(wall);
+    const stuckAt = wall;
+    for (; wall < stuckAt + 60; wall += READING_MS)
+      clock.observe(wall, stuck, 1, true);
+    assert.equal(clock.rate, 0, "the clock ran through the standstill");
+    const late = clock.observe(wall, playing(wall), 1, true);
+    assert.equal(
+      late,
+      false,
+      "a continuous reading started on one late update",
+    );
+    wall += READING_MS;
+    const next = clock.observe(wall, playing(wall), 1, true);
+    assert.equal(
+      next,
+      true,
+      "the change after the late update did not start the clock",
+    );
+    const off = (clock.at(wall + 50) - playing(wall + 50)) * 1000;
+    assert.ok(Math.abs(off) <= 2, `${off.toFixed(2)} ms off the element`);
+    console.log(
+      "ok clock, continuous reading with a late update: starts on the change after",
+    );
+  }
+
+  // Chromium's early move spread over three readings at playing pace: the
+  // clock does run on it, and stops again two readings into the standstill
+  // that follows; when the sound comes it starts on the sound.
+  {
+    const clock = new MediaClock();
+    let { wall } = feed(clock, 1000, 70, (w) => 10 + (w - 1000) / 1000);
+    clock.hold();
+    const held = 20;
+    ({ wall } = feed(clock, wall, 2, () => held));
+    const resumed = wall;
+    const sound = resumed + 90;
+    const truth = (w) => held + Math.max(0, w - sound) / 1000;
+    const moves = [0.002, 0.019, 0.036];
+    const reading = (w) => {
+      const index = Math.round((w - resumed) / READING_MS);
+      return index < moves.length
+        ? held + moves[index]
+        : Math.max(held + moves.at(-1), truth(w));
+    };
+    let ahead = 0;
+    let stopped = false;
+    let ran = false;
+    for (let index = 0; index < 24; index++, wall += READING_MS) {
+      clock.observe(wall, reading(wall), 1, true);
+      if (clock.rate > 0) {
+        ran = true;
+        ahead = Math.max(ahead, (clock.at(wall) - truth(wall)) * 1000);
+      } else if (ran) stopped = true;
+    }
+    assert.ok(stopped, "the clock ran on through the standstill");
+    const bound = 36 + 2 * READING_MS + 2;
+    assert.ok(ahead <= bound, `${ahead.toFixed(1)} ms ahead of the sound`);
+    const off = (clock.at(wall) - truth(wall)) * 1000;
+    assert.ok(
+      Math.abs(off) <= 2,
+      `${off.toFixed(2)} ms off the sound at the end`,
+    );
+    console.log(
+      `ok clock, early move over three readings: ${ahead.toFixed(1)} ms ahead at most, then with the sound`,
+    );
+  }
+}
 
 // Each field at the first refresh at or after its time, in all the shapes a
 // picture comes in.
@@ -1287,59 +1677,234 @@ for (const paused of [false, true]) {
 
 // An element that has been told to play may move its time by a few
 // milliseconds and then stand still before it really starts. The clock does
-// not run on that first move, so nothing goes up ahead of its time.
-for (const [moveAtMs, startAtMs] of [
-  [30, 170],
-  [105, 160],
-]) {
-  const pictures = stream({ count: 900 });
-  const media = playing();
-  const seekTo = pictures[599].timestamp + FRAME * 0.6;
-  const moved = seekTo + 0.004;
+// not run on that first move, so nothing goes up ahead of its time, whether
+// the page or a Worker renders.
+for (const rendering of ["main", "worker"])
+  for (const [moveAtMs, startAtMs] of [
+    [30, 170],
+    [105, 160],
+  ]) {
+    const pictures = stream({ count: 900 });
+    const media = playing();
+    const seekTo = pictures[599].timestamp + FRAME * 0.6;
+    const moved = seekTo + 0.004;
+    const marks = {};
+    let supplying = true;
+    const steps = timeline(
+      [
+        3,
+        (control, context) => {
+          media.set(control.now(), seekTo, 0);
+          control.video.seeking = true;
+          event(control, "seeking");
+          context.deinterlacer.decodedVideo.reset();
+          context.producer.seek(seekTo);
+        },
+      ],
+      [
+        3.2,
+        (control) => {
+          control.video.seeking = false;
+          event(control, "seeked");
+          event(control, "playing");
+          marks.played = control.now();
+        },
+      ],
+    );
+    const { result, refreshMs, stats } = await play({
+      seconds: 8,
+      media,
+      pictures,
+      rendering,
+      supply: false,
+      script: (vsync, control, context) => {
+        steps(control, context);
+        const now = control.now();
+        if (marks.played !== undefined) {
+          if (marks.moved === undefined && now >= marks.played + moveAtMs) {
+            media.set(now, moved, 0);
+            marks.moved = now;
+          }
+          if (marks.started === undefined && now >= marks.played + startAtMs) {
+            media.set(now, moved, 1);
+            marks.started = now;
+          }
+        }
+        if (supplying) context.producer.supply(control.video.currentTime, 1);
+      },
+    });
+    const shown = appearances(
+      { draws: canvasDraws(result, marks.played) },
+      outputs(pictures),
+      refreshMs,
+    );
+    let early = 0;
+    for (const output of shown) {
+      const wall = BASE_MS + output.refresh * refreshMs;
+      const truth =
+        wall >= marks.started
+          ? moved + (wall - marks.started) / 1000
+          : wall >= marks.moved
+            ? moved
+            : seekTo;
+      early = Math.max(early, (output.time - truth) * 1000);
+    }
+    const label = `${rendering}, moved at ${moveAtMs} ms, started at ${startAtMs} ms`;
+    assert.ok(
+      early <= 2,
+      `${label}: an output went up ${early.toFixed(2)} ms before its time`,
+    );
+    checkTiming(label, shown, media, refreshMs, {
+      from: marks.started + 100,
+      toleranceMs: 2,
+    });
+    assert.equal(stats.missed, 0, label);
+    console.log(`ok start, ${label}: nothing ahead of its time`);
+  }
+
+// An element that publishes its position in steps, as Firefox does every
+// 40 ms of media: after `set`, the reading stays where it was set until
+// `phaseMs` of playing have passed, and from then on moves a step at a time.
+// With `stepMs` 0 it is read as it plays, as Chromium's is.
+class SteppedMedia {
+  constructor(stepMs) {
+    this.stepMs = stepMs;
+    /** A reading below this is reported as this, as Chromium never reports time going back. */
+    this.floor = Number.NEGATIVE_INFINITY;
+    this.set(BASE_MS, 0, 0);
+  }
+
+  set(wall, media, rate, phaseMs = 0) {
+    Object.assign(this, { wall, media, rate, phaseMs });
+  }
+
+  truth(wall) {
+    return this.media + (this.rate * Math.max(0, wall - this.wall)) / 1000;
+  }
+
+  reading(wall) {
+    return Math.max(this.floor, this.#reading(wall));
+  }
+
+  #reading(wall) {
+    if (this.rate === 0) return this.media;
+    const since = wall - this.wall - this.phaseMs;
+    if (since < 0) return this.media;
+    if (this.stepMs === 0) return this.truth(wall);
+    const step = (this.stepMs * Math.floor(since / this.stepMs)) / 1000;
+    return this.media + this.rate * (this.phaseMs / 1000 + step);
+  }
+}
+
+/**
+ * Seek back by about `backSeconds`, inside the buffer, at `seekAt` seconds
+ * while the reading moves in steps (or, with `continuous`, as it plays). The
+ * sound starts `soundMs` after `seeked`, and the reading's first update comes
+ * `phaseMs` of playing after that; `standUntilMs`, if given, makes the
+ * reading move by 2 ms at its first update and then stand until that long
+ * after `seeked`, as an element that has not really started does. With
+ * `earlyMs` as well, the reading moves 2 ms and at the next reading the rest
+ * of `earlyMs`, and the sound then starts from the target, the reading held
+ * where the move took it until the sound catches up: Chromium extrapolating
+ * its first audio callback from wall time.
+ */
+async function steppedSeek({
+  rendering,
+  rate = 1,
+  continuous = false,
+  seekAt = 4,
+  backSeconds = 2,
+  fraction,
+  phaseMs,
+  soundMs = 30,
+  standUntilMs = null,
+  earlyMs = null,
+}) {
+  const pictures = stream({ count: Math.ceil((8 * rate + 2) / FRAME) });
+  const media = new SteppedMedia(continuous ? 0 : 40 / rate);
+  const moveSeconds = earlyMs === null ? 0.002 : earlyMs / 1000;
+  media.set(BASE_MS + 10, 0, rate);
+  const seekTo =
+    pictures[Math.floor(((seekAt - backSeconds) * rate) / FRAME)].timestamp +
+    FRAME * fraction;
+  // Where playback really is: at the target until the sound starts, which
+  // starts from where the reading moved to unless Chromium's early move is
+  // modelled.
+  const start =
+    standUntilMs === null || earlyMs !== null ? seekTo : seekTo + moveSeconds;
   const marks = {};
   let supplying = true;
   const steps = timeline(
     [
-      3,
+      seekAt,
       (control, context) => {
-        media.set(control.now(), seekTo, 0);
+        marks.seeking = control.now();
         control.video.seeking = true;
         event(control, "seeking");
+        event(control, "waiting");
         context.deinterlacer.decodedVideo.reset();
+        media.set(control.now(), seekTo, 0);
         context.producer.seek(seekTo);
+        supplying = false;
       },
     ],
     [
-      3.2,
+      seekAt + 0.002,
       (control) => {
         control.video.seeking = false;
         event(control, "seeked");
         event(control, "playing");
         marks.played = control.now();
+        supplying = true;
       },
     ],
   );
   const { result, refreshMs, stats } = await play({
-    seconds: 8,
+    seconds: seekAt + 3,
     media,
     pictures,
+    rendering,
     supply: false,
     script: (vsync, control, context) => {
+      if (vsync === 0) control.video.playbackRate = rate;
       steps(control, context);
       const now = control.now();
-      if (marks.played !== undefined) {
-        if (marks.moved === undefined && now >= marks.played + moveAtMs) {
-          media.set(now, moved, 0);
-          marks.moved = now;
-        }
-        if (marks.started === undefined && now >= marks.played + startAtMs) {
-          media.set(now, moved, 1);
-          marks.started = now;
+      if (marks.played !== undefined && marks.sound === undefined) {
+        if (standUntilMs === null) {
+          if (now >= marks.played + soundMs) {
+            media.set(marks.played + soundMs, seekTo, rate, phaseMs);
+            marks.sound = marks.played + soundMs;
+          }
+        } else if (marks.moved === undefined) {
+          if (now >= marks.played + soundMs + phaseMs) {
+            // Chromium's move takes two readings: a little, then the rest
+            // at the pace of playing.
+            media.set(
+              now,
+              seekTo + (earlyMs === null ? moveSeconds : 0.002),
+              0,
+            );
+            marks.moved = now;
+          }
+        } else if (
+          earlyMs !== null &&
+          marks.movedOn === undefined &&
+          now >= marks.moved + 15
+        ) {
+          media.set(now, seekTo + moveSeconds, 0);
+          marks.movedOn = now;
+        } else if (now >= marks.played + standUntilMs) {
+          if (earlyMs !== null) media.floor = seekTo + moveSeconds;
+          media.set(marks.played + standUntilMs, start, rate, phaseMs);
+          marks.sound = marks.played + standUntilMs;
         }
       }
-      if (supplying) context.producer.supply(control.video.currentTime, 1);
+      if (supplying && !control.video.seeking)
+        context.producer.supply(control.video.currentTime, rate);
     },
   });
+  const truth = (wall) =>
+    wall < marks.sound ? start : start + (rate * (wall - marks.sound)) / 1000;
   const shown = appearances(
     { draws: canvasDraws(result, marks.played) },
     outputs(pictures),
@@ -1348,25 +1913,370 @@ for (const [moveAtMs, startAtMs] of [
   let early = 0;
   for (const output of shown) {
     const wall = BASE_MS + output.refresh * refreshMs;
-    const truth =
-      wall >= marks.started
-        ? moved + (wall - marks.started) / 1000
-        : wall >= marks.moved
-          ? moved
-          : seekTo;
-    early = Math.max(early, (output.time - truth) * 1000);
+    early = Math.max(early, ((output.time - truth(wall)) * 1000) / rate);
   }
-  const label = `moved at ${moveAtMs} ms, started at ${startAtMs} ms`;
+  const drawn = new Set(
+    canvasDraws(result, marks.played).map((draw) => draw.picture.mediaTime),
+  );
+  const unshown = pictures.filter(
+    (picture) =>
+      picture.timestamp + picture.duration > seekTo + 0.001 &&
+      picture.timestamp < seekTo + rate &&
+      !drawn.has(picture.timestamp),
+  );
+  // Statistics are reported once a second; before the first report nothing
+  // has been counted.
+  const before = result.stats.findLast(
+    (snapshot) => snapshot.t < marks.seeking,
+  ) ?? { missed: 0, late: 0, resynced: 0 };
+  return {
+    stats,
+    before,
+    early,
+    unshown,
+    starts: stats.resynced - before.resynced,
+    shown,
+    truth,
+    refreshMs,
+    marks,
+  };
+}
+
+// A seek inside the buffer with a stepped reading. The reading after the
+// first update stands until the next one whether the element plays or not,
+// so a clock waiting for a second update starts a step late and the
+// pictures of that step never go up. Wherever the target falls in its
+// picture and whenever the first update comes, every picture from the
+// target on is shown and none ahead of its time.
+for (const rendering of ["main", "worker"]) {
+  let runs = 0;
+  for (const fraction of [0.1, 0.35, 0.6, 0.85])
+    for (const phaseMs of [6, 10, 14]) {
+      const label = `${rendering}, target ${fraction} into its picture, first update ${phaseMs} ms in`;
+      const { stats, before, early, unshown, starts } = await steppedSeek({
+        rendering,
+        fraction,
+        phaseMs,
+      });
+      const missed = stats.missed - before.missed;
+      assert.equal(missed, 0, `${label}: ${missed} pictures dropped`);
+      assert.deepEqual(
+        unshown.map((picture) => picture.timestamp),
+        [],
+        `${label}: pictures never shown`,
+      );
+      assert.ok(
+        early <= 2,
+        `${label}: an output went up ${early.toFixed(2)} ms before its time`,
+      );
+      assert.equal(starts, 1, `${label}: the clock started ${starts} times`);
+      runs++;
+    }
+  console.log(
+    `ok stepped reading, ${rendering}: ${runs} seeks, every picture from the target shown, none early`,
+  );
+}
+
+// The same, with a stepped reading that moves at its first update and then
+// stands as an element that has not really started does. The clock runs
+// from that update, stops once the reading stands longer than a step, and
+// starts again on two updates: ahead of the sound by at most a step, a
+// reading and a refresh, once, and on time after.
+for (const rendering of ["main", "worker"]) {
+  const { stats, early, starts, shown, truth, refreshMs, marks } =
+    await steppedSeek({
+      rendering,
+      fraction: 0.6,
+      phaseMs: 10,
+      standUntilMs: 150,
+    });
+  const label = `${rendering}, moved then stood until 150 ms`;
+  const bound = 40 + 2 * refreshMs;
+  assert.ok(
+    early <= bound,
+    `${label}: ${early.toFixed(2)} ms ahead, more than ${bound.toFixed(1)}`,
+  );
+  assert.equal(starts, 2, `${label}: the clock started ${starts} times`);
+  // From a little after the real start, nothing goes up early; the clock
+  // started on a reading that was seen up to one reading after its update,
+  // so an output may go up that much behind its refresh until the slew has
+  // taken it up.
+  let ahead = 0;
+  let behind = 0;
+  for (const output of shown) {
+    const wall = BASE_MS + output.refresh * refreshMs;
+    if (wall < marks.sound + 100) continue;
+    const error = (output.time - truth(wall)) * 1000;
+    ahead = Math.max(ahead, error);
+    behind = Math.max(behind, -error - refreshMs);
+  }
+  assert.ok(
+    ahead <= 2,
+    `${label}: ${ahead.toFixed(2)} ms ahead after the start`,
+  );
+  assert.ok(
+    behind <= refreshMs + 2,
+    `${label}: ${behind.toFixed(2)} ms behind its refresh after the start`,
+  );
+  assert.equal(stats.queueResetted, 0, label);
+  console.log(
+    `ok stepped reading that stands, ${rendering}: ${early.toFixed(1)} ms ahead at most, one start taken back; after the start ${ahead.toFixed(1)} ms ahead, ${behind.toFixed(1)} ms behind at most`,
+  );
+}
+
+// Chromium at a seek, with a reading read as it plays: the reading runs 19 ms
+// ahead with wall time and stands while the device plays its first silence;
+// the sound starts from the target and the reading follows once it catches
+// up. While the clock waits the pictures follow the reading, so they can be
+// that far ahead for a moment; it starts with the sound, not on the early
+// move, and from then on nothing goes up ahead of its time.
+for (const rendering of ["main", "worker"]) {
+  const { early, shown, truth, refreshMs, marks } = await steppedSeek({
+    rendering,
+    continuous: true,
+    fraction: 0.6,
+    phaseMs: 0,
+    soundMs: 15,
+    standUntilMs: 65,
+    earlyMs: 19,
+  });
+  const label = `${rendering}, Chromium-shaped start`;
+  assert.ok(
+    early <= 19 + 2,
+    `${label}: ${early.toFixed(2)} ms ahead of the sound`,
+  );
+  let ahead = 0;
+  let behind = 0;
+  for (const output of shown) {
+    const wall = BASE_MS + output.refresh * refreshMs;
+    if (wall < marks.sound + 100) continue;
+    const error = (output.time - truth(wall)) * 1000;
+    ahead = Math.max(ahead, error);
+    behind = Math.max(behind, -error - refreshMs);
+  }
+  assert.ok(
+    ahead <= 2,
+    `${label}: ${ahead.toFixed(2)} ms ahead after the start`,
+  );
+  assert.ok(
+    behind <= refreshMs + 2,
+    `${label}: ${behind.toFixed(2)} ms behind its refresh after the start`,
+  );
+  console.log(
+    `ok ${label}: ${early.toFixed(1)} ms ahead while waiting, on time after`,
+  );
+}
+
+// Paused while the page shows, then played while it is hidden: a hidden page
+// sends no readings, so when it shows again the clock is still where the
+// element was paused, and the pictures that passed meanwhile were never due
+// to be seen. None of them counts as dropped, and those after are on time.
+for (const rendering of ["main", "worker"]) {
+  const pictures = stream({ count: 400 });
+  const media = playing();
+  const marks = {};
+  const steps = timeline(
+    [
+      3,
+      (control) => {
+        marks.paused = media.truth(control.now());
+        media.set(control.now(), marks.paused, 0);
+        control.video.paused = true;
+        event(control, "pause");
+      },
+    ],
+    [3.5, (control) => control.suspend("page")],
+    [
+      4,
+      (control) => {
+        media.set(control.now(), marks.paused, 1);
+        control.video.paused = false;
+        event(control, "play");
+        event(control, "playing");
+      },
+    ],
+    [
+      5,
+      (control) => {
+        control.resume("page");
+        marks.shown = control.now();
+      },
+    ],
+  );
+  const { result, refreshMs, stats } = await play({
+    seconds: 7,
+    media,
+    pictures,
+    rendering,
+    script: (vsync, control) => steps(control),
+  });
+  const label = `${rendering}, played while hidden`;
+  assert.equal(stats.missed, 0, `${label}: ${stats.missed} pictures dropped`);
+  checkTiming(
+    label,
+    appearances(
+      { draws: canvasDraws(result, marks.shown) },
+      outputs(pictures),
+      refreshMs,
+    ),
+    media,
+    refreshMs,
+    {
+      from: marks.shown + 300,
+      toleranceMs: 2,
+    },
+  );
+  console.log(
+    `ok ${label}: nothing counted for the time hidden, on time after`,
+  );
+}
+
+// Other rates: the reading's steps come at the same media distance and a
+// shorter or longer wall time, and the start follows the reading. At twice
+// the rate there are as many pictures as refreshes, so some are passed over
+// in any case; the seek adds none.
+for (const rate of [0.5, 2]) {
+  const { stats, before, unshown, starts, early } = await steppedSeek({
+    rendering: "worker",
+    rate,
+    fraction: 0.35,
+    phaseMs: 10,
+  });
+  const label = `rate ${rate}`;
+  assert.equal(stats.missed - before.missed, 0, label);
+  assert.ok(starts <= 2, `${label}: the clock started ${starts} times`);
   assert.ok(
     early <= 2,
-    `${label}: an output went up ${early.toFixed(2)} ms before its time`,
+    `${label}: an output went up ${early.toFixed(2)} ms early`,
   );
-  checkTiming(label, shown, media, refreshMs, {
-    from: marks.started + 100,
-    toleranceMs: 2,
+  console.log(
+    `ok stepped reading at ${label}: none dropped by the seek, started ${starts} times`,
+  );
+}
+
+// A seek before the clock has run long enough to have seen the reading step:
+// it waits for two updates as it always has. An element that moves a little
+// and then stands is not taken for one that plays, so nothing goes up ahead
+// of its time, where a clock that had seen the steps would run ahead until
+// it took the start back.
+{
+  const { early } = await steppedSeek({
+    rendering: "worker",
+    seekAt: 0.2,
+    backSeconds: 0.1,
+    fraction: 0.6,
+    phaseMs: 10,
+    standUntilMs: 150,
   });
-  assert.equal(stats.missed, 0, label);
-  console.log(`ok start, ${label}: nothing ahead of its time`);
+  assert.ok(
+    early <= 2,
+    `no history: an output went up ${early.toFixed(2)} ms early`,
+  );
+  console.log("ok stepped reading with no history: nothing early");
+}
+
+// A reading read as the element plays, with a Worker rendering. The Worker
+// uses a reading in the frame it was taken for; one taken in the page's own
+// frame would be a refresh old, and a picture due in that refresh would go
+// unshown after a seek. Swept over where in a refresh the sound starts, a
+// seek drops nothing; a picture goes unshown only when the sound starts in
+// the lead before the Worker's frame, too late for that frame's reading, so
+// in about that share of the seeks. (At twice the rate one picture after a
+// seek goes unshown with either renderer: the clock waits for a second
+// reading, one refresh, before it runs, and at that rate a refresh is a
+// whole picture.)
+{
+  let runs = 0;
+  let unshownTotal = 0;
+  let refresh = 0;
+  for (const fraction of [0.1, 0.35, 0.6, 0.85])
+    for (let soundMs = 20; soundMs < 37; soundMs += 2) {
+      const { stats, before, early, unshown, refreshMs } = await steppedSeek({
+        rendering: "worker",
+        continuous: true,
+        fraction,
+        phaseMs: 0,
+        soundMs,
+      });
+      const label = `continuous reading, target ${fraction} into its picture, sound at ${soundMs} ms`;
+      const missed = stats.missed - before.missed;
+      assert.equal(missed, 0, `${label}: ${missed} pictures dropped`);
+      assert.ok(
+        unshown.length <= 1,
+        `${label}: ${unshown.length} pictures never shown`,
+      );
+      assert.ok(
+        early <= 2,
+        `${label}: an output went up ${early.toFixed(2)} ms early`,
+      );
+      unshownTotal += unshown.length;
+      runs++;
+      refresh = refreshMs;
+    }
+  const share = (CLOCK_LEAD_MS + 1) / refresh;
+  assert.ok(
+    unshownTotal <= runs * share,
+    `${unshownTotal} pictures unshown in ${runs} seeks`,
+  );
+  console.log(
+    `ok continuous reading, worker: ${runs} seeks, none dropped, ${unshownTotal} pictures unshown`,
+  );
+}
+
+// The page sends a Worker renderer at most one reading per refresh, however
+// late its timers and its animation frames run: two readings close together
+// would look like a jump to the clock. While the page is busy, a task holds
+// it from before the reading is due until 9 ms into each refresh, so the
+// reading's timer and the refresh's animation frame both run when it ends.
+// Each frame still sets the next reading, so there is one a refresh.
+{
+  const pictures = stream({ count: 400 });
+  const media = playing();
+  const busy = { from: BASE_MS + 2000, to: BASE_MS + 4000 };
+  const { result, refreshMs } = await play({
+    seconds: 6,
+    media,
+    pictures,
+    rendering: "worker",
+    script: (vsync, control, context) => {
+      if (vsync !== 0) return;
+      // The window that composites the canvas is the one whose frames and
+      // timers the renderer uses.
+      const view = context.deinterlacer.canvas.ownerDocument.defaultView;
+      const setTimeout = view.setTimeout.bind(view);
+      const requestAnimationFrame = view.requestAnimationFrame.bind(view);
+      const isBusy = () =>
+        control.now() >= busy.from && control.now() < busy.to;
+      view.setTimeout = (callback, delay) =>
+        setTimeout(callback, delay + (isBusy() ? CLOCK_LEAD_MS + 9 : 0));
+      view.requestAnimationFrame = (callback) =>
+        requestAnimationFrame((timestamp) =>
+          isBusy()
+            ? setTimeout(() => callback(timestamp), 9)
+            : callback(timestamp),
+        );
+    },
+  });
+  const clocks = result.commands
+    .filter((command) => command.type === "clock")
+    .map((command) => command.t);
+  let closest = Infinity;
+  for (let index = 1; index < clocks.length; index++)
+    if (clocks[index] >= BASE_MS + 1000)
+      closest = Math.min(closest, clocks[index] - clocks[index - 1]);
+  const during = clocks.filter((t) => t >= busy.from && t < busy.to).length;
+  const refreshes = (busy.to - busy.from) / refreshMs;
+  assert.ok(
+    closest >= refreshMs - CLOCK_LEAD_MS - 1,
+    `two readings ${closest.toFixed(2)} ms apart`,
+  );
+  assert.ok(
+    during >= refreshes - 2,
+    `${during} readings in ${refreshes.toFixed(0)} refreshes while busy`,
+  );
+  console.log(
+    `ok busy page: readings at least ${closest.toFixed(1)} ms apart, ${during} in ${refreshes.toFixed(0)} busy refreshes`,
+  );
 }
 
 // Faster playback: fields are chosen by time, and those the display has no
