@@ -32,6 +32,16 @@
  * seen to stand while the element played, and one reading more: the element
  * has stopped, though it has not said so, and pictures shown on would run
  * ahead of the sound.
+ *
+ * While it waits, the position is the reading, except where the reading has
+ * been seen to run ahead of the sound when the element starts: at each start
+ * after the element was stopped, the clock runs from a reading on the sound's
+ * line, and so learns how far ahead of the sound the reading's first change
+ * was. In Chromium that is the device's output delay, about 50 ms at each
+ * start; in Firefox the reading leads by less than a reading, if at all.
+ * Where it has led by more than a reading at the last starts, the sound
+ * while the clock waits is where the reading's first change was, less that
+ * lead, and playing on from there.
  */
 export declare class MediaClock {
     #private;
