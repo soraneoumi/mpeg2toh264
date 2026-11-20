@@ -1046,6 +1046,376 @@ await testConversion();
       `ok clock, early move over three readings: ${ahead.toFixed(1)} ms ahead at most, then with the sound`,
     );
   }
+
+  /**
+   * An element started as Chromium starts one, on `clock` from `wall`, after a
+   * second of playing to have the reading's behaviour seen. The sound starts
+   * from `held` at `soundAt` ms after the reading first moves (negative: it
+   * was already playing) and plays on at `rate`. The reading leads the sound
+   * by `lead` ms at that first move, the device's output delay it leaves out;
+   * as in Edge's recordings it goes on at playing pace for `climbMs` more and
+   * then stands until the sound catches up, or with `creep` moves on by 4 ms
+   * a reading, slower than playing, from two readings after it stood.
+   * `stoodFirst` keeps the reading at `held` for one reading more, as after
+   * a late `seeked`. `hold` is how the element is stopped first: "pause"
+   * (readings of an element not playing; its first playing reading has
+   * moved), "seek" (a hold, readings of an element not playing, a hold at
+   * seeked, then a playing reading at `held`), "zero" (a
+   * rate of 0, then a reading at `held` at the rate it plays at) or "rate"
+   * (the same from another rate it played at). Returns the wall time after
+   * it and, for each reading while the clock waited, the clock's position
+   * and the sound at the next refresh, and the reading and whether the sound
+   * had caught it up.
+   */
+  function chromiumStart(
+    clock,
+    wall,
+    {
+      held = 100,
+      soundAt,
+      lead = 52,
+      climbMs = 20,
+      creep = false,
+      rate = 1,
+      stoodFirst = false,
+      hold = "seek",
+      from = rate,
+    },
+  ) {
+    const before = hold === "rate" ? from : rate;
+    let position = held - 1;
+    for (let index = 0; index < 60; index++, wall += READING_MS) {
+      clock.observe(wall, position, before, true);
+      position += (before * READING_MS) / 1000;
+    }
+    if (hold === "pause") {
+      for (let index = 0; index < 2; index++, wall += READING_MS)
+        clock.observe(wall, held, rate, false);
+    } else if (hold === "seek") {
+      // Held at seeking and again at seeked, as the renderer holds it.
+      clock.hold();
+      for (let index = 0; index < 2; index++, wall += READING_MS)
+        clock.observe(wall, held, rate, false);
+      clock.hold();
+      clock.observe(wall, held, rate, true);
+      wall += READING_MS;
+    } else {
+      for (let index = 0; index < 2; index++, wall += READING_MS)
+        clock.observe(wall, held, hold === "zero" ? 0 : from, true);
+      clock.observe(wall, held, rate, true);
+      wall += READING_MS;
+    }
+    if (stoodFirst) {
+      clock.observe(wall, held, rate, true);
+      wall += READING_MS;
+    }
+    const moves = wall;
+    const line = (w) => held + (rate * (w - moves - soundAt)) / 1000;
+    const sound = (w) => Math.max(held, line(w));
+    const early = line(moves) + (rate * lead) / 1000;
+    const creepFrom = climbMs + 2 * READING_MS;
+    const ahead = (w) => {
+      const since = w - moves;
+      const crept =
+        creep && since > creepFrom
+          ? 4 * Math.floor((since - creepFrom) / READING_MS + 1e-9)
+          : 0;
+      return early + (rate * (Math.min(climbMs, since) + crept)) / 1000;
+    };
+    // The position is asked for the coming refresh, a reading after the last
+    // was taken, as the renderer asks for it.
+    const waits = [];
+    for (let index = 0; index < 40; index++, wall += READING_MS) {
+      const r = Math.max(ahead(wall), line(wall));
+      clock.observe(wall, r, rate, true);
+      const next = wall + READING_MS;
+      if (clock.rate === 0)
+        waits.push({
+          wall,
+          at: clock.at(next),
+          sound: sound(next),
+          reading: r,
+          caught: line(wall) >= ahead(wall),
+        });
+    }
+    return { wall, waits };
+  }
+
+  /** The furthest a waiting position was from the sound, in ms; and from the reading. */
+  const offSound = (waits) =>
+    Math.max(0, ...waits.map((w) => Math.abs(w.at - w.sound) * 1000));
+  const offReading = (waits) =>
+    Math.max(0, ...waits.map((w) => Math.abs(w.at - w.reading) * 1000));
+
+  // Seeks and resumes in Chromium: until three starts have been seen the
+  // position while waiting is the reading; once they have, the clock knows
+  // how far the reading leads the sound and the position is the sound's. A
+  // seek's sound starts after the reading first moves, a resume's before;
+  // the lead is the same. (The playing before the first seek is itself a
+  // start, so the third is seen during the second or third seek.)
+  for (const [label, soundAt, hold] of [
+    ["seek", 40, "seek"],
+    ["resume", -10, "pause"],
+  ]) {
+    const clock = new MediaClock();
+    let wall = 1000;
+    for (let start = 0; start < 6; start++) {
+      const result = chromiumStart(clock, wall, { soundAt, hold });
+      wall = result.wall;
+      assert.ok(
+        result.waits.length > 0,
+        `${label} ${start}: the clock did not wait`,
+      );
+      if (start === 0)
+        assert.ok(
+          offReading(result.waits) <= 1e-6,
+          `${label} ${start}: the position left the reading before anything was learnt`,
+        );
+      else if (start >= 3)
+        assert.ok(
+          offSound(result.waits) <= 1,
+          `${label} ${start}: ${offSound(result.waits).toFixed(2)} ms off the sound while waiting`,
+        );
+    }
+    console.log(
+      `ok clock, Chromium ${label}: on the sound from the fourth start`,
+    );
+  }
+
+  // Held at a rate of 0 and played again: a start like a seek, learnt and
+  // used. A change between two rates it plays at stops nothing: neither
+  // used nor learnt. (The reading is made to look like a start there, with
+  // twice the lead, so that a lead learnt from it would show at the seek
+  // after.)
+  {
+    const clock = new MediaClock();
+    let wall = 1000;
+    for (let start = 0; start < 4; start++)
+      ({ wall } = chromiumStart(clock, wall, { soundAt: 40, hold: "zero" }));
+    const held = chromiumStart(clock, wall, { soundAt: 40, hold: "zero" });
+    assert.ok(
+      offSound(held.waits) <= 1,
+      "a start from a rate of 0 is not on the sound",
+    );
+    wall = held.wall;
+    for (let change = 0; change < 3; change++) {
+      const changed = chromiumStart(clock, wall, {
+        soundAt: 92,
+        lead: 104,
+        hold: "rate",
+        from: 1.5,
+      });
+      wall = changed.wall;
+      assert.ok(
+        offReading(changed.waits) <= 1e-6,
+        "a change between two rates used the lead",
+      );
+    }
+    const seek = chromiumStart(clock, wall, { soundAt: 40 });
+    assert.ok(
+      offSound(seek.waits) <= 1,
+      "a lead was learnt from a change between two rates",
+    );
+    console.log(
+      "ok clock, Chromium start from a rate of 0: learnt and used; a rate change: neither",
+    );
+  }
+
+  // A reading that creeps on after it stood, slower than playing: not where
+  // the sound is, and the position stays the sound's. (With a lead of 80 ms,
+  // as where Edge's recordings show a creep, it stands long enough to.)
+  {
+    const clock = new MediaClock();
+    let wall = 1000;
+    const shape = { soundAt: 68, lead: 80 };
+    for (let start = 0; start < 4; start++)
+      ({ wall } = chromiumStart(clock, wall, shape));
+    const crept = chromiumStart(clock, wall, { ...shape, creep: true });
+    assert.ok(
+      offSound(crept.waits) <= 1,
+      `${offSound(crept.waits).toFixed(2)} ms off the sound with a creeping reading`,
+    );
+    console.log(
+      "ok clock, Chromium reading that creeps after it stood: the sound",
+    );
+  }
+
+  // A reading that leads the sound by less than a reading, as Firefox's
+  // does now and then: no lead worth going by, the position is the reading.
+  {
+    const clock = new MediaClock();
+    let wall = 1000;
+    for (let start = 0; start < 6; start++) {
+      const result = chromiumStart(clock, wall, {
+        soundAt: 5,
+        lead: 10,
+        climbMs: 0,
+      });
+      wall = result.wall;
+      assert.ok(
+        offReading(result.waits) <= 1e-6,
+        `start ${start}: a lead shorter than a reading was used`,
+      );
+    }
+    console.log("ok clock, lead shorter than a reading: the reading");
+  }
+
+  // A reading that stands at the held position for a reading before it
+  // moves, as after a late seeked: the position is the reading.
+  {
+    const clock = new MediaClock();
+    let wall = 1000;
+    for (let start = 0; start < 4; start++)
+      ({ wall } = chromiumStart(clock, wall, { soundAt: 40 }));
+    const late = chromiumStart(clock, wall, { soundAt: 40, stoodFirst: true });
+    assert.ok(
+      offReading(late.waits) <= 1e-6,
+      "a reading that stood first used the lead",
+    );
+    console.log(
+      "ok clock, Chromium start whose reading stood first: the reading",
+    );
+  }
+
+  // The output delay grows: the lead learnt is too short, and the sound
+  // worked out runs ahead of the real one; never past the reading and the
+  // time since it was read. The middle of three starts takes the new lead
+  // at the second start of it, and the position is the sound's again.
+  // The delay shrinks: the lead is too long, and the sound worked out falls
+  // behind; never behind a reading that has moved on at playing pace.
+  {
+    const clock = new MediaClock();
+    let wall = 1000;
+    for (let start = 0; start < 4; start++)
+      ({ wall } = chromiumStart(clock, wall, { soundAt: 40 }));
+    let worst = 0;
+    for (let start = 0; start < 3; start++) {
+      const result = chromiumStart(clock, wall, { soundAt: 70, lead: 82 });
+      wall = result.wall;
+      for (const w of result.waits)
+        worst = Math.max(worst, (w.at - w.reading) * 1000 - READING_MS);
+      if (start === 2)
+        assert.ok(
+          offSound(result.waits) <= 1,
+          "the longer lead was not learnt",
+        );
+    }
+    assert.ok(
+      worst <= 1e-6,
+      `${worst.toFixed(2)} ms past the reading and its age`,
+    );
+    let behind = 0;
+    for (let start = 0; start < 3; start++) {
+      // With so short a delay there is no room for the reading to go on
+      // before it stands: it stands at its first move.
+      const result = chromiumStart(clock, wall, {
+        soundAt: 10,
+        lead: 22,
+        climbMs: 0,
+      });
+      wall = result.wall;
+      for (const w of result.waits)
+        if (w.caught) behind = Math.max(behind, (w.reading - w.at) * 1000);
+    }
+    assert.ok(
+      behind <= 1e-6,
+      `${behind.toFixed(2)} ms behind a reading that moved on`,
+    );
+    console.log(
+      "ok clock, Chromium lead too short or too long: bounded, then learnt",
+    );
+  }
+
+  // One start the element makes differently, here with twice the lead,
+  // does not move what the clock goes by: the next start is on the sound.
+  {
+    const clock = new MediaClock();
+    let wall = 1000;
+    for (let start = 0; start < 5; start++)
+      ({ wall } = chromiumStart(clock, wall, { soundAt: 40 }));
+    ({ wall } = chromiumStart(clock, wall, { soundAt: 92, lead: 104 }));
+    const next = chromiumStart(clock, wall, { soundAt: 40 });
+    assert.ok(
+      offSound(next.waits) <= 1,
+      `${offSound(next.waits).toFixed(2)} ms off the sound after one odd start`,
+    );
+    console.log("ok clock, one odd Chromium start: the lead stays");
+  }
+
+  // At twice the rate the lead is the same wall time, and the position is
+  // the sound's at that rate.
+  {
+    const clock = new MediaClock();
+    let wall = 1000;
+    let last = null;
+    for (let start = 0; start < 5; start++)
+      ({ wall, waits: last } = chromiumStart(clock, wall, {
+        soundAt: 40,
+        rate: 2,
+      }));
+    assert.ok(
+      offSound(last) <= 1,
+      `${offSound(last).toFixed(2)} ms off the sound at rate 2`,
+    );
+    console.log("ok clock, Chromium seek at rate 2: on the sound");
+  }
+
+  // A reading in steps, as Firefox's: it trails the sound, so whatever the
+  // clock learns is no lead, and one start with a 100 ms early move does not
+  // make one. The position while waiting is the reading throughout.
+  {
+    const clock = new MediaClock();
+    let wall = 1000;
+    const stepped = (origin, start) => (w) =>
+      start + 0.04 * Math.floor((w - origin) / 40);
+    let worst = 0;
+    for (let start = 0; start < 7; start++) {
+      const begin = wall;
+      ({ wall } = feed(clock, wall, 60, stepped(begin, 100 + start)));
+      clock.hold();
+      ({ wall } = feed(clock, wall, 2, () => 200 + start));
+      const moves = wall;
+      const odd = start === 3 ? 0.1 : 0;
+      for (let index = 0; index < 20; index++, wall += READING_MS) {
+        const r =
+          200 + start + odd + 0.01 + 0.04 * Math.floor((wall - moves) / 40);
+        clock.observe(wall, r, 1, true);
+        if (clock.rate === 0)
+          worst = Math.max(worst, Math.abs(clock.at(wall) - r) * 1000);
+      }
+    }
+    assert.ok(
+      worst <= 1e-6,
+      `${worst.toFixed(2)} ms off the reading while waiting`,
+    );
+    console.log(
+      "ok clock, stepped reading: no lead learnt, the reading while waiting",
+    );
+  }
+
+  // A reading that changes while the rate is 0 starts nothing, and the
+  // position stays a number; a hold while the lead is in use leaves the
+  // position unknown until the next reading.
+  {
+    const clock = new MediaClock();
+    let wall = 1000;
+    for (let start = 0; start < 4; start++)
+      ({ wall } = chromiumStart(clock, wall, { soundAt: 40 }));
+    for (let index = 0; index < 6; index++, wall += READING_MS) {
+      const started = clock.observe(wall, 300 + index * 0.003, 0, true);
+      assert.equal(started, false, "a start at a rate of 0");
+      assert.ok(Number.isFinite(clock.at(wall)), "the position is no number");
+    }
+    const held = 400;
+    clock.observe(wall, held, 1, true);
+    wall += READING_MS;
+    clock.observe(wall, held + 0.052, 1, true);
+    clock.hold();
+    assert.ok(Number.isNaN(clock.at(wall + 5)), "known across a hold");
+    console.log(
+      "ok clock, rate 0 and a hold while waiting: nothing started, nothing assumed",
+    );
+  }
 }
 
 // Each field at the first refresh at or after its time, in all the shapes a
@@ -1771,6 +2141,10 @@ class SteppedMedia {
     this.stepMs = stepMs;
     /** A reading below this is reported as this, as Chromium never reports time going back. */
     this.floor = Number.NEGATIVE_INFINITY;
+    /** The wall time from which the floor holds. */
+    this.floorAt = Number.NEGATIVE_INFINITY;
+    /** How far the floor goes on rising after that, at playing pace at a rate of 1, in ms. */
+    this.floorRiseMs = 0;
     this.set(BASE_MS, 0, 0);
   }
 
@@ -1783,7 +2157,16 @@ class SteppedMedia {
   }
 
   reading(wall) {
-    return Math.max(this.floor, this.#reading(wall));
+    const reading = this.#reading(wall);
+    // A reading taken at `floorAt` may be stamped a little before it.
+    if (wall < this.floorAt - 1) return reading;
+    const rise = Math.min(this.floorRiseMs, Math.max(0, wall - this.floorAt));
+    return Math.max(this.floor + rise / 1000, reading);
+  }
+
+  /** From the reading at `wall` on, never below `floor`, which rises for `riseMs`. */
+  setFloor(wall, floor, riseMs = 0) {
+    Object.assign(this, { floor, floorAt: wall, floorRiseMs: riseMs });
   }
 
   #reading(wall) {
@@ -2067,6 +2450,81 @@ for (const rendering of ["main", "worker"]) {
   );
 }
 
+// Held at a playback rate of 0 without being paused, as a player does while
+// the pictures of a seek are decoded: the element does not move, and neither
+// does the picture; when the rate comes back playback goes on from there,
+// nothing early, nothing dropped, on time. A Worker hears of the stop, as of
+// any, after its frame for that refresh, and may show one field more.
+for (const rendering of ["main", "worker"]) {
+  const pictures = stream({ count: 400 });
+  const media = playing();
+  const marks = {};
+  const steps = timeline(
+    [
+      3,
+      (control) => {
+        marks.held = media.truth(control.now());
+        marks.heldAt = control.now();
+        media.set(control.now(), marks.held, 0);
+        control.video.playbackRate = 0;
+        event(control, "ratechange");
+      },
+    ],
+    [
+      3.5,
+      (control) => {
+        media.set(control.now(), marks.held, 1);
+        control.video.playbackRate = 1;
+        event(control, "ratechange");
+        marks.released = control.now();
+      },
+    ],
+  );
+  const { result, refreshMs, stats } = await play({
+    seconds: 6,
+    media,
+    pictures,
+    rendering,
+    script: (vsync, control) => steps(control),
+  });
+  const label = `${rendering}, held at rate 0`;
+  assert.equal(stats.missed, 0, `${label}: ${stats.missed} pictures dropped`);
+  const shown = appearances(
+    { draws: canvasDraws(result, BASE_MS + 3000) },
+    outputs(pictures),
+    refreshMs,
+  );
+  let early = 0;
+  for (const output of shown) {
+    const wall = BASE_MS + output.refresh * refreshMs;
+    if (rendering === "worker" && wall <= marks.heldAt + refreshMs) continue;
+    const truth =
+      wall < marks.released
+        ? marks.held
+        : marks.held + (wall - marks.released) / 1000;
+    early = Math.max(early, (output.time - truth) * 1000);
+  }
+  assert.ok(
+    early <= 2,
+    `${label}: an output went up ${early.toFixed(2)} ms early`,
+  );
+  checkTiming(
+    label,
+    appearances(
+      { draws: canvasDraws(result, marks.released + 300) },
+      outputs(pictures),
+      refreshMs,
+    ),
+    media,
+    refreshMs,
+    {
+      from: marks.released + 300,
+      toleranceMs: 2,
+    },
+  );
+  console.log(`ok ${label}: the picture waits with the element, on time after`);
+}
+
 // Paused while the page shows, then played while it is hidden: a hidden page
 // sends no readings, so when it shows again the clock is still where the
 // element was paused, and the pictures that passed meanwhile were never due
@@ -2130,6 +2588,120 @@ for (const rendering of ["main", "worker"]) {
     `ok ${label}: nothing counted for the time hidden, on time after`,
   );
 }
+
+// Chromium's reading after a start, with the real renderer, as Edge's
+// recordings show it: after a seek the reading is at the target at the first
+// reading after seeked and moves at the next, and the sound starts 40 ms
+// after that move; after a resume the first reading of the playing element
+// has already moved, and the sound starts at about that reading. Either way
+// the reading's first move is 52 ms ahead of the sound, the device's output
+// delay; it goes on at playing pace for 20 ms more and stands there until
+// the sound catches up. Once the clock has seen this at a few starts, the
+// picture at the next one stays with the sound: every picture from where the
+// element was held is shown, and none ahead of the sound.
+async function chromiumStarts({ rendering, kind }) {
+  const pictures = stream({ count: 600 });
+  const media = new SteppedMedia(0);
+  media.set(BASE_MS + 10, 0, 1);
+  const lead = 52;
+  const seek = kind !== "resume";
+  const soundMs = seek ? 40 : 0;
+  const events = [];
+  let next = BASE_MS + 2000;
+  let pending = null;
+  const { result, refreshMs } = await play({
+    seconds: 12,
+    media,
+    pictures,
+    rendering,
+    supply: false,
+    script: (vsync, control, context) => {
+      const now = control.now();
+      if (pending === null && now >= next && events.length < 6) {
+        // A seek lands 5 ms before a field ends, so that following the
+        // reading's early move would show the next field ahead of the sound.
+        const held = seek
+          ? Math.floor((media.truth(now) - 1) / FRAME) * FRAME +
+            FRAME / 2 -
+            0.005
+          : media.truth(now);
+        media.floor = Number.NEGATIVE_INFINITY;
+        if (seek) {
+          control.video.seeking = true;
+          event(control, "seeking");
+          event(control, "waiting");
+          context.deinterlacer.decodedVideo.reset();
+          context.producer.seek(held);
+        } else {
+          control.video.paused = true;
+          event(control, "pause");
+        }
+        media.set(now, held, 0);
+        pending = { held, at: now + (seek ? 2 : 300) };
+      } else if (pending !== null && now >= pending.at) {
+        const { held } = pending;
+        if (seek) {
+          control.video.seeking = false;
+          event(control, "seeked");
+          event(control, "playing");
+        } else {
+          control.video.paused = false;
+          event(control, "play");
+          event(control, "playing");
+        }
+        // The harness reads once a refresh, at 60 Hz.
+        const moves = seek ? now + 1000 / 60 : now;
+        const soundAt = moves + soundMs;
+        media.set(soundAt, held, 1);
+        // The reading goes on 20 ms at playing pace before it stands.
+        media.setFloor(moves, held + (lead - soundMs) / 1000, 20);
+        events.push({ held, played: now, soundAt });
+        pending = null;
+        next = now + 1300;
+      }
+      if (pending === null && !control.video.seeking)
+        context.producer.supply(control.video.currentTime, 1);
+    },
+  });
+  const last = events.at(-1);
+  const truth = (wall) =>
+    Math.max(last.held, last.held + (wall - last.soundAt) / 1000);
+  const draws = canvasDraws(result, last.played).filter(
+    (draw) => draw.t < last.played + 400,
+  );
+  const shown = appearances({ draws }, outputs(pictures), refreshMs);
+  let ahead = 0;
+  for (const output of shown) {
+    const wall = BASE_MS + output.refresh * refreshMs;
+    ahead = Math.max(ahead, (output.time - truth(wall)) * 1000);
+  }
+  // The picture paused on was on screen before the play, and the rest of it
+  // can have passed by the first picture after it: the main renderer's goes
+  // up a refresh after the play, a Worker's, which hears of it from the
+  // reading sent before the next refresh, a refresh later still. Pictures
+  // after it are shown.
+  const from = kind === "resume" ? last.held : last.held + 0.001 - FRAME;
+  const drawn = new Set(draws.map((draw) => draw.picture.mediaTime));
+  const unshown = pictures.filter(
+    (picture) =>
+      picture.timestamp >= from &&
+      picture.timestamp < last.held + 0.25 &&
+      !drawn.has(picture.timestamp),
+  );
+  return { ahead, unshown: unshown.length };
+}
+
+for (const kind of ["seek", "resume"])
+  for (const rendering of ["main", "worker"]) {
+    const { ahead, unshown } = await chromiumStarts({ rendering, kind });
+    const label = `${rendering}, Chromium ${kind}s`;
+    assert.ok(
+      ahead <= 2,
+      `${label}: a picture went up ${ahead.toFixed(1)} ms ahead of the sound`,
+    );
+    assert.equal(unshown, 0, `${label}: ${unshown} pictures never shown`);
+    console.log(`ok ${label}: with the sound once learnt, every picture shown`);
+  }
 
 // Other rates: the reading's steps come at the same media distance and a
 // shorter or longer wall time, and the start follows the reading. At twice

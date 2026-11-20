@@ -32,6 +32,16 @@
  * seen to stand while the element played, and one reading more: the element
  * has stopped, though it has not said so, and pictures shown on would run
  * ahead of the sound.
+ *
+ * While it waits, the position is the reading, except where the reading has
+ * been seen to run ahead of the sound when the element starts: at each start
+ * after the element was stopped, the clock runs from a reading on the sound's
+ * line, and so learns how far ahead of the sound the reading's first change
+ * was. In Chromium that is the device's output delay, about 50 ms at each
+ * start; in Firefox the reading leads by less than a reading, if at all.
+ * Where it has led by more than a reading at the last starts, the sound
+ * while the clock waits is where the reading's first change was, less that
+ * lead, and playing on from there.
  */
 
 /** Window over which the highest reading is kept, as buckets of this many milliseconds. */
@@ -127,10 +137,60 @@ export class MediaClock {
   #paced = false;
   /** While waiting after a stop on a standstill, until the reading changes. */
   #stoodStill = false;
+  /**
+   * How far ahead of the sound the reading's first change was, in wall
+   * milliseconds, at the last starts whose reading moved at the first
+   * reading after the element was stopped, oldest overwritten first. NaN
+   * until there have been that many.
+   */
+  readonly #leads = new Float64Array(3).fill(Number.NaN);
+  #leadsSeen = 0;
+  /**
+   * While waiting after the element was stopped: where it was held. NaN
+   * otherwise, and after a change between two rates it plays at.
+   */
+  #held = Number.NaN;
+  /** The reading's first change after that hold, and when it was seen. */
+  #first = Number.NaN;
+  #firstAt = Number.NaN;
+  /**
+   * While waiting: the lead the sound is worked out with, or NaN where the
+   * position is the reading.
+   */
+  #lead = Number.NaN;
+  /** Whether the reading has stood since its first change, while the lead is in use. */
+  #leadStood = false;
+  /** A reading that stood and then moved on at playing pace, while the lead is in use. */
+  #soundFloor = Number.NEGATIVE_INFINITY;
 
   /** The position at `wall`, in media seconds, or NaN while not known. */
   at(wall: number): number {
+    if (
+      this.#waiting &&
+      !Number.isNaN(this.#lead) &&
+      !Number.isNaN(this.#media)
+    )
+      return this.#soundWhileWaiting(wall);
     return this.#media + (this.#rate * (wall - this.#wall)) / 1000;
+  }
+
+  /**
+   * Where the sound is at `wall` while the clock waits on a reading known to
+   * lead it: where the reading's first change was, less the lead, playing on
+   * from there. Not before where the element was held, from where the sound
+   * starts. Not past the reading and the time since it was read, which is the
+   * furthest the element can be. Not behind a reading that stood and moved
+   * on at playing pace, which is where the sound was when it moved.
+   */
+  #soundWhileWaiting(wall: number): number {
+    const rate = this.#playbackRate;
+    const sound =
+      this.#first + (rate * (wall - this.#firstAt - this.#lead)) / 1000;
+    const furthest = this.#reading + (rate * (wall - this.#observedAt)) / 1000;
+    return Math.max(
+      this.#soundFloor,
+      Math.min(furthest, Math.max(this.#held, sound)),
+    );
   }
 
   /** The rate the clock advances at: the playback rate, or 0 while held. */
@@ -172,20 +232,34 @@ export class MediaClock {
   ): boolean {
     const sinceObserved = wall - this.#observedAt;
     this.#observedAt = wall;
+    // At a rate of 0 the element stays where it is, though it is not paused.
     if (
       !playing ||
+      playbackRate === 0 ||
       this.#holdRequested ||
       playbackRate !== this.#playbackRate
     ) {
+      // About to play after being stopped: it was not playing, or held at a
+      // rate of 0, or the hold came at the rate it plays at (a seek, a
+      // stall). A change between two rates it plays at does not stop it.
+      const stopped =
+        playbackRate !== 0 &&
+        (!playing ||
+          this.#playbackRate === 0 ||
+          playbackRate === this.#playbackRate);
       this.#holdRequested = false;
       this.#playbackRate = playbackRate;
       this.#holdAt(wall, currentTime);
+      if (stopped) this.#held = currentTime;
       return false;
     }
     const confirming = this.#confirmBy !== 0;
     if (!this.#waiting && !confirming) this.#countRunning(sinceObserved);
     if (currentTime === this.#reading) {
-      if (this.#waiting) return false;
+      if (this.#waiting) {
+        if (!Number.isNaN(this.#lead)) this.#leadStood = true;
+        return false;
+      }
       if (confirming) {
         // Overdue: a standstill like any other, so that an update that was
         // only late still starts the clock again on its own.
@@ -221,6 +295,21 @@ export class MediaClock {
     if (this.#waiting) {
       const first = !this.#stepped;
       this.#stepped = true;
+      if (first && !Number.isNaN(this.#held) && stood <= START_MARGIN_MS) {
+        // The first change, at the first reading after the element was
+        // stopped. One that stood at the held position first was not an
+        // element that had just been told to play, and is left out.
+        this.#first = currentTime;
+        this.#firstAt = wall;
+        const lead = this.#usualLead();
+        this.#lead = lead > sinceObserved + START_MARGIN_MS ? lead : Number.NaN;
+      } else if (
+        this.#leadStood &&
+        moved >= sinceObserved * START_FRACTION &&
+        moved <= sinceObserved + previousWithin + START_MARGIN_MS
+      ) {
+        this.#soundFloor = currentTime;
+      }
       // The change that ends a stop on a standstill, at playing pace over
       // all the time the reading stood: the reading stood between two
       // updates, longer than any stand seen so far, as after the rate falls
@@ -335,6 +424,12 @@ export class MediaClock {
     sinceObserved: number,
     confirm: boolean,
   ): void {
+    // A start after the element was stopped is on the sound's line: how far
+    // ahead of it the reading's first change was.
+    if (!Number.isNaN(this.#firstAt))
+      this.#leads[this.#leadsSeen++ % this.#leads.length] =
+        ((this.#first - currentTime) * 1000) / playbackRate +
+        (wall - this.#firstAt);
     this.#run(wall, currentTime);
     if (confirm)
       this.#confirmBy =
@@ -404,7 +499,25 @@ export class MediaClock {
     return (stand * 1000) / playbackRate;
   }
 
+  /**
+   * The lead of the last starts, the middle of them, so that one start the
+   * element made differently does not move it. NaN until there have been
+   * enough.
+   */
+  #usualLead(): number {
+    const [a, b, c] = this.#leads as unknown as [number, number, number];
+    if (Number.isNaN(a) || Number.isNaN(b) || Number.isNaN(c))
+      return Number.NaN;
+    return Math.max(Math.min(a, b), Math.min(Math.max(a, b), c));
+  }
+
   #holdAt(wall: number, currentTime: number): void {
+    this.#held = Number.NaN;
+    this.#first = Number.NaN;
+    this.#firstAt = Number.NaN;
+    this.#lead = Number.NaN;
+    this.#leadStood = false;
+    this.#soundFloor = Number.NEGATIVE_INFINITY;
     this.#stoodStill = false;
     this.#paced = false;
     this.#confirmBy = 0;
@@ -419,6 +532,8 @@ export class MediaClock {
   }
 
   #run(wall: number, currentTime: number): void {
+    this.#firstAt = Number.NaN;
+    this.#lead = Number.NaN;
     this.#confirmBy = 0;
     this.#wall = wall;
     this.#media = currentTime;
