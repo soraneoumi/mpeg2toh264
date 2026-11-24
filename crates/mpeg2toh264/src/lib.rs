@@ -14,6 +14,7 @@
 
 mod error;
 
+pub mod audio;
 pub mod bitreader;
 pub mod container;
 pub mod mpeg2;

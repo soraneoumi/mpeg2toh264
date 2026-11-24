@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+mod decode_audio;
+
 use mpeg2toh264::mpeg2::decode::{DecodedFrame, StreamDecoder};
 use mpeg2toh264::{
     extract_mpeg2_video_es, is_mpeg_transport_stream, mpeg2_passthrough_unit, mpeg2_to_fmp4,
@@ -53,7 +55,8 @@ Options:
   -q, --quiet               Do not print conversion progress or summary
   -h, --help                Show this help
 
-Use 'mpeg2toh264 decode --help' to decode MPEG-2 video to raw frames.
+Use 'mpeg2toh264 decode --help' to decode MPEG-2 video to raw frames, and
+'mpeg2toh264 decode-audio --help' to decode AAC to raw samples.
 ";
 
 const DECODE_USAGE: &str = "\
@@ -552,6 +555,19 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         };
         return match run_decode(&options) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("mpeg2toh264: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if args.first().is_some_and(|arg| arg == "decode-audio") {
+        let Some(options) = decode_audio::parse_args(&args[1..]) else {
+            print!("{}", decode_audio::USAGE);
+            return ExitCode::SUCCESS;
+        };
+        return match decode_audio::run(&options) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("mpeg2toh264: {error}");

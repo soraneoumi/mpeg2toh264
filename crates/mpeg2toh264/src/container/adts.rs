@@ -19,7 +19,7 @@ use super::aac::{
 use crate::error::{bail, Result};
 
 /// `sampling_frequency_index` to sample rate (ISO/IEC 14496-3 Table 1.16).
-static SAMPLE_RATES: [u32; 13] = [
+pub(crate) static SAMPLE_RATES: [u32; 13] = [
     96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025, 8_000,
     7_350,
 ];
@@ -507,7 +507,7 @@ fn is_single_channel_service(block: &Block) -> bool {
     )
 }
 
-/// The `adts_error_check` CRC of a frame whose block is `block`
+/// The `adts_error_check` CRC of a frame whose block has `elements`
 /// (ISO/IEC 13818-7, as ARIB STD-B32 requires it of every broadcast frame).
 ///
 /// It covers the header without the CRC itself, then from each element the
@@ -518,11 +518,11 @@ fn is_single_channel_service(block: &Block) -> bool {
 /// zeros; the 192 bits of a channel pair run on into its second channel stream
 /// when the first is shorter. That is the layout every frame of eight broadcast
 /// recordings matched.
-fn adts_crc(frame: &[u8], block: &Block) -> u16 {
+fn adts_crc(frame: &[u8], elements: &[Element]) -> u16 {
     let raw = &frame[9..];
     let mut crc = Crc16::default();
     crc.bits(frame, 0, 56, 56);
-    for element in &block.elements {
+    for element in elements {
         let after_id = element.start + 3;
         match element.id {
             ID_SCE | ID_LFE => crc.bits(raw, after_id, element.end, 192),
@@ -536,6 +536,12 @@ fn adts_crc(frame: &[u8], block: &Block) -> u16 {
         }
     }
     crc.value
+}
+
+/// Whether the `adts_error_check` of a frame that carries one matches the
+/// frame, whose raw_data_block has `elements` (see [`adts_crc`]).
+pub fn crc_matches(frame: &[u8], elements: &[Element]) -> bool {
+    adts_crc(frame, elements) == u16::from_be_bytes([frame[7], frame[8]])
 }
 
 /// CRC-16 with the polynomial x^16 + x^15 + x^2 + 1, from all ones, most
@@ -765,7 +771,7 @@ impl AdtsStream {
         let Some(block) = walk_block(raw_data, sampling_frequency_index) else {
             return Ok(None);
         };
-        if protected && adts_crc(frame, &block) != u16::from_be_bytes([frame[7], frame[8]]) {
+        if protected && !crc_matches(frame, &block.elements) {
             return Ok(None);
         }
         if !self.elements_fit((sampling_frequency_index, channel_count), &block) {

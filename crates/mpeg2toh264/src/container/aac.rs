@@ -1,5 +1,11 @@
-//! AAC-LC syntax walking: where every element of a raw_data_block begins and
-//! ends, and whether a decoder would accept it.
+//! AAC-LC syntax: where every element of a raw_data_block begins and ends,
+//! whether a decoder would accept it, and every value it carries.
+//!
+//! There is one reading of the syntax, and it hands each value it reads to a
+//! [`Sink`]. [`walk_block`] gives it a sink that keeps nothing; the audio
+//! decoder's parse gives it one that records what decoding needs. What a
+//! decoder accepts is decided by the reading alone, so the two cannot disagree
+//! about a block.
 
 use crate::bitreader::BitReader;
 use crate::container::aac_huffman::*;
@@ -16,27 +22,115 @@ use std::sync::LazyLock;
 /// scalefactor outside 0..=255, which is what `max_scalefactor` is kept for.
 #[derive(Default, Debug)]
 struct GlobalGains {
-    /// The bit position of every channel's `global_gain`, in stream order.
-    positions: Vec<usize>,
+    /// The bit position of every channel's `global_gain`, in stream order:
+    /// the first `count` of them.
+    positions: [usize; 2],
+    count: usize,
     /// The largest scalefactor any band reached, or `None` where no band
     /// carried one.
     max_scalefactor: Option<i32>,
 }
 
-#[derive(Clone)]
-struct IcsInfo {
-    short: bool,
-    max_sfb: usize,
-    group_len: Vec<usize>,
+/// `window_sequence` values other than ONLY_LONG_SEQUENCE's zero (ISO/IEC
+/// 14496-3 Table 4.88).
+pub(crate) const LONG_START_SEQUENCE: u8 = 1;
+pub(crate) const EIGHT_SHORT_SEQUENCE: u8 = 2;
+pub(crate) const LONG_STOP_SEQUENCE: u8 = 3;
+
+/// Codebooks with a meaning of their own rather than spectral values
+/// (ISO/IEC 14496-3 Table 4.150).
+pub(crate) const ZERO_HCB: u8 = 0;
+pub(crate) const NOISE_HCB: u8 = 13;
+pub(crate) const INTENSITY_HCB2: u8 = 14;
+pub(crate) const INTENSITY_HCB: u8 = 15;
+
+/// An `ics_info`, with the window groups its `scale_factor_grouping` makes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IcsInfo {
+    pub window_sequence: u8,
+    pub window_shape: u8,
+    pub max_sfb: usize,
+    /// How many window groups there are, and how many windows each spans:
+    /// one group of one window for a long window sequence.
+    pub groups: usize,
+    pub group_len: [u8; 8],
     /// The scalefactor band offsets of the window this `ics_info` selected.
-    offsets: &'static [u16],
+    pub offsets: &'static [u16],
 }
 
-#[derive(Clone, Copy)]
+impl IcsInfo {
+    pub fn short(&self) -> bool {
+        self.window_sequence == EIGHT_SHORT_SEQUENCE
+    }
+}
+
+/// One TNS filter as `tns_data` codes it.
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct TnsFilter {
+    /// How many bands the filter spans, counted down from where the filter
+    /// above it began.
+    pub length: u8,
+    pub order: u8,
+    /// Whether the filter runs from the top of its span downwards.
+    pub direction: bool,
+    /// Whether each coefficient is coded with one bit less than
+    /// `coef_res` says.
+    pub compress: bool,
+    /// The coded coefficients, sign-extended, the first `order` of them.
+    pub coef: [i8; 12],
+}
+
+/// Where the reading of a raw_data_block hands what it reads. Every method
+/// does nothing unless a sink overrides it, which is all a walk needs.
+///
+/// Bands are numbered `group * max_sfb + band`, in the order the syntax codes
+/// them, and spectral values are placed by `window * 128 + line` for a short
+/// window and by `line` for a long one.
+pub(crate) trait Sink {
+    /// A channel element begins: a single channel, channel pair or LFE
+    /// element.
+    fn channel_element(&mut self, _id: u8, _tag: u8) {}
+    /// The channel pair element that began shares one `ics_info` between its
+    /// channels, with this `ms_mask_present`.
+    fn common_window(&mut self, _ms_mask_present: u8) {}
+    /// One `ms_used` bit, under `ms_mask_present` 1.
+    fn ms_used(&mut self, _band: usize, _used: bool) {}
+    /// An `individual_channel_stream` begins.
+    fn channel(&mut self, _global_gain: u8, _info: &IcsInfo) {}
+    /// A band's codebook and what its scale factor data comes to: the
+    /// scalefactor of a spectral band, the noise energy of a noise band, the
+    /// intensity position of an intensity band, each run on from the band
+    /// before as the syntax codes it; zero for a band of the zero codebook.
+    fn band(&mut self, _band: usize, _codebook: u8, _value: i32) {}
+    /// The first `count` pulses, at the spectral lines they land on.
+    fn pulses(&mut self, _count: usize, _positions: [u16; 4], _amplitudes: [u8; 4]) {}
+    /// `tns_data` for one window: how many filters it has, and its
+    /// `coef_res`.
+    fn tns_window(&mut self, _window: usize, _filters: usize, _coef_res: u8) {}
+    fn tns_filter(&mut self, _window: usize, _index: usize, _filter: &TnsFilter) {}
+    /// Quantised spectral values from line `at` on.
+    fn spectral<const N: usize>(&mut self, _at: usize, _values: [i32; N]) {}
+}
+
+/// The sink of a walk, which keeps nothing.
+struct Walk;
+
+impl Sink for Walk {}
+
+#[derive(Clone, Copy, Default)]
 struct Section {
     cb: u8,
-    start: usize,
-    end: usize,
+    start: u8,
+    end: u8,
+}
+
+/// The sections of every window group of a channel stream. A section spans one
+/// band at least, so a group has no more sections than `max_sfb`: 51 for a long
+/// window, eight times 15 for the short ones.
+struct Sections {
+    list: [Section; 128],
+    /// One past the last section of each group.
+    group_end: [u8; 8],
 }
 
 /// Scalefactor band offsets of the long and the short window at one sampling
@@ -91,7 +185,7 @@ const SWB_SHORT_8: &[u16] = &[
 
 /// The long and the short window's band offsets for a
 /// `sampling_frequency_index`, or `None` for the reserved and escape values.
-fn band_tables(frequency_index: u8) -> Option<(&'static [u16], &'static [u16])> {
+pub(crate) fn band_tables(frequency_index: u8) -> Option<(&'static [u16], &'static [u16])> {
     Some(match frequency_index {
         0 | 1 => (SWB_LONG_96, SWB_SHORT_96),
         2 => (SWB_LONG_64, SWB_SHORT_96),
@@ -110,6 +204,15 @@ const LOOKUP_BITS: u32 = 10;
 /// The longest codeword of any book.
 const LONGEST_CODE: u32 = 19;
 
+/// What a spectral codeword stands for: its values in order -- magnitudes for
+/// an unsigned book, whose signs follow the codeword -- and how many of them
+/// are not zero.
+#[derive(Clone, Copy, Default)]
+struct Tuple {
+    values: [i8; 4],
+    nonzero: u8,
+}
+
 /// A codebook, with its shorter codewords laid out to be found in one read.
 struct Codebook {
     /// By the next `LOOKUP_BITS` bits of the stream: the length of the
@@ -118,10 +221,13 @@ struct Codebook {
     short: [u16; 1 << LOOKUP_BITS],
     /// Every codeword, in order of length and then of value.
     codes: &'static [AacVlc],
+    /// By codeword index, the values of a spectral book; empty for the
+    /// scalefactor book.
+    tuples: Vec<Tuple>,
 }
 
 impl Codebook {
-    fn new(codes: &'static [AacVlc]) -> Self {
+    fn new(codes: &'static [AacVlc], tuples: Vec<Tuple>) -> Self {
         let mut short = [0; 1 << LOOKUP_BITS];
         for code in codes {
             let len = code.len as u32;
@@ -131,7 +237,47 @@ impl Codebook {
                     .fill(code.index << 5 | code.len as u16);
             }
         }
-        Self { short, codes }
+        Self {
+            short,
+            codes,
+            tuples,
+        }
+    }
+}
+
+/// The values of every codeword of spectral book `cb` (ISO/IEC 14496-3
+/// 4.6.3.3): the index is the values as digits, the first most significant,
+/// in base `lav + 1` for an unsigned book and `2 * lav + 1` offset by `lav` for
+/// a signed one.
+fn tuples(cb: usize) -> Vec<Tuple> {
+    let (unsigned, dimension, lav) = book_shape(cb as u8);
+    let radix = if unsigned { lav + 1 } else { 2 * lav + 1 };
+    let count = radix.pow(dimension as u32);
+    (0..count)
+        .map(|mut index| {
+            let mut tuple = Tuple::default();
+            for value in tuple.values[..dimension].iter_mut().rev() {
+                let digit = (index % radix) as i8;
+                index /= radix;
+                *value = if unsigned { digit } else { digit - lav as i8 };
+            }
+            tuple.nonzero = tuple.values.iter().filter(|&&v| v != 0).count() as u8;
+            tuple
+        })
+        .collect()
+}
+
+/// Whether spectral book `cb` codes magnitudes with separate signs, how many
+/// values a codeword carries, and the largest absolute value it codes.
+fn book_shape(cb: u8) -> (bool, usize, usize) {
+    match cb {
+        1 | 2 => (false, 4, 1),
+        3 | 4 => (true, 4, 2),
+        5 | 6 => (false, 2, 4),
+        7 | 8 => (true, 2, 7),
+        9 | 10 => (true, 2, 12),
+        11 => (true, 2, 16),
+        _ => unreachable!("spectral books are 1 to 11"),
     }
 }
 
@@ -151,7 +297,12 @@ static CODEBOOKS: LazyLock<[Codebook; 12]> = LazyLock::new(|| {
         &SPECTRAL_10,
         &SPECTRAL_11,
     ];
-    books.map(Codebook::new)
+    let mut cb = 0;
+    books.map(|codes| {
+        let tuples = if cb == 0 { Vec::new() } else { tuples(cb) };
+        cb += 1;
+        Codebook::new(codes, tuples)
+    })
 });
 
 fn scalefactor_book() -> &'static Codebook {
@@ -188,23 +339,28 @@ fn ics_info(r: &mut BitReader<'_>, tables: BandTables) -> Result<IcsInfo> {
     if r.flag() {
         bail!("AAC ics_reserved_bit is set");
     }
-    let sequence = r.u(2);
-    r.skip(1); // window_shape
-    let info = if sequence == 2 {
+    let window_sequence = r.u(2) as u8;
+    let window_shape = r.u(1) as u8;
+    let info = if window_sequence == EIGHT_SHORT_SEQUENCE {
         let max_sfb = r.u(4) as usize;
         let grouping = r.u(7);
-        let mut groups = vec![1usize];
+        let mut group_len = [0u8; 8];
+        let mut groups = 1;
+        group_len[0] = 1;
         for bit in (0..7).rev() {
             if grouping & (1 << bit) != 0 {
-                *groups.last_mut().unwrap() += 1;
+                group_len[groups - 1] += 1;
             } else {
-                groups.push(1);
+                group_len[groups] = 1;
+                groups += 1;
             }
         }
         IcsInfo {
-            short: true,
+            window_sequence,
+            window_shape,
             max_sfb,
-            group_len: groups,
+            groups,
+            group_len,
             offsets: tables.1,
         }
     } else {
@@ -213,9 +369,11 @@ fn ics_info(r: &mut BitReader<'_>, tables: BandTables) -> Result<IcsInfo> {
             bail!("AAC-LC predictor_data_present is unsupported");
         }
         IcsInfo {
-            short: false,
+            window_sequence,
+            window_shape,
             max_sfb,
-            group_len: vec![1],
+            groups: 1,
+            group_len: [1, 0, 0, 0, 0, 0, 0, 0],
             offsets: tables.0,
         }
     };
@@ -232,17 +390,16 @@ fn ics_info(r: &mut BitReader<'_>, tables: BandTables) -> Result<IcsInfo> {
 /// The long and the short window's band offsets at one sampling rate.
 type BandTables = (&'static [u16], &'static [u16]);
 
-fn band_count(offsets: &[u16]) -> usize {
+pub(crate) fn band_count(offsets: &[u16]) -> usize {
     offsets.len() - 1
 }
 
-fn sections(r: &mut BitReader<'_>, info: &IcsInfo) -> Result<Vec<Vec<Section>>> {
-    let len_bits = if info.short { 3 } else { 5 };
+fn sections(r: &mut BitReader<'_>, info: &IcsInfo, out: &mut Sections) -> Result<()> {
+    let len_bits = if info.short() { 3 } else { 5 };
     let escape = (1usize << len_bits) - 1;
-    let mut groups = Vec::new();
-    for _ in &info.group_len {
+    let mut count = 0;
+    for g in 0..info.groups {
         let mut at = 0;
-        let mut group = Vec::new();
         while at < info.max_sfb {
             let cb = r.u(4) as u8;
             let mut length = 0;
@@ -256,56 +413,72 @@ fn sections(r: &mut BitReader<'_>, info: &IcsInfo) -> Result<Vec<Vec<Section>>> 
             if length == 0 || at + length > info.max_sfb || cb == 12 {
                 bail!("invalid AAC section at bit {}", r.bit_pos());
             }
-            group.push(Section {
+            out.list[count] = Section {
                 cb,
-                start: at,
-                end: at + length,
-            });
+                start: at as u8,
+                end: (at + length) as u8,
+            };
+            count += 1;
             at += length;
         }
-        groups.push(group);
+        out.group_end[g] = count as u8;
     }
-    Ok(groups)
+    Ok(())
 }
 
-fn scale_factors(
+/// `scale_factor_data`, run on from `global_gain` as ISO/IEC 14496-3 4.6.2.3.3
+/// has it: the band scalefactors from `global_gain`, the noise energies from
+/// `global_gain - 90` with the first of them a nine-bit difference offset by
+/// 256, and the intensity positions from zero.
+fn scale_factors<S: Sink>(
     r: &mut BitReader<'_>,
     info: &IcsInfo,
-    sections: &[Vec<Section>],
+    sections: &Sections,
     global_gain: u32,
     gains: &mut GlobalGains,
+    sink: &mut S,
 ) -> Result<()> {
     let mut first_noise = true;
     // Only the spectral bands' scalefactors run on from `global_gain` and are
     // held to 0..=255. Noise energies and intensity positions are differences
     // of their own, which a decoder clips rather than refuses.
     let mut scalefactor = global_gain as i32;
-    for group in sections.iter().take(info.group_len.len()) {
-        for section in group {
-            for _ in section.start..section.end {
-                match section.cb {
-                    0 => {}
-                    13 if first_noise => {
-                        r.skip(9);
+    let mut noise_energy = global_gain as i32 - 90;
+    let mut intensity_position = 0;
+    let mut band = 0;
+    for section in &sections.list[..sections.group_end[info.groups - 1] as usize] {
+        for _ in section.start..section.end {
+            let value = match section.cb {
+                ZERO_HCB => 0,
+                NOISE_HCB => {
+                    noise_energy += if first_noise {
                         first_noise = false;
-                    }
-                    1..=11 => {
-                        scalefactor += vlc(r, scalefactor_book())? as i32 - 60;
-                        if !(0..=255).contains(&scalefactor) {
-                            bail!("AAC scalefactor {scalefactor} is outside 0..=255");
-                        }
-                        gains.max_scalefactor = Some(
-                            gains
-                                .max_scalefactor
-                                .map_or(scalefactor, |m| m.max(scalefactor)),
-                        );
-                    }
-                    13..=15 => {
-                        vlc(r, scalefactor_book())?;
-                    }
-                    _ => bail!("unsupported AAC scalefactor codebook {}", section.cb),
+                        r.u(9) as i32 - 256
+                    } else {
+                        vlc(r, scalefactor_book())? as i32 - 60
+                    };
+                    noise_energy
                 }
-            }
+                1..=11 => {
+                    scalefactor += vlc(r, scalefactor_book())? as i32 - 60;
+                    if !(0..=255).contains(&scalefactor) {
+                        bail!("AAC scalefactor {scalefactor} is outside 0..=255");
+                    }
+                    gains.max_scalefactor = Some(
+                        gains
+                            .max_scalefactor
+                            .map_or(scalefactor, |m| m.max(scalefactor)),
+                    );
+                    scalefactor
+                }
+                INTENSITY_HCB2 | INTENSITY_HCB => {
+                    intensity_position += vlc(r, scalefactor_book())? as i32 - 60;
+                    intensity_position
+                }
+                _ => bail!("unsupported AAC scalefactor codebook {}", section.cb),
+            };
+            sink.band(band, section.cb, value);
+            band += 1;
         }
     }
     Ok(())
@@ -313,11 +486,11 @@ fn scale_factors(
 
 /// `pulse_data`, which only a long window may carry, and whose pulses have to
 /// land inside the spectrum.
-fn pulses(r: &mut BitReader<'_>, info: &IcsInfo) -> Result<()> {
-    if info.short {
+fn pulses<S: Sink>(r: &mut BitReader<'_>, info: &IcsInfo, sink: &mut S) -> Result<()> {
+    if info.short() {
         bail!("AAC pulse data in a short window");
     }
-    let count = r.u(2) + 1;
+    let count = r.u(2) as usize + 1;
     let start_band = r.u(6) as usize;
     let bands = band_count(info.offsets);
     if start_band >= bands {
@@ -325,160 +498,224 @@ fn pulses(r: &mut BitReader<'_>, info: &IcsInfo) -> Result<()> {
     }
     let limit = info.offsets[bands] as u32;
     let mut position = info.offsets[start_band] as u32;
-    for _ in 0..count {
+    let mut positions = [0; 4];
+    let mut amplitudes = [0; 4];
+    for (at, amplitude) in positions.iter_mut().zip(&mut amplitudes).take(count) {
         position += r.u(5); // pulse_offset
-        r.skip(4); // pulse_amp
+        *amplitude = r.u(4) as u8;
         if position >= limit {
             bail!("AAC pulse at line {position} is past the end of the spectrum");
         }
+        *at = position as u16;
     }
+    sink.pulses(count, positions, amplitudes);
     Ok(())
 }
 
 /// `tns_data`. AAC-LC allows filters of order 12 in a long window and 7 in a
 /// short one, and the order field is wide enough to say more.
-fn tns(r: &mut BitReader<'_>, info: &IcsInfo) -> Result<()> {
-    let (windows, max_order) = if info.short { (8, 7) } else { (1, 12) };
-    for _ in 0..windows {
-        let filters = r.u(if info.short { 1 } else { 2 });
+fn tns<S: Sink>(r: &mut BitReader<'_>, info: &IcsInfo, sink: &mut S) -> Result<()> {
+    let short = info.short();
+    let (windows, max_order) = if short { (8, 7) } else { (1, 12) };
+    for window in 0..windows {
+        let filters = r.u(if short { 1 } else { 2 }) as usize;
         let resolution = if filters != 0 { r.u(1) } else { 0 };
-        for _ in 0..filters {
-            r.skip(if info.short { 4 } else { 6 });
-            let order = r.u(if info.short { 3 } else { 5 });
+        sink.tns_window(window, filters, resolution as u8);
+        for index in 0..filters {
+            let length = r.u(if short { 4 } else { 6 }) as u8;
+            let order = r.u(if short { 3 } else { 5 });
             if order > max_order {
                 bail!("AAC TNS filter order {order} exceeds {max_order}");
             }
+            let mut filter = TnsFilter {
+                length,
+                order: order as u8,
+                ..TnsFilter::default()
+            };
             if order != 0 {
-                r.skip(1);
-                let compress = r.u(1);
-                r.skip(order * (resolution + 3 - compress));
+                filter.direction = r.flag();
+                filter.compress = r.flag();
+                let bits = resolution + 3 - filter.compress as u32;
+                for coef in &mut filter.coef[..order as usize] {
+                    // Two's complement in `bits` bits.
+                    *coef = ((r.u(bits) << (32 - bits)) as i32 >> (32 - bits)) as i8;
+                }
+            }
+            sink.tns_filter(window, index, &filter);
+        }
+    }
+    Ok(())
+}
+
+fn spectral<S: Sink>(
+    r: &mut BitReader<'_>,
+    info: &IcsInfo,
+    sections: &Sections,
+    sink: &mut S,
+) -> Result<()> {
+    let mut first = 0;
+    let mut window = 0;
+    for g in 0..info.groups {
+        let windows = window..window + info.group_len[g] as usize;
+        let end = sections.group_end[g] as usize;
+        for section in &sections.list[first..end] {
+            let at = (info.offsets, section, windows.clone());
+            match section.cb {
+                1 | 2 => section_values::<4, false, false, S>(r, at, sink)?,
+                3 | 4 => section_values::<4, true, false, S>(r, at, sink)?,
+                5 | 6 => section_values::<2, false, false, S>(r, at, sink)?,
+                7..=10 => section_values::<2, true, false, S>(r, at, sink)?,
+                11 => section_values::<2, true, true, S>(r, at, sink)?,
+                _ => {}
+            }
+        }
+        first = end;
+        window = windows.end;
+    }
+    Ok(())
+}
+
+/// The spectral values of one section, coded with a book of `N` values a
+/// codeword, `UNSIGNED` if it codes magnitudes whose signs follow, `ESCAPE` for
+/// book 11. Within a window group the values run band by band, and within a
+/// band window by window (ISO/IEC 14496-3 4.6.3.3).
+#[inline(always)]
+fn section_values<const N: usize, const UNSIGNED: bool, const ESCAPE: bool, S: Sink>(
+    r: &mut BitReader<'_>,
+    (offsets, section, windows): (&[u16], &Section, std::ops::Range<usize>),
+    sink: &mut S,
+) -> Result<()> {
+    let book = &CODEBOOKS[section.cb as usize];
+    for band in section.start as usize..section.end as usize {
+        let (low, high) = (offsets[band] as usize, offsets[band + 1] as usize);
+        for window in windows.clone() {
+            for line in (window * 128 + low..window * 128 + high).step_by(N) {
+                let tuple = book.tuples[vlc(r, book)?];
+                let mut values = [0i32; N];
+                for (value, &coded) in values.iter_mut().zip(&tuple.values) {
+                    *value = coded as i32;
+                }
+                if UNSIGNED {
+                    let signs = r.u(tuple.nonzero as u32);
+                    let mut left = tuple.nonzero as u32;
+                    for value in &mut values {
+                        if *value != 0 {
+                            left -= 1;
+                            if signs >> left & 1 != 0 {
+                                *value = -*value;
+                            }
+                        }
+                    }
+                }
+                if ESCAPE {
+                    for (value, &coded) in values.iter_mut().zip(&tuple.values) {
+                        if coded == 16 {
+                            *value = value.signum() * escape(r)?;
+                        }
+                    }
+                }
+                sink.spectral(line, values);
             }
         }
     }
     Ok(())
 }
 
-fn spectral(r: &mut BitReader<'_>, info: &IcsInfo, groups: &[Vec<Section>]) -> Result<()> {
-    let offsets = info.offsets;
-    for (g, sections) in groups.iter().enumerate() {
-        for section in sections {
-            if !matches!(section.cb, 1..=11) {
-                continue;
-            }
-            let (unsigned, dimension, lav) = match section.cb {
-                1 | 2 => (false, 4, 1),
-                3 | 4 => (true, 4, 2),
-                5 | 6 => (false, 2, 4),
-                7 | 8 => (true, 2, 7),
-                9 | 10 => (true, 2, 12),
-                11 => (true, 2, 16),
-                _ => unreachable!(),
-            };
-            let book = &CODEBOOKS[section.cb as usize];
-            let coefficients =
-                (offsets[section.end] - offsets[section.start]) as usize * info.group_len[g];
-            for _ in 0..coefficients / dimension {
-                let mut index = vlc(r, book)?;
-                let radix = if unsigned { lav + 1 } else { 2 * lav + 1 };
-                let mut values = [0usize; 4];
-                for value in values[..dimension].iter_mut().rev() {
-                    *value = index % radix;
-                    index /= radix;
-                }
-                if unsigned {
-                    r.skip(values[..dimension].iter().filter(|&&v| v != 0).count() as u32);
-                }
-                if section.cb == 11 {
-                    for _ in values[..dimension].iter().filter(|&&v| v == 16) {
-                        // An escape codes a magnitude below 2^13 in a prefix of
-                        // at most eight ones; a longer prefix is not a value.
-                        let mut ones = 0;
-                        while r.flag() {
-                            ones += 1;
-                            if ones > 8 {
-                                bail!("AAC escape sequence longer than eight ones");
-                            }
-                        }
-                        r.skip(ones + 4);
-                    }
-                }
-            }
+/// The magnitude an escape sequence codes: a prefix of ones, a zero, and as
+/// many bits as four more than the ones.
+#[inline]
+fn escape(r: &mut BitReader<'_>) -> Result<i32> {
+    // An escape codes a magnitude below 2^13 in a prefix of at most eight
+    // ones; a longer prefix is not a value.
+    let mut ones = 0;
+    while r.flag() {
+        ones += 1;
+        if ones > 8 {
+            bail!("AAC escape sequence longer than eight ones");
         }
     }
-    Ok(())
+    Ok((1 << (ones + 4)) + r.u(ones + 4) as i32)
 }
 
 /// One `individual_channel_stream`. A channel pair whose `common_window` is set
 /// shares one `ics_info` between its two channels, and passes it in here rather
 /// than letting each read its own.
-fn skip_ics_sharing(
+fn channel_stream<S: Sink>(
     r: &mut BitReader<'_>,
     shared: Option<&IcsInfo>,
     tables: BandTables,
     gains: &mut GlobalGains,
+    sink: &mut S,
 ) -> Result<()> {
-    gains.positions.push(r.bit_pos());
+    gains.positions[gains.count] = r.bit_pos();
+    gains.count += 1;
     let global_gain = r.u(8);
-    let owned;
     let info = match shared {
-        Some(info) => info,
-        None => {
-            owned = ics_info(r, tables)?;
-            &owned
-        }
+        Some(info) => *info,
+        None => ics_info(r, tables)?,
     };
-    let sections = sections(r, info)?;
-    scale_factors(r, info, &sections, global_gain, gains)?;
+    sink.channel(global_gain as u8, &info);
+    let mut sections_of = Sections {
+        list: [Section::default(); 128],
+        group_end: [0; 8],
+    };
+    sections(r, &info, &mut sections_of)?;
+    scale_factors(r, &info, &sections_of, global_gain, gains, sink)?;
     if r.flag() {
-        pulses(r, info)?;
+        pulses(r, &info, sink)?;
     }
     if r.flag() {
-        tns(r, info)?;
+        tns(r, &info, sink)?;
     }
     if r.flag() {
         bail!("AAC-LC gain_control_data is unsupported");
     }
-    spectral(r, info, &sections)
+    spectral(r, &info, &sections_of, sink)
 }
 
 /// Bit position just past a one-channel element -- `single_channel_element` or
 /// the `lfe_channel_element` that shares its syntax -- starting at `start`.
-fn single_channel_end(
+fn single_channel_end<S: Sink>(
     data: &[u8],
     start: usize,
     tables: BandTables,
     gains: &mut GlobalGains,
+    sink: &mut S,
 ) -> Result<usize> {
     let mut r = BitReader::at_bit(data, start + 7); // id_syn_ele, element_instance_tag
-    skip_ics_sharing(&mut r, None, tables, gains)?;
+    channel_stream(&mut r, None, tables, gains, sink)?;
     Ok(r.bit_pos())
 }
 
 /// Bit position just past the `channel_pair_element` starting at `start`.
-fn cpe_end(
+fn cpe_end<S: Sink>(
     data: &[u8],
     start: usize,
     tables: BandTables,
     gains: &mut GlobalGains,
+    sink: &mut S,
 ) -> Result<usize> {
     let mut r = BitReader::at_bit(data, start + 7); // id_syn_ele, element_instance_tag
     let shared = if r.flag() {
         // common_window: one ics_info for both channels, and the mid/side mask
         // that only a shared window can carry.
         let info = ics_info(&mut r, tables)?;
-        match r.u(2) {
-            0 | 2 => {}
-            1 => {
-                r.skip((info.group_len.len() * info.max_sfb) as u32);
+        let ms_mask_present = r.u(2) as u8;
+        if ms_mask_present == 3 {
+            bail!("reserved AAC ms_mask_present at bit {}", r.bit_pos());
+        }
+        sink.common_window(ms_mask_present);
+        if ms_mask_present == 1 {
+            for band in 0..info.groups * info.max_sfb {
+                sink.ms_used(band, r.flag());
             }
-            _ => bail!("reserved AAC ms_mask_present at bit {}", r.bit_pos()),
         }
         Some(info)
     } else {
         None
     };
-    skip_ics_sharing(&mut r, shared.as_ref(), tables, gains)?;
-    skip_ics_sharing(&mut r, shared.as_ref(), tables, gains)?;
+    channel_stream(&mut r, shared.as_ref(), tables, gains, sink)?;
+    channel_stream(&mut r, shared.as_ref(), tables, gains, sink)?;
     Ok(r.bit_pos())
 }
 
@@ -516,7 +753,50 @@ impl Element {
     }
 }
 
-/// What a `program_config_element` says, as far as repackaging needs it.
+/// One channel element a `program_config_element` names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PceElement {
+    /// A channel pair rather than a single channel; always false for an LFE.
+    pub is_cpe: bool,
+    pub tag: u8,
+}
+
+/// The channel elements of one position -- front, side, back or LFE -- in the
+/// order the `program_config_element` lists them. A count is four bits at
+/// most, two for the LFEs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PceElements {
+    len: u8,
+    elements: [PceElement; 15],
+}
+
+impl PceElements {
+    pub fn as_slice(&self) -> &[PceElement] {
+        &self.elements[..self.len as usize]
+    }
+
+    /// The channels they carry.
+    pub fn channels(&self) -> usize {
+        self.as_slice()
+            .iter()
+            .map(|element| 1 + element.is_cpe as usize)
+            .sum()
+    }
+
+    fn read(r: &mut BitReader<'_>, count: u32, may_pair: bool) -> Self {
+        let mut out = Self {
+            len: count as u8,
+            ..Self::default()
+        };
+        for element in &mut out.elements[..count as usize] {
+            element.is_cpe = may_pair && r.flag();
+            element.tag = r.u(4) as u8;
+        }
+        out
+    }
+}
+
+/// What a `program_config_element` says.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PceInfo {
     /// The bit after `element_instance_tag`, where the part of the element an
@@ -526,6 +806,13 @@ pub struct PceInfo {
     /// comment field.
     pub body_end: usize,
     pub channels: u8,
+    pub matrix_mixdown_idx_present: bool,
+    pub matrix_mixdown_idx: u8,
+    pub pseudo_surround_enable: bool,
+    pub front: PceElements,
+    pub side: PceElements,
+    pub back: PceElements,
+    pub lfe: PceElements,
 }
 
 /// A raw_data_block that has been walked from its first element to `ID_END`.
@@ -557,9 +844,24 @@ impl Block {
 /// reason. Every frame of eight broadcast recordings, over nine thousand of
 /// them, ends at the last byte of its block.
 pub fn walk_block(data: &[u8], frequency_index: u8) -> Option<Block> {
+    let mut elements = Vec::new();
+    let pce = read_block(data, frequency_index, &mut elements, &mut Walk)?;
+    Some(Block { elements, pce })
+}
+
+/// Read the raw_data_block in `data` as [`walk_block`] describes, handing every
+/// value to `sink` and every element to `elements`, which is cleared first.
+/// `None` where a decoder would refuse the block; otherwise the
+/// `program_config_element` that describes its channels, if it has one.
+pub(crate) fn read_block<S: Sink>(
+    data: &[u8],
+    frequency_index: u8,
+    elements: &mut Vec<Element>,
+    sink: &mut S,
+) -> Option<Option<PceInfo>> {
+    elements.clear();
     let tables = band_tables(frequency_index)?;
     let total = data.len() * 8;
-    let mut elements = Vec::new();
     let mut pce = None;
     let mut at = 0;
     loop {
@@ -569,13 +871,19 @@ pub fn walk_block(data: &[u8], frequency_index: u8) -> Option<Block> {
         let mut r = BitReader::at_bit(data, at);
         let id = r.u(3) as u8;
         if id == ID_END {
-            return ((at + 3).div_ceil(8) == data.len()).then_some(Block { elements, pce });
+            return ((at + 3).div_ceil(8) == data.len()).then_some(pce);
         }
         let tag = if id == ID_FIL { 0 } else { r.u(4) as u8 };
         let mut gains = GlobalGains::default();
         let end = match id {
-            ID_SCE | ID_LFE => single_channel_end(data, at, tables, &mut gains).ok()?,
-            ID_CPE => cpe_end(data, at, tables, &mut gains).ok()?,
+            ID_SCE | ID_LFE => {
+                sink.channel_element(id, tag);
+                single_channel_end(data, at, tables, &mut gains, sink).ok()?
+            }
+            ID_CPE => {
+                sink.channel_element(id, tag);
+                cpe_end(data, at, tables, &mut gains, sink).ok()?
+            }
             ID_PCE => {
                 let (info, end) = program_config_element(data, at);
                 if !elements.iter().any(Element::is_channel) {
@@ -594,7 +902,7 @@ pub fn walk_block(data: &[u8], frequency_index: u8) -> Option<Block> {
             return None;
         }
         let mut global_gains = [None; 2];
-        for (slot, &position) in global_gains.iter_mut().zip(&gains.positions) {
+        for (slot, &position) in global_gains.iter_mut().zip(&gains.positions[..gains.count]) {
             *slot = Some(position);
         }
         elements.push(Element {
@@ -626,15 +934,18 @@ fn program_config_element(data: &[u8], start: usize) -> (PceInfo, usize) {
     if r.flag() {
         r.skip(4); // stereo_mixdown_element_number
     }
-    if r.flag() {
-        r.skip(3); // matrix_mixdown_idx, pseudo_surround_enable
-    }
-    let mut channels = lfe as u8;
-    for _ in 0..front + side + back {
-        channels += if r.flag() { 2 } else { 1 };
-        r.skip(4);
-    }
-    r.skip((lfe + assoc) * 4 + cc * 5);
+    let matrix_mixdown_idx_present = r.flag();
+    let (matrix_mixdown_idx, pseudo_surround_enable) = if matrix_mixdown_idx_present {
+        (r.u(2) as u8, r.flag())
+    } else {
+        (0, false)
+    };
+    let front = PceElements::read(&mut r, front, true);
+    let side = PceElements::read(&mut r, side, true);
+    let back = PceElements::read(&mut r, back, true);
+    let lfe = PceElements::read(&mut r, lfe, false);
+    let channels = (front.channels() + side.channels() + back.channels() + lfe.channels()) as u8;
+    r.skip(assoc * 4 + cc * 5);
     let body_end = r.bit_pos();
     r.align_to_byte();
     let comments = r.u(8);
@@ -644,6 +955,13 @@ fn program_config_element(data: &[u8], start: usize) -> (PceInfo, usize) {
             body_start: start + 7,
             body_end,
             channels,
+            matrix_mixdown_idx_present,
+            matrix_mixdown_idx,
+            pseudo_surround_enable,
+            front,
+            side,
+            back,
+            lfe,
         },
         r.bit_pos(),
     )
@@ -680,7 +998,7 @@ fn fill_element_end(data: &[u8], start: usize) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Every codeword of every book reads back as its own index and length,
@@ -703,18 +1021,19 @@ mod tests {
 
     /// A bit string under construction, with codewords taken from the books.
     #[derive(Default)]
-    struct Bits {
-        bytes: Vec<u8>,
-        len: usize,
+    pub(crate) struct Bits {
+        pub bytes: Vec<u8>,
+        pub len: usize,
     }
 
     impl Bits {
-        fn put(&mut self, count: usize, value: u32) -> &mut Self {
+        pub fn put(&mut self, count: usize, value: u32) -> &mut Self {
             for shift in (0..count).rev() {
                 if self.len % 8 == 0 {
                     self.bytes.push(0);
                 }
-                if (value >> shift) & 1 != 0 {
+                // Bits above the value's 32 are zeros.
+                if shift < 32 && (value >> shift) & 1 != 0 {
                     *self.bytes.last_mut().unwrap() |= 0x80 >> (self.len % 8);
                 }
                 self.len += 1;
@@ -722,7 +1041,7 @@ mod tests {
             self
         }
 
-        fn code(&mut self, book: &[AacVlc], index: usize) -> &mut Self {
+        pub fn code(&mut self, book: &[AacVlc], index: usize) -> &mut Self {
             let code = book
                 .iter()
                 .find(|code| code.index as usize == index)
@@ -731,7 +1050,7 @@ mod tests {
         }
 
         /// `ID_END` and the alignment after it.
-        fn end(&mut self) -> Vec<u8> {
+        pub fn end(&mut self) -> Vec<u8> {
             self.put(3, ID_END as u32);
             std::mem::take(&mut self.bytes)
         }
