@@ -30,6 +30,8 @@ export interface SoundOutputHandlers {
   report: (position: SoundPosition) => void;
   /** The processor could not be loaded or failed. */
   error: (error: Error) => void;
+  /** Each animation frame, with its refresh time, after the clock has been read. */
+  frame: (now: number) => void;
 }
 
 export class SoundOutput {
@@ -135,8 +137,9 @@ export class SoundOutput {
     this.clock.sample();
   };
 
-  #onFrame = (): void => {
+  #onFrame = (now: number): void => {
     this.clock.sample();
+    this.#handlers.frame(now);
     this.#frame = requestAnimationFrame(this.#onFrame);
   };
 }

@@ -146,6 +146,11 @@ export class MediaTakeover {
     return this.#paused;
   }
 
+  /** Whether the sound is playing and playback is wanted. */
+  get playing(): boolean {
+    return this.#running && !this.#paused;
+  }
+
   get readyState(): Ready {
     return this.#readyState;
   }

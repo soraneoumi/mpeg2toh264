@@ -37,6 +37,7 @@ import {
   type TimingMark,
 } from "./protocol.js";
 import bundledWorkerURL from "./worker.ts?worker&url";
+import { DisplayLock } from "./display-lock.js";
 import { MediaTakeover, Ready } from "./media-takeover.js";
 import { SoundOutput } from "./sound-output.js";
 import type { SoundPosition } from "./sound/index.js";
@@ -392,6 +393,13 @@ export class Mpeg2TsPlayer extends EventTarget {
   /** Decode mode: the sound's way out, and the element's media interface. */
   #sound: SoundOutput | null = null;
   #takeover: MediaTakeover | null = null;
+  #lock: DisplayLock | null = null;
+  /**
+   * The grid the pictures change on -- a field, or a frame of progressive
+   * video -- in seconds, and a media time on it; from the last picture taken.
+   */
+  #gridStep: number | null = null;
+  #gridOrigin = 0;
   /**
    * Decode mode: where the current epoch starts, and whether each of the two
    * things playback waits for after a start or a seek is there -- the sound
@@ -755,7 +763,13 @@ export class Mpeg2TsPlayer extends EventTarget {
       error: (error) => {
         if (id === this.#generation) this.#fail(error);
       },
+      frame: (now) => {
+        if (id === this.#generation) this.#lockFrame(now);
+      },
     });
+    const lock = new DisplayLock((ratio) =>
+      sound.control({ type: "adjust", ratio }),
+    );
     const takeover = new MediaTakeover(this.video, {
       play: () => this.#startIfReady(),
       pause: () => sound.control({ type: "pause" }),
@@ -773,6 +787,22 @@ export class Mpeg2TsPlayer extends EventTarget {
     takeover.install();
     this.#sound = sound;
     this.#takeover = takeover;
+    this.#lock = lock;
+    this.#gridStep = null;
+  }
+
+  /** Hold the media clock to the display, for the refresh at `now`. */
+  #lockFrame(now: number): void {
+    const sound = this.#sound!;
+    const takeover = this.#takeover!;
+    this.#lock!.frame({
+      now,
+      at: (wall) => sound.clock.at(wall),
+      speed: sound.clock.speed,
+      step: this.#gridStep,
+      origin: this.#gridOrigin,
+      active: takeover.playing && takeover.rate === 1,
+    });
   }
 
   /**
@@ -780,6 +810,7 @@ export class Mpeg2TsPlayer extends EventTarget {
    * sound and its first picture are in (`#startIfReady`).
    */
   #beginSoundEpoch(at: number): void {
+    this.#lock?.reset();
     this.#epochAt = at;
     this.#soundReady = false;
     this.#pictureReady = false;
@@ -904,6 +935,11 @@ export class Mpeg2TsPlayer extends EventTarget {
       this.#emit("error", { error: toError(error) });
       return;
     }
+    // A field of interlaced video, three for one whose first is repeated;
+    // the picture of progressive video.
+    const fields = picture.interlaced ? (picture.repeatFirstField ? 3 : 2) : 1;
+    this.#gridStep = picture.duration / fields;
+    this.#gridOrigin = picture.timestamp;
     if (
       !this.#pictureReady &&
       picture.timestamp + picture.duration > this.#epochAt
@@ -1427,6 +1463,7 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.#sink = null;
     this.#sound?.close();
     this.#sound = null;
+    this.#lock = null;
     // Before the element is reset below, which is its own again by then.
     this.#takeover?.uninstall();
     this.#takeover = null;
