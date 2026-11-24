@@ -81,6 +81,14 @@ export type WorkerCommand =
   /** A decoded picture, its buffer transferred. `id` comes back with the buffer. */
   | { type: "picture"; id: number; picture: DecodedPicture }
   | { type: "pictures"; action: "reset" | "finish" }
+  /** `DecodedVideoInput.startsAt`, `at` taken on the page's clock. */
+  | {
+      type: "start";
+      media: number;
+      at: number;
+      timeOrigin: number;
+      video: WorkerVideoState;
+    }
   /** A reading of the element's clock, taken at `at` on the page's clock. */
   | {
       type: "clock";

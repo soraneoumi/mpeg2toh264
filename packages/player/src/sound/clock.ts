@@ -117,7 +117,7 @@ export class SoundClock {
     const last = reports.at(-1);
     if (last !== undefined && last.epoch !== position.epoch) reports.length = 0;
     reports.push(position);
-    const heard = this.#frameAt(performance.now());
+    const heard = this.frameAt(performance.now());
     if (Number.isNaN(heard)) {
       if (reports.length > REPORTS) reports.shift();
       return;
@@ -184,7 +184,7 @@ export class SoundClock {
 
   /** Media time being heard at wall time `wall`, or NaN when not playing or not yet known. */
   at(wall: number): number {
-    const frame = this.#frameAt(wall);
+    const frame = this.frameAt(wall);
     const report = this.#reportAt(frame);
     if (report === undefined) return Number.NaN;
     if (report.state === "playing")
@@ -198,7 +198,7 @@ export class SoundClock {
 
   /** Media seconds per wall second right now; 0 when not playing. */
   get speed(): number {
-    const report = this.#reportAt(this.#frameAt(performance.now()));
+    const report = this.#reportAt(this.frameAt(performance.now()));
     if (report === undefined || report.state !== "playing") return 0;
     return report.speed * this.#slope;
   }
@@ -219,8 +219,8 @@ export class SoundClock {
     );
   }
 
-  /** The context frame being played at wall time `wall`; NaN until known. */
-  #frameAt(wall: number): number {
+  /** The context frame being heard at wall time `wall`; NaN until known. */
+  frameAt(wall: number): number {
     if (!this.#locked) return Number.NaN;
     return this.#line(wall - this.#latency * 1000) * this.#rate;
   }

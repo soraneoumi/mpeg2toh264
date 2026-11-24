@@ -147,6 +147,12 @@ const AV_CORRECTION_SECONDS = 0.02;
  * sound's speed by up to this much to match.
  */
 const MAX_DISPLAY_DEVIATION = 0.005;
+/**
+ * How long, in ms, decoded pictures are counted from an announced start
+ * (`startsAt`) without a reading of the clock confirming that the sound
+ * plays: well past the reading or two the clock takes to see it move.
+ */
+const START_TRUST_MS = 250;
 /** Time constant of the average of that difference which `avDifference` reports, in ms. */
 const AV_FILTER_MS = 1000;
 
@@ -870,6 +876,16 @@ export class Deinterlacer extends EventTarget {
   #counting = false;
   #cursor = 0;
   #cursorAt = 0;
+  /** The playback speed the count last moved at. */
+  #countRate = 1;
+  /** A start announced through `startsAt` and not yet reached, on this realm's clock. */
+  #startLine: { media: number; wall: number } | null = null;
+  /**
+   * The refresh (wall ms) the count began at from an announced start or
+   * change of speed, while
+   * no reading of the clock has confirmed it yet; NaN otherwise.
+   */
+  #unconfirmedSince = Number.NaN;
   /**
    * The step decoded pictures change on -- a field, or a frame of
    * progressive video -- in seconds, from the last picture taken; 0 before.
@@ -1012,6 +1028,21 @@ export class Deinterlacer extends EventTarget {
       onrelease: null,
       avDifference: () =>
         this.#worker ? this.#workerAvDifference : this.#avDifference,
+      startsAt: (media, wall) => {
+        if (!Number.isFinite(media) || !Number.isFinite(wall))
+          throw new RangeError(`start at ${media} s, ${wall} ms`);
+        if (this.#worker) {
+          this.#worker.postMessage({
+            type: "start",
+            media,
+            at: wall,
+            timeOrigin: performance.timeOrigin,
+            video: this.#workerVideoState(),
+          } satisfies WorkerCommand);
+          return;
+        }
+        this.#startLine = { media, wall };
+      },
     };
     // The watch shares this GL context, so it works only while pictures are
     // drawn here. A Worker renderer is sent frames, not textures.
@@ -2361,6 +2392,8 @@ export class Deinterlacer extends EventTarget {
     this.#previousStart = null;
     this.#shownTime = Number.NEGATIVE_INFINITY;
     this.#counting = false;
+    this.#startLine = null;
+    this.#unconfirmedSince = Number.NaN;
     this.#avDifference = Number.NaN;
     this.#resetFieldMetrics();
     this.#filmHold = 0;
@@ -2447,7 +2480,9 @@ export class Deinterlacer extends EventTarget {
       )
     ) {
       this.#stats.resynced++;
-      this.#counting = false;
+      // Unless this is the clock seeing an announced start that the count
+      // already runs from.
+      if (Number.isNaN(this.#unconfirmedSince)) this.#counting = false;
     }
   }
 
@@ -2458,6 +2493,14 @@ export class Deinterlacer extends EventTarget {
    */
   observeMediaClock(at: number, timeOrigin: number): void {
     this.#observeClock(this.#localTime(at, timeOrigin));
+  }
+
+  /**
+   * @internal Give a Worker renderer `DecodedVideoInput.startsAt`, `at`
+   * taken on the clock whose origin is `timeOrigin`.
+   */
+  observeStart(media: number, at: number, timeOrigin: number): void {
+    this.#startLine = { media, wall: this.#localTime(at, timeOrigin) };
   }
 
   /**
@@ -2529,15 +2572,66 @@ export class Deinterlacer extends EventTarget {
     const video = this.#video;
     // A Worker renderer is sent its readings, with the time they were made.
     if (!this.#externalHost) this.#observeClock(performance.now());
-    const rate = this.#clock.rate;
     // What is drawn now reaches the screen at the next refresh.
-    const reading = this.#clock.at(this.#gridAt + this.#refreshMs);
-    // Held for an event, and not read since.
-    if (Number.isNaN(reading)) return;
-    // While playing, the pictures' time is the count of refreshes, which the
-    // clock only steers; what is taken in, dropped and shown all goes by it.
-    const time = video.paused ? reading : this.#countRefresh(reading, rate);
-    if (video.paused) this.#counting = false;
+    const target = this.#gridAt + this.#refreshMs;
+    if (video.paused) {
+      this.#startLine = null;
+      this.#unconfirmedSince = Number.NaN;
+      this.#counting = false;
+    } else if (this.#startLine !== null) {
+      // An announced start or change of speed: the count runs from it. Before
+      // it nothing moves at a start, and at a change of speed the count runs
+      // on at the speed it had, which the element's rate no longer says and
+      // its clock, held for the change, cannot.
+      const line = this.#startLine;
+      if (target < line.wall) {
+        if (!this.#counting) return;
+        const rate = this.#countRate;
+        const time = this.#advanceCount(target, rate);
+        const revision = this.#playbackRevision;
+        this.#feed(time, rate);
+        if (this.#frameIsCurrent(revision))
+          this.#showDecoded(time, rate, false);
+        return;
+      }
+      this.#startLine = null;
+      this.#counting = true;
+      this.#cursor =
+        line.media + ((target - line.wall) * video.playbackRate) / 1000;
+      this.#cursorAt = target;
+      this.#countRate = video.playbackRate;
+      this.#unconfirmedSince = target;
+      this.#avDifference = Number.NaN;
+    }
+    let rate = this.#clock.rate;
+    const reading = this.#clock.at(target);
+    let time: number;
+    if (
+      !Number.isNaN(this.#unconfirmedSince) &&
+      (Number.isNaN(reading) || !(rate > 0))
+    ) {
+      // Counting from an announced start, or through a change of speed, that
+      // the clock has not seen yet.
+      if (target - this.#unconfirmedSince > START_TRUST_MS) {
+        this.#unconfirmedSince = Number.NaN;
+        this.#counting = false;
+        return;
+      }
+      rate = this.#countRate;
+      // The refresh the count began at is where it already is.
+      time =
+        this.#cursorAt === target
+          ? this.#cursor
+          : this.#advanceCount(target, rate);
+    } else {
+      this.#unconfirmedSince = Number.NaN;
+      // Held for an event, and not read since.
+      if (Number.isNaN(reading)) return;
+      // While playing, the pictures' time is the count of refreshes, which
+      // the clock only steers; what is taken in, dropped and shown all goes
+      // by it.
+      time = video.paused ? reading : this.#countRefresh(reading, rate);
+    }
     const revision = this.#playbackRevision;
     this.#feed(time, rate);
     if (this.#frameIsCurrent(revision))
@@ -3012,20 +3106,29 @@ export class Deinterlacer extends EventTarget {
     if (!this.#counting) {
       this.#counting = true;
       this.#cursor = reading;
+      this.#countRate = rate;
       this.#avDifference = Number.NaN;
     } else {
-      // Refreshes the page did not get a frame for still went by.
-      const refreshes = Math.max(
-        1,
-        Math.round((target - this.#cursorAt) / this.#refreshMs),
-      );
-      this.#cursor += refreshes * step;
+      this.#advanceCount(target, rate);
       const difference = reading - this.#cursor;
       if (Math.abs(difference) >= Math.max(AV_CORRECTION_SECONDS * rate, step))
         this.#cursor += Math.trunc(difference / step) * step;
     }
     this.#cursorAt = target;
     this.#noteAvDifference(reading - this.#cursor);
+    return this.#cursor;
+  }
+
+  /** Move the count on to the refresh at `target`: by the refreshes since its last. */
+  #advanceCount(target: number, rate: number): number {
+    // Refreshes the page did not get a frame for still went by.
+    const refreshes = Math.max(
+      1,
+      Math.round((target - this.#cursorAt) / this.#refreshMs),
+    );
+    this.#cursor += refreshes * this.#countStep(rate);
+    this.#cursorAt = target;
+    this.#countRate = rate;
     return this.#cursor;
   }
 
@@ -4583,6 +4686,15 @@ export class Deinterlacer extends EventTarget {
     // Decoded pictures are shown by the clock, which only has to start again.
     if (this.#decoded) {
       this.#clock.hold();
+      // A change of speed while counting: the count runs on at the old
+      // speed, for the clock is held now and the new speed starts with the
+      // sound, which `startsAt` says when. A rate of 0 is a stop instead.
+      if (
+        event.type === "ratechange" &&
+        this.#counting &&
+        this.#video.playbackRate > 0
+      )
+        this.#unconfirmedSince = this.#cursorAt;
       this.#postWorkerEvent(
         event.type as "pause" | "ended" | "seeked" | "ratechange",
       );

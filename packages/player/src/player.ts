@@ -42,6 +42,22 @@ import { MediaTakeover, Ready } from "./media-takeover.js";
 import { CONTEXT_SAMPLE_RATE, SoundOutput } from "./sound-output.js";
 import { SoundClock, type SoundPosition } from "./sound/index.js";
 
+/**
+ * How long after it is asked for a placed start may be heard at the
+ * earliest, besides the output latency: for the command to reach the
+ * worklet before it renders that frame, which it does a device callback or
+ * so ahead of the latency.
+ */
+const START_MARGIN_MS = 40;
+/** How far ahead of its refresh a placed start is heard, in ms. */
+const START_BEFORE_REFRESH_MS = 2;
+/**
+ * How close a reported speed has to be to one asked for to be it: the
+ * display lock's adjustment is well within, the next speed one can ask for
+ * well outside.
+ */
+const RATE_MATCH = 0.02;
+
 /** The Worker URL emitted with this package for consumers that re-bundle the player. */
 const mpeg2TsPlayerWorkerURL = bundledWorkerURL;
 
@@ -82,6 +98,8 @@ export interface PlayerDecodedVideo {
   onrelease: ((data: ArrayBuffer) => void) | null;
   /** The sound's lead over the picture on the screen, in seconds; see `DisplayLock`. */
   avDifference(): number;
+  /** Playback starts: media time `media` is heard at `wall`; see `DecodedVideoInput.startsAt`. */
+  startsAt(media: number, wall: number): void;
 }
 
 /**
@@ -413,13 +431,17 @@ export class Mpeg2TsPlayer extends EventTarget {
   /**
    * Decode mode: where the current epoch starts, and whether each of the two
    * things playback waits for after a start or a seek is there -- the sound
-   * buffered in the worklet, and the first picture at or after the start in
-   * the deinterlacer. The worklet is told to play only once both are, so
-   * that the clock never starts with the picture behind it.
+   * buffered in the worklet, and the pictures of the start in the
+   * deinterlacer: the one the start falls in and the one after it, with the
+   * picture after that, which the deinterlacer filters the second against.
+   * The worklet is told to play only once both are, so that the pictures
+   * start with the sound rather than behind it.
    */
   #epochAt = 0;
   #soundReady = false;
   #pictureReady = false;
+  /** A playback speed asked for while playing that the worklet has not been seen to play at yet. */
+  #rateChange: number | null = null;
 
   constructor(video: HTMLVideoElement, options: Mpeg2TsPlayerOptions = {}) {
     super();
@@ -790,7 +812,7 @@ export class Mpeg2TsPlayer extends EventTarget {
       pause: () => sound.control({ type: "pause" }),
       seek: (time) => this.#seekDecoded(time),
       rate: (rate) => {
-        sound.control({ type: "rate", rate });
+        this.#changeRate(rate);
         this.#postNeed();
       },
       volume: (gain) => sound.control({ type: "volume", gain }),
@@ -858,7 +880,72 @@ export class Mpeg2TsPlayer extends EventTarget {
     if (!takeover || !this.#soundReady || !this.#pictureReady) return;
     takeover.seeked();
     takeover.setReadyState(Ready.EnoughData);
-    if (!takeover.paused) this.#sound!.control({ type: "play" });
+    if (!takeover.paused) this.#play();
+  }
+
+  /**
+   * Tell the worklet to play from a context frame a little ahead, heard at a
+   * refresh, and the deinterlacer when that frame will be heard, so that the
+   * first picture goes up at that refresh with the sound -- as mpv starts
+   * video and audio together after a seek -- rather than once the
+   * deinterlacer has seen the clock move, by which time the sound is a
+   * reading or two ahead and the pictures in between are passed over. At
+   * once, unannounced, while the clock's mapping to wall time is not known
+   * yet.
+   */
+  #play(): void {
+    const sound = this.#sound!;
+    this.#rateChange = null;
+    const placed = this.#placeOnRefresh();
+    if (placed === null) {
+      sound.control({ type: "play" });
+      return;
+    }
+    sound.control({ type: "play", at: placed.frame });
+    this.#deinterlacer?.decodedVideo?.startsAt(
+      this.#takeover!.currentTime,
+      placed.wall,
+    );
+  }
+
+  /**
+   * A new playback speed. While playing, the deinterlacer counts on at the
+   * old one and is told where the new one starts once the worklet reports
+   * it: the time stretch takes a new speed at its next frame, up to a frame
+   * (20 ms) after the command, which only the worklet knows -- and it reports
+   * that before the sound gets to the speaker, which it renders that far
+   * ahead.
+   */
+  #changeRate(rate: number): void {
+    this.#sound!.control({ type: "rate", rate });
+    this.#rateChange = this.#takeover!.playing ? rate : null;
+  }
+
+  /**
+   * The context frame a start placed on the display's grid takes effect at,
+   * and when it is heard: a little before the first refresh
+   * far enough ahead for the worklet to have the command first -- a little
+   * before, so that the deinterlacer, whose idea of the refresh wobbles by
+   * about as much, takes that refresh and not the next. Where the refresh is
+   * not known yet, as soon as that. Null while the clock's mapping to wall
+   * time is not known.
+   */
+  #placeOnRefresh(): { frame: number; wall: number } | null {
+    const sound = this.#sound!;
+    const earliest =
+      performance.now() +
+      (sound.context.outputLatency ?? 0) * 1000 +
+      START_MARGIN_MS;
+    const refresh = this.#lock!.refreshAfter(
+      earliest + START_BEFORE_REFRESH_MS,
+    );
+    const wall = Number.isNaN(refresh)
+      ? earliest
+      : refresh - START_BEFORE_REFRESH_MS;
+    const frame = sound.clock.frameAt(wall);
+    if (!Number.isFinite(frame)) return null;
+    const at = Math.ceil(frame);
+    return { frame: at, wall: sound.clock.wallOfFrame(at) };
   }
 
   /** What the worklet says it is doing, for the element and the start. */
@@ -874,6 +961,16 @@ export class Mpeg2TsPlayer extends EventTarget {
       case "playing":
         takeover.setReadyState(Ready.EnoughData);
         takeover.soundStarted(position.media);
+        if (
+          this.#rateChange !== null &&
+          Math.abs(position.speed / this.#rateChange - 1) < RATE_MATCH
+        ) {
+          // Where the new speed starts.
+          this.#rateChange = null;
+          const wall = this.#sound!.clock.wallOfFrame(position.frame);
+          if (Number.isFinite(wall))
+            this.#deinterlacer?.decodedVideo?.startsAt(position.media, wall);
+        }
         break;
       case "starved":
         takeover.soundStopped(position.media, false);
@@ -957,7 +1054,9 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.#gridStep = picture.duration / fields;
     if (
       !this.#pictureReady &&
-      picture.timestamp + picture.duration > this.#epochAt
+      // The picture two after the one the start falls in; a millisecond
+      // over, for timestamps at the start that are a tick either side.
+      picture.timestamp > this.#epochAt + picture.duration + 0.001
     ) {
       this.#pictureReady = true;
       const takeover = this.#takeover!;
@@ -1107,7 +1206,7 @@ export class Mpeg2TsPlayer extends EventTarget {
       case "pictures-end":
         if (this.#decoding && notification.epoch === this.#epoch) {
           this.#deinterlacer?.decodedVideo?.finish();
-          // No picture at or after the start is coming.
+          // No more pictures of the start are coming.
           if (!this.#pictureReady) {
             this.#pictureReady = true;
             this.#startIfReady();

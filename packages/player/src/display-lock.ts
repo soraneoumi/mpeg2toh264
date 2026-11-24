@@ -84,6 +84,17 @@ export class DisplayLock {
     return span / periods;
   }
 
+  /**
+   * The first refresh at or after `wall` on the grid of those seen, as an
+   * animation frame's time; NaN while the period is not known.
+   */
+  refreshAfter(wall: number): number {
+    const period = this.period;
+    const last = this.#frames.at(-1);
+    if (Number.isNaN(period) || last === undefined) return Number.NaN;
+    return last + Math.max(0, Math.ceil((wall - last) / period)) * period;
+  }
+
   /** Take one animation frame. */
   frame(input: DisplayLockInput): void {
     const { now, rate, step } = input;

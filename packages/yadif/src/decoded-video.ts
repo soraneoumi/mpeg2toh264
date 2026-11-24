@@ -63,6 +63,19 @@ export interface DecodedVideoInput {
    * the two together by moving the sound's speed by this.
    */
   avDifference(): number;
+  /**
+   * Playback is about to start: media time `media` will be heard at `wall`,
+   * a `performance.now()` time of this realm, and from then on at the
+   * element's playback rate. Pictures then go up from the first refresh at or
+   * after `wall`, with the sound, rather than once the element's clock has
+   * been seen to move, which takes a reading or two and would pass over the
+   * pictures in between. Forgotten at a pause or a `reset()`.
+   *
+   * Also for a change of the playback rate while playing: `media` and `wall`
+   * are then where the sound takes up the new rate. From the change until
+   * `wall` the pictures go on at the rate they had.
+   */
+  startsAt(media: number, wall: number): void;
 }
 
 function positiveInteger(value: number): boolean {

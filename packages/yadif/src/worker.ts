@@ -197,6 +197,14 @@ workerScope.onmessage = (event: MessageEvent<WorkerCommand>) => {
         if (command.action === "reset") deinterlacer.decodedVideo.reset();
         else deinterlacer.decodedVideo.finish();
         break;
+      case "start":
+        video.update(command.video);
+        deinterlacer.observeStart(
+          command.media,
+          command.at,
+          command.timeOrigin,
+        );
+        break;
       case "clock":
         video.update(command.video);
         deinterlacer.observeMediaClock(command.at, command.timeOrigin);

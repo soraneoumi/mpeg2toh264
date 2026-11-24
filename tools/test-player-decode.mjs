@@ -83,6 +83,7 @@ function fakeDeinterlacer(withDecodedVideo) {
           reset: () => calls.push("reset"),
           finish: () => calls.push("finish"),
           avDifference: () => Number.NaN,
+          startsAt: (media) => calls.push(["startsAt", media]),
         }
       : null,
     destroy: () => calls.push("destroy"),
@@ -386,14 +387,23 @@ try {
     assert.ok(Number.isNaN(video.duration));
     assert.equal(video.buffered.length, 0);
 
-    // A picture of the epoch: shown, and the element has data -- once it
-    // knows its duration, as an element does by the time it has metadata.
+    // Pictures of the epoch: shown, and the element has data once the one
+    // two after the start is in, which the deinterlacer filters the second
+    // against -- and once it knows its duration, as an element does by the
+    // time it has metadata.
     assert.equal(player.videoSize, null);
     worker.send({ type: "picture", id, epoch, picture: picture(0) });
     assert.deepEqual(deinterlacer.calls.at(-1), ["push", 0]);
     assert.deepEqual(player.videoSize, { width: 6, height: 2 });
-    assert.equal(video.readyState, 0, "no duration yet");
+    worker.send({ type: "picture", id, epoch, picture: picture(0.04) });
     worker.send({ type: "seekable", id, duration: 600 });
+    assert.equal(
+      video.readyState,
+      0,
+      "the start's second picture is not enough",
+    );
+    worker.send({ type: "picture", id, epoch, picture: picture(0.08) });
+    assert.deepEqual(deinterlacer.calls.at(-1), ["push", 0.08]);
     assert.equal(video.readyState, 2);
     assert.deepEqual(await takeEvents(), ["durationchange", "loadeddata"]);
 
@@ -494,16 +504,24 @@ try {
     // So does a report of the old epoch.
     node.report({ epoch, state: "ready", media: 2 });
 
-    // The seek completes once both are in: a picture ending past the target,
-    // and the sound.
+    // The seek completes once both are in: the pictures of the target --
+    // the one it falls in, the next, and the one after that -- and the
+    // sound.
+    for (const timestamp of [9.98, 10.02])
+      worker.send({
+        type: "picture",
+        id,
+        epoch: epoch + 1,
+        picture: picture(timestamp),
+      });
+    node.report({ epoch: epoch + 1, state: "ready", media: 10 });
+    assert.equal(video.seeking, true, "the pictures are not all in yet");
     worker.send({
       type: "picture",
       id,
       epoch: epoch + 1,
-      picture: picture(9.98),
+      picture: picture(10.06),
     });
-    assert.equal(video.seeking, true, "the sound is not in yet");
-    node.report({ epoch: epoch + 1, state: "ready", media: 10 });
     assert.equal(video.seeking, false);
     assert.deepEqual(await takeEvents(), ["seeked", "canplay"]);
     assert.equal(node.port.take("play").length, 0, "still paused");

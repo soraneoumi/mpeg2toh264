@@ -2163,6 +2163,91 @@ for (const rendering of ["main", "worker"])
     console.log(`ok start, ${label}: nothing ahead of its time`);
   }
 
+// A start announced through `startsAt`, as the player does when it plays the
+// sound itself: the first picture goes up at the refresh the sound starts
+// at, before the element's clock -- read in 40 ms steps, as Firefox gives it
+// -- has been seen to move, and nothing from the start on is passed over.
+for (const rendering of ["main", "worker"]) {
+  const pictures = stream({ count: 900 });
+  const media = playing({ stepMs: 40, jitterMs: 3 });
+  const seekTo = pictures[599].timestamp + FRAME * 0.3;
+  const marks = {};
+  const steps = timeline(
+    [
+      3,
+      (control, context) => {
+        media.set(control.now(), seekTo, 0);
+        control.video.seeking = true;
+        event(control, "seeking");
+        context.deinterlacer.decodedVideo.reset();
+        context.producer.seek(seekTo);
+        marks.seeking = control.now();
+      },
+    ],
+    [
+      3.2,
+      (control, context) => {
+        control.video.seeking = false;
+        event(control, "seeked");
+        event(control, "playing");
+        marks.played = control.now();
+        // Heard from three refreshes on, announced a little before that
+        // refresh, as the player places it.
+        marks.start = control.now() + 3 * (1000 / (60000 / 1001));
+        context.deinterlacer.decodedVideo.startsAt(
+          seekTo,
+          control.pageContext.performance.now() +
+            (marks.start - control.now()) -
+            2,
+        );
+      },
+    ],
+  );
+  const { result, refreshMs, stats } = await play({
+    seconds: 6,
+    media,
+    pictures,
+    rendering,
+    script: (vsync, control, context) => {
+      steps(control, context);
+      if (
+        marks.start !== undefined &&
+        marks.started === undefined &&
+        control.now() >= marks.start - 1
+      ) {
+        media.set(control.now(), seekTo, 1);
+        marks.started = control.now();
+      }
+    },
+  });
+  const label = `announced start, ${rendering}`;
+  const shown = appearances(
+    { draws: canvasDraws(result, marks.played) },
+    outputs(pictures),
+    refreshMs,
+  );
+  const first = shown[0];
+  assert.ok(
+    first.time <= seekTo && seekTo < first.time + FRAME / 2 + 1e-6,
+    `${label}: first went up ${first.key}, not the field of the start`,
+  );
+  assert.equal(
+    BASE_MS + first.refresh * refreshMs,
+    marks.started,
+    `${label}: the first field went up at another refresh than the sound's`,
+  );
+  checkTiming(label, shown, media, refreshMs, {
+    from: marks.started,
+    toleranceMs: 2,
+  });
+  const before = result.stats.findLast(
+    (snapshot) => snapshot.t < marks.seeking,
+  ) ?? { missed: 0, late: 0 };
+  assert.equal(stats.late - before.late, 0, `${label}: fields late`);
+  assert.equal(stats.missed - before.missed, 0, `${label}: pictures missed`);
+  console.log(`ok ${label}: the first field with the sound, none passed over`);
+}
+
 // An element that publishes its position in steps, as Firefox does every
 // 40 ms of media: after `set`, the reading stays where it was set until
 // `phaseMs` of playing have passed, and from then on moves a step at a time.
