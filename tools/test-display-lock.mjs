@@ -96,6 +96,46 @@ try {
     assert.equal(held.repeats + held.skips, 0, `${rate}x: no slip`);
   }
 
+  // A start placed by startWall: from the first refresh on, each falls in
+  // the middle of its step, with no settling.
+  for (const rate of [1, 2, 0.5]) {
+    const lock = new DisplayLock(() => {});
+    for (let frame = 0; frame < 120; frame++)
+      lock.frame({
+        now: frame * refreshMs,
+        at: () => Number.NaN,
+        speed: rate,
+        step,
+        origin: 0,
+        rate,
+        active: false,
+      });
+    const now = 119 * refreshMs;
+    const media = 12.3456;
+    const wall = lock.startWall(media, 0.01, step, rate, now + 50);
+    assert.ok(wall >= now + 50, "not before the earliest");
+    let worst = 0;
+    // The first few refreshes: past them it is the lock's to hold the phase
+    // against the rates' own difference.
+    for (let k = 1; k <= 8; k++) {
+      const refresh = now + k * refreshMs;
+      if (refresh < wall) continue;
+      const shown = media + ((refresh - wall) / 1000) * rate;
+      const phase = ((shown - 0.01) / step) % 1;
+      // Mid-step, or for a step two refreshes long, a quarter either side.
+      const share = rate < 1 ? 0.5 : 1;
+      const within = phase % share;
+      worst = Math.max(worst, Math.abs(within - share / 2));
+    }
+    console.log(
+      `start placed at ${rate}x: worst phase off the middle ${worst.toFixed(4)}`,
+    );
+    assert.ok(
+      worst < 0.01,
+      `${rate}x: the refreshes in the middle of their steps`,
+    );
+  }
+
   // Not locked where the rates are far apart, nor when not active.
   {
     let sent = null;

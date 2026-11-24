@@ -549,6 +549,25 @@ for (const how of ["starve", "pause"]) {
   );
 }
 
+// A start placed at a context frame: silence until the first quantum at or
+// after it, which is where the first report of playing is.
+{
+  const rig = new Rig();
+  rig.control({ type: "epoch", epoch: 1, at: 0 });
+  rig.feed(1, 0, 2);
+  rig.runSeconds(0.3);
+  const at = rig.left.length + 4800 + 50;
+  rig.control({ type: "play", at });
+  rig.runSeconds(0.3);
+  const playing = rig.reports.find((r) => r.state === "playing");
+  const quantum = Math.ceil(at / QUANTUM) * QUANTUM;
+  const silentBefore = rig.left.slice(0, quantum).every((v) => v === 0);
+  check(
+    `play at frame ${at}: first playing report at ${playing?.frame}, silence before`,
+    playing?.frame === quantum && silentBefore && rig.left[quantum + 64] !== 0,
+  );
+}
+
 // Dual mono: the chosen service on both sides, and a change of choice taken
 // at once, at the PCM read next.
 {

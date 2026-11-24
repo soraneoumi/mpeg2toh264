@@ -39,8 +39,16 @@ import {
 import bundledWorkerURL from "./worker.ts?worker&url";
 import { DisplayLock } from "./display-lock.js";
 import { MediaTakeover, Ready } from "./media-takeover.js";
-import { SoundOutput } from "./sound-output.js";
-import type { SoundPosition } from "./sound/index.js";
+import { CONTEXT_SAMPLE_RATE, SoundOutput } from "./sound-output.js";
+import { SoundClock, type SoundPosition } from "./sound/index.js";
+
+/**
+ * How long after it is asked for a start placed on the display's grid may be
+ * heard at the earliest, besides the output latency: for the command to reach
+ * the worklet before it renders that frame, which it does a device callback
+ * or so ahead of the latency.
+ */
+const START_MARGIN_MS = 40;
 
 /** The Worker URL emitted with this package for consumers that re-bundle the player. */
 const mpeg2TsPlayerWorkerURL = bundledWorkerURL;
@@ -394,6 +402,13 @@ export class Mpeg2TsPlayer extends EventTarget {
   #sound: SoundOutput | null = null;
   #takeover: MediaTakeover | null = null;
   #lock: DisplayLock | null = null;
+  /**
+   * The context and the clock of what it plays, kept from load to load so
+   * that the clock's mapping to wall time is settled before a load's first
+   * pictures need it.
+   */
+  #context: AudioContext | null = null;
+  #clock: SoundClock | null = null;
   /** Which dual-mono service was last chosen, which a new load keeps. */
   #dualMonoSub = false;
   /**
@@ -761,7 +776,9 @@ export class Mpeg2TsPlayer extends EventTarget {
    * media interface answered from here for the length of the load.
    */
   #openSound(id: number): void {
-    const sound = new SoundOutput({
+    this.#context ??= new AudioContext({ sampleRate: CONTEXT_SAMPLE_RATE });
+    this.#clock ??= new SoundClock(this.#context);
+    const sound = new SoundOutput(this.#context, this.#clock, {
       report: (position) => {
         if (id === this.#generation) this.#onSoundReport(position);
       },
@@ -849,7 +866,37 @@ export class Mpeg2TsPlayer extends EventTarget {
     if (!takeover || !this.#soundReady || !this.#pictureReady) return;
     takeover.seeked();
     takeover.setReadyState(Ready.EnoughData);
-    if (!takeover.paused) this.#sound!.control({ type: "play" });
+    if (!takeover.paused) this.#play();
+  }
+
+  /**
+   * Tell the worklet to play, timed so that its first sound is heard when the
+   * refresh after it falls in the middle of a picture step: the pictures are
+   * then shown each at its refresh from the first, rather than once the lock
+   * has moved the clock there. At once where the display or the clock is not
+   * known well enough yet.
+   */
+  #play(): void {
+    const sound = this.#sound!;
+    const takeover = this.#takeover!;
+    const step = this.#gridStep;
+    let at: number | undefined;
+    if (step !== null) {
+      const earliest =
+        performance.now() +
+        (sound.context.outputLatency ?? 0) * 1000 +
+        START_MARGIN_MS;
+      const wall = this.#lock!.startWall(
+        takeover.currentTime,
+        this.#gridOrigin,
+        step,
+        takeover.rate,
+        earliest,
+      );
+      const frame = sound.clock.frameAt(wall);
+      if (Number.isFinite(frame)) at = Math.round(frame);
+    }
+    sound.control({ type: "play", at });
   }
 
   /** What the worklet says it is doing, for the element and the start. */
@@ -983,6 +1030,9 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.#deinterlacer?.destroy();
     this.#deinterlacer = null;
     this.#worker?.terminate();
+    void this.#context?.close();
+    this.#context = null;
+    this.#clock = null;
     this.#worker = null;
   }
 

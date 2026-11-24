@@ -570,14 +570,18 @@ try {
     const stopping = deinterlacer.calls.length;
     player.stop();
     assert.ok(deinterlacer.calls.slice(stopping).includes("reset"));
-    assert.equal(context.state, "closed");
+    assert.notEqual(context.state, "closed", "the context outlives the load");
     assert.equal(Object.getOwnPropertyDescriptor(video, "paused"), undefined);
     assert.equal(video.playbackRate, 2);
     assert.equal(video.volume, 0.5);
     worker.take("need");
     await wait(100);
     assert.equal(worker.take("need").length, 0, "no requests once stopped");
+    // The next load plays through the same context, its clock settled.
+    void player.load("https://example.invalid/c.ts").catch(() => {});
+    assert.equal(FakeAudioContext.last, context, "one context per player");
     player.destroy();
+    assert.equal(context.state, "closed", "closed with the player");
   }
 
   // A stream without AAC sound is loaded again with the video passed through,

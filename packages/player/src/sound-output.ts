@@ -1,7 +1,9 @@
 /**
- * Decode mode's way to the speaker, on the page: an `AudioContext`, the
- * AudioWorklet that plays the decode worker's PCM, and the clock of what is
- * being heard.
+ * Decode mode's way to the speaker for one load, on the page: the
+ * AudioWorklet that plays the decode worker's PCM, in a context and against
+ * a clock of what is being heard that the player keeps from load to load --
+ * a context made anew for each load would start each one with the clock's
+ * mapping to wall time not yet settled, when the first pictures need it.
  *
  * The worklet's module loads asynchronously, while the worker may start
  * sending PCM at once: the port the worker is given buffers what it is sent
@@ -23,7 +25,19 @@ import {
 const SAMPLE_INTERVAL_MS = 50;
 
 /** Broadcast sound is 48 kHz; asking for it spares the browser a resampler. */
-const CONTEXT_SAMPLE_RATE = 48000;
+export const CONTEXT_SAMPLE_RATE = 48000;
+
+/** The processor's module, loaded once into each context. */
+const modules = new WeakMap<BaseAudioContext, Promise<void>>();
+
+function loadModule(context: AudioContext): Promise<void> {
+  let loading = modules.get(context);
+  if (!loading) {
+    loading = context.audioWorklet.addModule(soundProcessorURL);
+    modules.set(context, loading);
+  }
+  return loading;
+}
 
 export interface SoundOutputHandlers {
   /** Every report of the processor, after the clock has taken it. */
@@ -47,15 +61,19 @@ export class SoundOutput {
   readonly #timer: ReturnType<typeof setInterval>;
   #frame = 0;
 
-  constructor(handlers: SoundOutputHandlers) {
+  constructor(
+    context: AudioContext,
+    clock: SoundClock,
+    handlers: SoundOutputHandlers,
+  ) {
     this.#handlers = handlers;
-    this.context = new AudioContext({ sampleRate: CONTEXT_SAMPLE_RATE });
-    this.clock = new SoundClock(this.context);
+    this.context = context;
+    this.clock = clock;
     const { port1, port2 } = new MessageChannel();
     this.workerPort = port2;
     this.#timer = setInterval(this.#sample, SAMPLE_INTERVAL_MS);
     this.#frame = requestAnimationFrame(this.#onFrame);
-    this.context.audioWorklet.addModule(soundProcessorURL).then(
+    loadModule(context).then(
       () => this.#open(port1),
       (error: unknown) => this.#fail(error),
     );
@@ -93,7 +111,6 @@ export class SoundOutput {
     this.#node = null;
     this.#queued = [];
     this.workerPort.close();
-    void this.context.close();
   }
 
   #open(port: MessagePort): void {

@@ -106,8 +106,15 @@ export class DisplayLock {
     if (this.#frames.length > PERIOD_WINDOW) this.#frames.shift();
     const period = this.period;
     const step = input.step;
-    if (!input.active || step === null || Number.isNaN(period)) {
+    if (step === null || Number.isNaN(period)) {
       this.#release(now);
+      return;
+    }
+    if (!input.active) {
+      // Paused or waiting: the rates are the same when it plays again, so
+      // the speed that matched them stays; only the phase has to be found
+      // again, which a start placed by `startWall` already has.
+      this.#error = Number.NaN;
       return;
     }
     // Steps a refresh moves by at this speed: whole steps per refresh, or
@@ -149,6 +156,40 @@ export class DisplayLock {
   /** Forget the phase: a seek, a pause, a change of speed. */
   reset(): void {
     this.#error = Number.NaN;
+  }
+
+  /**
+   * When the sound starting at media time `media` should be heard, so that
+   * from the first refresh on every refresh falls in the middle of its step
+   * -- a start the lock does not have to settle -- at speed `rate`, no
+   * sooner than `earliest`. NaN while the refresh period is not known yet:
+   * start at once then.
+   */
+  startWall(
+    media: number,
+    origin: number,
+    step: number,
+    rate: number,
+    earliest: number,
+  ): number {
+    const period = this.period;
+    const last = this.#frames.at(-1);
+    if (Number.isNaN(period) || last === undefined) return Number.NaN;
+    // Where in its step a refresh should fall: the middle where a refresh
+    // moves by whole steps, and where a step lasts `k` refreshes, at 1/(2k),
+    // 3/(2k), ..., so that they lie evenly about the middle.
+    const steps = (rate * period) / (step * 1000);
+    const share = steps >= 1 ? 1 : 1 / Math.round(1 / steps);
+    const target = share / 2;
+    // How far the sound has to have played, in media seconds, when a
+    // refresh shows it for that refresh to fall there.
+    const phase = (media - origin) / step - Math.floor((media - origin) / step);
+    const ahead = ((((target - phase) % share) + share) % share) * step;
+    const lead = (ahead * 1000) / rate;
+    // The first refresh that leaves room for the lead before it.
+    let refresh = last + Math.ceil((earliest + lead - last) / period) * period;
+    if (refresh - lead < earliest) refresh += period;
+    return refresh - lead;
   }
 
   #release(now: number): void {
