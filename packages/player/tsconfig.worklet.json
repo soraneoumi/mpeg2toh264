@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2022"]
+  },
+  "include": [
+    "src/sound/processor.ts",
+    "src/sound/queue.ts",
+    "src/sound/stretch.ts",
+    "src/sound/resample.ts",
+    "src/sound/messages.ts",
+    "src/sound/worklet.d.ts"
+  ]
+}
