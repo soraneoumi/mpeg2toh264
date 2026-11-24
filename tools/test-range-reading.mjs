@@ -14,12 +14,19 @@ const tree = ts.createSourceFile(
   true,
 );
 const readings = [];
+const helpers = [];
 function visit(node) {
   if (ts.isVariableDeclaration(node) && node.name.getText(tree) === "reading")
     readings.push(node.initializer.getText(tree));
+  if (
+    ts.isFunctionDeclaration(node) &&
+    node.name?.getText(tree) === "readWithin"
+  )
+    helpers.push(node.getText(tree));
   ts.forEachChild(node, visit);
 }
 visit(tree);
+assert.equal(helpers.length, 1, "the stall-bounded read is unambiguous");
 assert.equal(readings.length, 1, "production reading loop must be unambiguous");
 const [reading] = readings;
 const server = await createServer({
@@ -31,7 +38,8 @@ try {
     "/packages/player/src/source.ts",
   );
   const js = ts.transpileModule(
-    `class Reader {
+    `${helpers[0]}
+  class Reader {
     #command = {url: "test", id: 1};
     #leg = {signal: {aborted:false}};
     #totalBytes; #readingMs = 0;
@@ -57,6 +65,7 @@ try {
     "MAX_PACKAGE_CHUNK_BYTES",
     "post",
     "mark",
+    "READ_STALL_MS",
     `${js}; return Reader;`,
   )(
     isRangeExhaustion,
@@ -65,6 +74,7 @@ try {
     10,
     () => {},
     () => {},
+    20,
   );
   const error416 = () => new Error("range refused", { cause: { status: 416 } });
   function sourceWith(read) {
@@ -114,7 +124,22 @@ try {
   assert.equal(r.readError, null);
   assert.equal(r.ended, true);
   assert.equal(r.chunks, 0);
-  console.log("production range reading: 7 cases passed");
+  // A response that stalls without failing is given up and the input
+  // reopened at the next byte, which then reads on to the end.
+  let reopens = 0;
+  let closed = 0;
+  const stalled = sourceWith(() => new Promise(() => {}));
+  stalled.close = () => closed++;
+  r = await new Reader(2).run(
+    stalled,
+    async () => (reopens++ === 0 ? chunk() : refused()),
+    false,
+  );
+  assert.equal(closed, 1, "the stalled response is closed");
+  assert.equal(r.readError, null);
+  assert.equal(r.chunks, 1, "the reopened response's bytes");
+  assert.equal(r.ended, true);
+  console.log("production range reading: 8 cases passed");
 } finally {
   await server.close();
 }

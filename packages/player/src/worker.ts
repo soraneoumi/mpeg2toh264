@@ -91,6 +91,32 @@ const INPUT_QUEUE_HIGH_WATER_BYTES = 32 << 20;
 /** Open the next byte range after the input queue drains this far. */
 const INPUT_QUEUE_LOW_WATER_BYTES = 8 << 20;
 
+/**
+ * How long a read of a response that can be reopened may bring nothing before
+ * it is given up and the input reopened at the next byte. A connection can
+ * stall without failing -- the server, a proxy or the network between stops
+ * sending and nothing says so -- and the read then waits as long as the
+ * connection lives while the playhead runs into the end of what was
+ * converted. A read normally returns within milliseconds, and well over this
+ * much is held ahead of the playhead, so reopening is in time.
+ */
+const READ_STALL_MS = 4000;
+
+/** `reader.read()`, or null if it brings nothing within `ms`. */
+function readWithin<T>(
+  reader: ReadableStreamDefaultReader<T>,
+  ms: number,
+): Promise<ReadableStreamReadResult<T> | null> {
+  const read = reader.read();
+  // Rejected once the response is closed under it, which nobody waits for.
+  read.catch(() => {});
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const stalled = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), ms);
+  });
+  return Promise.race([read, stalled]).finally(() => clearTimeout(timer));
+}
+
 /** The PES timestamp field is 33 bits, so distances along it are modular. */
 const PTS_MODULUS = 2 ** 33;
 
@@ -870,9 +896,18 @@ class Playback {
           let reopen = false;
           for (;;) {
             const readStarted = performance.now();
-            const result = await reader.read();
+            const result = response.resumable
+              ? await readWithin(reader, READ_STALL_MS)
+              : await reader.read();
             this.#readingMs += performance.now() - readStarted;
             if (!this.#running(leg)) return;
+            if (result === null) {
+              // Stalled: reopen at the next byte.
+              response.close();
+              response = null;
+              reopen = true;
+              break;
+            }
             if (result.done) {
               response.close();
               ended = true;
