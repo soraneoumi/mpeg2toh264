@@ -74,5 +74,7 @@ export declare class SoundClock {
     get state(): SoundPosition["state"] | "idle";
     /** Wall time at which the device plays context frame `frame` (outputLatency included); NaN until known. */
     wallOfFrame(frame: number): number;
+    /** The context frame being heard at wall time `wall`; NaN until known. */
+    frameAt(wall: number): number;
 }
 //# sourceMappingURL=clock.d.ts.map

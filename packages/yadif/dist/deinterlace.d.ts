@@ -64,6 +64,13 @@ export interface DeinterlaceStats {
      */
     late: number;
     /**
+     * With decoded pictures: the media time being heard less that of the
+     * output being shown, in seconds, averaged over about the last second -- a
+     * player that plays the sound itself moves the sound's speed by it to keep
+     * the two together. NaN before pictures are shown by counting refreshes.
+     */
+    avDifference: number;
+    /**
      * Times the presentation queue was reset because its scheduled lead exceeded
      * the useful display window. With decoded pictures, pictures dropped
      * because more were pushed than are held.

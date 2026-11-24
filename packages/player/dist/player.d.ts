@@ -9,6 +9,10 @@ export interface PlayerDecodedVideo {
     reset(): void;
     finish(): void;
     onrelease: ((data: ArrayBuffer) => void) | null;
+    /** The sound's lead over the picture on the screen, in seconds; see `DisplayLock`. */
+    avDifference(): number;
+    /** Playback starts: media time `media` is heard at `wall`; see `DecodedVideoInput.startsAt`. */
+    startsAt(media: number, wall: number): void;
 }
 /** A replaceable deinterlacer controlled by the source picture timeline. */
 export interface PlayerDeinterlacer {

@@ -1,7 +1,9 @@
 /**
- * Decode mode's way to the speaker, on the page: an `AudioContext`, the
- * AudioWorklet that plays the decode worker's PCM, and the clock of what is
- * being heard.
+ * Decode mode's way to the speaker for one load, on the page: the
+ * AudioWorklet that plays the decode worker's PCM, in a context and against
+ * a clock of what is being heard that the player keeps from load to load --
+ * a context made anew for each load would start each one with the clock's
+ * mapping to wall time not yet settled, when the first pictures need it.
  *
  * The worklet's module loads asynchronously, while the worker may start
  * sending PCM at once: the port the worker is given buffers what it is sent
@@ -9,6 +11,8 @@
  * until it exists.
  */
 import { SoundClock, type SoundControl, type SoundPosition } from "./sound/index.js";
+/** Broadcast sound is 48 kHz; asking for it spares the browser a resampler. */
+export declare const CONTEXT_SAMPLE_RATE = 48000;
 export interface SoundOutputHandlers {
     /** Every report of the processor, after the clock has taken it. */
     report: (position: SoundPosition) => void;
@@ -23,7 +27,7 @@ export declare class SoundOutput {
     readonly clock: SoundClock;
     /** The end of the PCM channel that belongs to the decode worker. */
     readonly workerPort: MessagePort;
-    constructor(handlers: SoundOutputHandlers);
+    constructor(context: AudioContext, clock: SoundClock, handlers: SoundOutputHandlers);
     /** Give the processor a command, now or as soon as it exists. */
     control(message: SoundControl): void;
     /**

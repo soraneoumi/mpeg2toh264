@@ -61,8 +61,11 @@ export type SoundControl = {
     type: "epoch";
     epoch: number;
     at: number;
-} | {
+}
+/** Play from the first quantum that starts at or after context frame `at`. */
+ | {
     type: "play";
+    at: number;
 } | {
     type: "pause";
 }

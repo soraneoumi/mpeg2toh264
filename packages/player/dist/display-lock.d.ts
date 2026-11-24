@@ -1,58 +1,54 @@
 /**
- * Decode mode's lock of the media clock to the display.
+ * Decode mode's hold of the sound to the pictures on the screen.
  *
- * Pictures change on a grid of fixed steps -- a field of interlaced video, a
- * frame of progressive -- and the screen on another, its refresh. When the
- * two run at nearly the same rate (59.94 fields a second on a 59.95 Hz
- * screen) or one at a whole multiple of the other, the picture due at each
- * refresh moves through the grid slowly, and while a refresh falls near a
- * step the smallest wobble of the clock decides between two pictures: one is
- * shown twice and its neighbour not at all. Over minutes that happens again
- * and again, however good the clock is, because the two rates are not the
- * same.
+ * The deinterlacer shows decoded pictures against a count of refreshes, as
+ * mpv's display sync does: where the screen runs close to a whole number of
+ * picture steps a refresh (59.94 fields a second on a 59.95 Hz screen, or
+ * twice that at double speed) or of refreshes a step (half speed), every
+ * refresh moves the pictures by exactly whole steps, so none is shown twice
+ * or passed over; elsewhere it moves them by the refresh. Either way the
+ * pictures keep the screen's time, not the sound's, and this class makes the
+ * sound follow: it plays the sound a fraction of a percent faster or slower
+ * (`adjust`, which the AudioWorklet applies by resampling).
  *
- * So the media clock is made to follow the screen: the sound is played a
- * fraction of a percent faster or slower (`adjust`, which the AudioWorklet
- * applies by resampling) so that every refresh moves the media by exactly a
- * whole number of steps, and a slow correction holds each refresh in the
- * middle of its step, where no wobble reaches a neighbour. This is what a
- * player that syncs to the display does; the pitch moves by as little as the
- * speed, which no one hears.
- *
- * While playing, at any speed where each refresh moves by a whole number of
- * steps (2 at double speed on such a screen) or each step lasts a whole
- * number of refreshes (2 at half speed), within `MAX_DEVIATION`. Anything
- * else -- 1.5 times as fast, say, where refreshes take one step and two in
- * turn whatever the clock does -- plays at the sound's own rate.
+ * The speed has two parts. The rate match is what the pictures' count
+ * demands -- whole steps per measured refresh, or the speed asked for --
+ * against the sound's own rate, which the device clock's drift from
+ * `performance.now()` is part of. The drift correction takes back what is
+ * left, the deinterlacer's `avDifference` (the sound's lead over the picture
+ * shown, averaged over a second), over `AV_RECOVERY_SECONDS`: rounding, a
+ * start that did not fall on a refresh, the clock's settling. Only a
+ * difference past a refresh and 20 ms -- a stall -- is taken back on the
+ * pictures' side, by the deinterlacer moving its count. The pitch moves by
+ * as little as the speed, which no one hears.
  */
 export interface DisplayLockInput {
     /** The time of this animation frame's refresh, on `performance.now()`'s clock. */
     now: number;
-    /** The media time heard at wall time `wall`, or NaN while not known. */
-    at: (wall: number) => number;
-    /** Media seconds per wall second at the speed last sent. */
+    /** Media seconds per wall second at the speed last sent; 0 while the sound is not playing. */
     speed: number;
-    /** The picture grid's step in seconds, or null while there is none to lock to. */
+    /** The step the pictures change on in seconds, or null while there is none. */
     step: number | null;
-    /** A media time on the grid: where some picture began. */
-    origin: number;
     /** The playback speed asked for. */
     rate: number;
-    /** Whether locking applies now: playing. */
+    /** Whether the sound plays now. */
     active: boolean;
+    /** The deinterlacer's `avDifference` in seconds, or NaN while not known. */
+    avDifference: number;
 }
 export declare class DisplayLock {
     #private;
     constructor(send: (adjust: number) => void);
     /** The speed factor last sent. */
     get adjust(): number;
-    /** The smoothed phase error in grid steps; 0 is a refresh in the middle of its step. */
-    get error(): number;
     /** The refresh period, in ms, or NaN until enough refreshes were seen. */
     get period(): number;
+    /**
+     * The first refresh at or after `wall` on the grid of those seen, as an
+     * animation frame's time; NaN while the period is not known.
+     */
+    refreshAfter(wall: number): number;
     /** Take one animation frame. */
     frame(input: DisplayLockInput): void;
-    /** Forget the phase: a seek, a pause, a change of speed. */
-    reset(): void;
 }
 //# sourceMappingURL=display-lock.d.ts.map

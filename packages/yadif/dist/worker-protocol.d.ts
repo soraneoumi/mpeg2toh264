@@ -95,6 +95,14 @@ export type WorkerCommand = {
     type: "pictures";
     action: "reset" | "finish";
 }
+/** `DecodedVideoInput.startsAt`, `at` taken on the page's clock. */
+ | {
+    type: "start";
+    media: number;
+    at: number;
+    timeOrigin: number;
+    video: WorkerVideoState;
+}
 /** A reading of the element's clock, taken at `at` on the page's clock. */
  | {
     type: "clock";
