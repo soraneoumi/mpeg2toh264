@@ -385,13 +385,16 @@ try {
     assert.ok(Number.isNaN(video.duration));
     assert.equal(video.buffered.length, 0);
 
-    // A picture of the epoch: shown, and the element has data.
+    // A picture of the epoch: shown, and the element has data -- once it
+    // knows its duration, as an element does by the time it has metadata.
     assert.equal(player.videoSize, null);
     worker.send({ type: "picture", id, epoch, picture: picture(0) });
     assert.deepEqual(deinterlacer.calls.at(-1), ["push", 0]);
     assert.deepEqual(player.videoSize, { width: 6, height: 2 });
+    assert.equal(video.readyState, 0, "no duration yet");
+    worker.send({ type: "seekable", id, duration: 600 });
     assert.equal(video.readyState, 2);
-    assert.deepEqual(await takeEvents(), ["loadeddata"]);
+    assert.deepEqual(await takeEvents(), ["durationchange", "loadeddata"]);
 
     // The sound buffered as well: ready to play, but nobody asked.
     node.report({ epoch, state: "ready", media: 0 });
@@ -451,13 +454,11 @@ try {
     // What the worker holds and how long the input is.
     worker.send({ type: "buffered", id, range: { start: 0, end: 9 } });
     assert.deepEqual([video.buffered.start(0), video.buffered.end(0)], [0, 9]);
-    worker.send({ type: "seekable", id, duration: 600 });
     assert.equal(video.duration, 600);
     assert.deepEqual(
       [video.seekable.start(0), video.seekable.end(0)],
       [0, 600],
     );
-    assert.deepEqual(await takeEvents(), ["durationchange"]);
 
     // A seek: a new epoch for the pictures and the sound, held again, and
     // the worker told where and under which epoch.

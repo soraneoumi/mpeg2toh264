@@ -112,6 +112,8 @@ export class MediaTakeover {
   #readyState = Ready.Nothing;
   #loadedMetadata = false;
   #loadedData = false;
+  /** A readyState asked for before the duration was known; see `setReadyState`. */
+  #pendingReady: Ready | null = null;
   /** The position while the sound is not running. */
   #position = 0;
   /** Whether the sound is playing, so that the position is the one heard. */
@@ -226,6 +228,9 @@ export class MediaTakeover {
     if (Object.is(duration, this.#duration)) return;
     this.#duration = duration;
     this.#fire("durationchange");
+    const pending = this.#pendingReady;
+    this.#pendingReady = null;
+    if (pending !== null) this.setReadyState(pending);
   }
 
   setBuffered(range: { start: number; end: number } | null): void {
@@ -240,6 +245,13 @@ export class MediaTakeover {
    * after every fall, as after a seek.
    */
   setReadyState(state: Ready): void {
+    // An element has its duration by the time it has metadata, and what
+    // listens for `loadedmetadata` reads it: the state waits for it.
+    if (state >= Ready.Metadata && Number.isNaN(this.#duration)) {
+      this.#pendingReady = state;
+      return;
+    }
+    this.#pendingReady = null;
     const was = this.#readyState;
     if (state === was) return;
     this.#readyState = state;
