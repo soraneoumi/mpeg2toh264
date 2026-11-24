@@ -509,6 +509,24 @@ mod program_restart_tests {
         program.scan(&pmt(service), new_pmt_pid, Some(300));
         assert_eq!(program.restart_offsets.get(&service), Some(&200));
     }
+
+    /// A PMT section whose packets lie far apart can complete after a PAT
+    /// that came in its middle; the restart is the PAT before its start.
+    #[test]
+    fn restarts_at_the_pat_before_the_pmt_section_began() {
+        let service = 1;
+        let pmt_pid = 0x100;
+        let mut program = ProgramMap::default();
+        program.scan(&pat(service, pmt_pid), 0, Some(100));
+        program.scan(&pmt(service), pmt_pid, Some(150));
+        assert_eq!(program.restart_offsets.get(&service), Some(&100));
+        // The next section begins at 400, a PAT comes at 500, and the section
+        // completes after it.
+        program.scan(&pat(service, pmt_pid), 0, Some(300));
+        program.scan(&pat(service, pmt_pid), 0, Some(500));
+        program.scan(&pmt(service), pmt_pid, Some(400));
+        assert_eq!(program.restart_offsets.get(&service), Some(&300));
+    }
 }
 
 struct DeferredProgram {
@@ -576,9 +594,14 @@ struct ProgramMap {
     all_service_pids: HashMap<u16, Vec<u16>>,
     changed_pids: HashSet<u16>,
     assemblers: HashMap<u16, SectionAssembler>,
-    pat_offsets: HashMap<u16, u64>,
+    /// Where the last few PATs naming each service began, oldest first; see
+    /// `scan` for why more than the last.
+    pat_offsets: HashMap<u16, Vec<u64>>,
     restart_offsets: HashMap<u16, u64>,
 }
+
+/// PATs remembered per service: more than come in the span of one PMT section.
+const PAT_OFFSETS_KEPT: usize = 8;
 
 impl Default for ProgramMap {
     fn default() -> Self {
@@ -661,7 +684,13 @@ impl ProgramMap {
                 let program = ((section[i] as u16) << 8) | section[i + 1] as u16;
                 if program != 0 {
                     if let Some(source_offset) = source_offset {
-                        self.pat_offsets.insert(program, source_offset);
+                        let offsets = self.pat_offsets.entry(program).or_default();
+                        if offsets.last().is_none_or(|&last| last < source_offset) {
+                            offsets.push(source_offset);
+                            if offsets.len() > PAT_OFFSETS_KEPT {
+                                offsets.remove(0);
+                            }
+                        }
                     }
                     if !self.services.contains(&program) {
                         self.services.push(program);
@@ -681,11 +710,23 @@ impl ProgramMap {
             // another would put a programme's picture against a different
             // programme's sound, so both come from here or neither does.
             let service = ((section[3] as u16) << 8) | section[4] as u16;
-            if source_offset.is_some() && self.pmt_pid_by_service.get(&service) == Some(&pid) {
-                if let Some(&pat_offset) = self.pat_offsets.get(&service) {
-                    // A new demuxer has to read the PAT before this PMT: if a
-                    // newer PAT arrived after the last PMT, starting there
-                    // would make it discard that PMT and miss the next GOP.
+            let current = self.pmt_pid_by_service.get(&service) == Some(&pid);
+            if let Some(pmt_start) = source_offset.filter(|_| current) {
+                // A new demuxer has to read the PAT before this PMT: if a
+                // newer PAT arrived after the last PMT, starting there would
+                // make it discard that PMT and miss the next GOP. Before the
+                // PMT's first packet, too, not merely before it completed: a
+                // section spread over packets far apart can have a PAT come
+                // in its middle, and a demuxer starting at that one has only
+                // the section's tail, which is no map.
+                let pat_offset = self.pat_offsets.get(&service).and_then(|offsets| {
+                    offsets
+                        .iter()
+                        .rev()
+                        .find(|&&offset| offset <= pmt_start)
+                        .copied()
+                });
+                if let Some(pat_offset) = pat_offset {
                     self.restart_offsets.insert(service, pat_offset);
                 }
             }
