@@ -1149,24 +1149,6 @@ fn make_audio_track(audio: &AacConfig, dinf: &[u8]) -> (Vec<u8>, Vec<u8>) {
     )
 }
 
-/// An initialization segment declaring the sound alone, and its MIME type.
-fn make_audio_init_segment(audio: &AacConfig) -> (Vec<u8>, String) {
-    let ftyp = {
-        let mut body = Buf::new();
-        body.ascii("isom").u32(0x200).ascii("isomiso6mp41");
-        boxed("ftyp", &body.into_vec())
-    };
-    let (trak, trex) = make_audio_track(audio, &make_dinf());
-    let moov = boxed(
-        "moov",
-        &concat(&[&make_mvhd(3), &trak, &boxed("mvex", &trex)]),
-    );
-    (
-        concat(&[&ftyp, &moov]),
-        format!("audio/mp4; codecs=\"{AAC_CODECS_PARAMETER}\""),
-    )
-}
-
 fn make_media_segment(
     video: &VideoPayload<'_>,
     durations: &[u32],
@@ -1504,19 +1486,14 @@ pub struct PicturePresentation {
     pub duration: u32,
 }
 
-/// Package one unit for a player that decodes its pictures itself: its sound
-/// as a fragment with no video track, and where each picture it keeps is
-/// presented, which is where [`mpeg2_gop_to_fmp4`] puts that picture's sample.
-///
-/// `describe` asks for an audio-only initialization segment. Neither segment
-/// is made without sound to put in it.
+/// Time one unit for a player that decodes its pictures itself: where each
+/// picture it keeps is presented, which is where [`mpeg2_gop_to_fmp4`] puts
+/// that picture's sample, and a fragment with no segments and no samples that
+/// spans the unit's duration on the same timeline.
 pub fn mpeg2_decode_unit_to_fmp4(
     unit: &Mpeg2Unit,
-    sequence_number: u32,
     presentation_start: u64,
     lead_in: UnitLeadIn,
-    describe: bool,
-    audio_track: Option<&Fmp4AudioSamples>,
 ) -> (Fmp4Fragment, Vec<PicturePresentation>) {
     let timing = mpeg2_sample_timing(&unit.timeline, lead_in);
     let mut decode_time = base_decode_time(presentation_start, &timing);
@@ -1545,28 +1522,11 @@ pub fn mpeg2_decode_unit_to_fmp4(
         decode_time += u64::from(decoded);
         at += samples;
     }
-    let sound = audio_track.filter(|track| !track.samples.is_empty());
-    let media_segment = sound.map_or_else(Vec::new, |track| {
-        make_av_media_segment(
-            &VideoPayload::mpeg2(Vec::new()),
-            &[],
-            &[],
-            &[],
-            &track.samples,
-            sequence_number,
-            0,
-            track.base_decode_time,
-        )
-    });
-    let (init_segment, mime_codec) = match sound.filter(|_| describe) {
-        Some(track) => make_audio_init_segment(&track.config),
-        None => (Vec::new(), String::new()),
-    };
     (
         Fmp4Fragment {
-            init_segment,
-            media_segment,
-            mime_codec,
+            init_segment: Vec::new(),
+            media_segment: Vec::new(),
+            mime_codec: String::new(),
             sample_count: 0,
             duration: timing.durations.iter().map(|&d| d as u64).sum(),
         },

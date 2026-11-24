@@ -225,12 +225,29 @@ export interface LoadCommand {
 
 export type Command =
   | LoadCommand
-  /** Where the playhead is now, in seconds. Worker-sink loads only. */
+  /** Where the playhead is now, in seconds. Worker-sink loads and decode mode. */
   | { type: "time"; id: number; currentTime: number }
   /** Whether the page's sink has room for more. Main-sink loads only. */
   | { type: "flow"; id: number; ready: boolean }
-  /** Play from here instead; the buffer does not reach it. See `seekable`. */
-  | { type: "seek"; id: number; time: number }
+  /**
+   * Play from here instead. Passthrough sends it where the buffer does not
+   * reach, and `epoch` is null. Decode mode sends it for every seek, with the
+   * epoch the AudioWorklet was just told to play from `time` under: the
+   * worker feeds it from the sound it holds where that reaches, and reads the
+   * input again where it does not. See `seekable`.
+   */
+  | { type: "seek"; id: number; time: number; epoch: number | null }
+  /**
+   * Decode mode: the port to the AudioWorklet's queue, and the epoch it was
+   * told to play from `at` under. Sent right after `load`.
+   */
+  | {
+      type: "sound-port";
+      id: number;
+      port: MessagePort;
+      epoch: number;
+      at: number;
+    }
   /**
    * Take the sound from somewhere else from here on: another of the service's
    * streams, or the other service of a dual-mono one. Either may be left
@@ -294,11 +311,20 @@ export type Notification =
    */
   | { type: "seekable"; id: number; duration: number }
   /**
-   * Throw away everything buffered; a seek is about to refill it. In decode
-   * mode this comes whichever side holds the MediaSource, and requests of the
-   * epochs before it are ignored from here on.
+   * Throw away everything buffered; a seek is about to refill it. Passthrough
+   * with the MediaSource on the page only: decode mode's seeks start on the
+   * page, which has emptied its side by then.
    */
   | { type: "reset"; id: number }
+  /**
+   * Decode mode: the sound the worker holds now spans `start` to `end` in
+   * media seconds, or it holds none. This is the media element's `buffered`.
+   */
+  | {
+      type: "buffered";
+      id: number;
+      range: { start: number; end: number } | null;
+    }
   /** Decode mode: a picture decoded for a request of `epoch`, in presentation order within it. */
   | { type: "picture"; id: number; epoch: number; picture: DecodedPicture }
   /** Decode mode: every picture after the request of `epoch` has been sent. */

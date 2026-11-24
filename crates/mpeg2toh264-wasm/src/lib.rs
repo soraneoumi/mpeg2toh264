@@ -5,7 +5,7 @@
 //! lives in [`mpeg2toh264::Session`] where it can be tested without a browser.
 //! What is here turns Rust values into the shapes JavaScript expects.
 
-use js_sys::{Array, Object, Reflect, Uint8Array};
+use js_sys::{Array, Float32Array, Object, Reflect, Uint8Array};
 use mpeg2toh264::mpeg2::decode::{packed_planes, DecodedFrame, ShownFrame, UnitDecoder};
 use mpeg2toh264::{
     AudioGain, DualMono, Fragment, OpenGopRecovery, SessionOptions, VideoMode, VideoPicture,
@@ -17,7 +17,10 @@ use wasm_bindgen::prelude::*;
 /// get something better than `any[]` to typecheck against.
 #[wasm_bindgen(typescript_custom_section)]
 const FRAGMENT_TYPESCRIPT: &str = r#"
-/** One thing to hand to Media Source Extensions. */
+/**
+ * One thing the session hands out: for Media Source Extensions, or, in decode
+ * mode, for the caller to decode or play.
+ */
 export type Fragment =
   | {
       /**
@@ -25,6 +28,10 @@ export type Fragment =
        * Normally the only one; a stream that changes its frame size, its field
        * coding or its aspect ratio sends another, and the `SourceBuffer` takes
        * it in the same order as everything else.
+       *
+       * Decode mode muxes nothing: `data` is empty and `mimeCodec` is "", and
+       * the fragment carries the coded size. It comes before the first unit
+       * with sound and again where the sound changes configuration.
        */
       kind: "init";
       data: Uint8Array;
@@ -34,6 +41,11 @@ export type Fragment =
       height: number;
     }
   | {
+      /**
+       * In decode mode `data` is empty: the fragment comes after the unit's
+       * `sound` and places the unit, and `audioSamples` is how many AAC
+       * access units of sound it carried.
+       */
       kind: "media";
       data: Uint8Array;
       /** Where this fragment starts on the presentation timeline, in seconds. */
@@ -53,9 +65,29 @@ export type Fragment =
     }
   | {
       /**
+       * The sound of one unit decoded to PCM, in decode mode only. It comes
+       * before the unit's `media` fragment, one for each run of the unit's
+       * access units at one sample rate.
+       */
+      kind: "sound";
+      /**
+       * Presentation time of the first sample, in seconds, on the timeline
+       * `media` fragments' `start` is on.
+       */
+      start: number;
+      sampleRate: number;
+      /**
+       * Stereo, full scale 1.0, 1024 samples per AAC access unit. Each owns
+       * its buffer, so both can be transferred.
+       */
+      left: Float32Array;
+      right: Float32Array;
+    }
+  | {
+      /**
        * One unit of MPEG-2 to decode with `PictureDecoder`, in decode mode
-       * only. It follows the `media` fragment carrying the unit's sound,
-       * where the unit has any.
+       * only. It follows the unit's `media` fragment, where the unit has
+       * sound.
        */
       kind: "video";
       data: Uint8Array;
@@ -721,6 +753,22 @@ fn to_js_fragment(fragment: Fragment) -> Result<JsValue, JsError> {
                 js_scans.set(index as u32, item.into());
             }
             set(&object, "scans", &js_scans.into())?;
+        }
+        Fragment::Sound {
+            start,
+            sample_rate,
+            left,
+            right,
+        } => {
+            set(&object, "kind", &"sound".into())?;
+            set(&object, "start", &start.into())?;
+            set(&object, "sampleRate", &(sample_rate as f64).into())?;
+            set(&object, "left", &Float32Array::from(left.as_slice()).into())?;
+            set(
+                &object,
+                "right",
+                &Float32Array::from(right.as_slice()).into(),
+            )?;
         }
         Fragment::Video {
             data,

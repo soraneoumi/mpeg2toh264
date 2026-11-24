@@ -126,11 +126,13 @@ export class PictureSchedule<U extends ScheduledUnit> {
 
   /**
    * Forget every unit and every request, as for a seek that reopens the
-   * input. Requests of the epochs seen so far are refused from here on.
+   * input. Requests of epochs before `from` are refused from here on: by
+   * default every epoch seen so far, and for a seek the page already started
+   * an epoch for -- its request can come before the seek -- that epoch's.
    */
-  clear(): void {
+  clear(from = this.#highestEpoch + 1): void {
     this.#entries = [];
-    this.#minEpoch = this.#highestEpoch + 1;
+    this.#minEpoch = from;
     this.#epoch = null;
     this.#window = null;
     this.#lastFrom = Number.NEGATIVE_INFINITY;

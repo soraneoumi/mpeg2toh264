@@ -1,10 +1,11 @@
 //! MPEG-2 video from MPEG transport streams, packaged for playback.
 //!
 //! A [`Session`] takes a transport stream in slices and hands back fragmented
-//! MP4. The video is either carried into the MP4 as it stands
-//! ([`VideoMode::Passthrough`]) or handed out as MPEG-2 units for the caller to
-//! decode with [`mpeg2::decode`] ([`VideoMode::Decode`]), in which case only the
-//! sound is muxed. The sound is the stream's own AAC, changed only in its gain.
+//! MP4. The video is either carried into the MP4 as it stands, with the sound
+//! beside it as the stream's own AAC, changed only in its gain
+//! ([`VideoMode::Passthrough`]), or handed out as MPEG-2 units for the caller to
+//! decode with [`mpeg2::decode`] and the sound as PCM decoded by [`audio`]
+//! ([`VideoMode::Decode`]), in which case nothing is muxed.
 
 // The inverse transform, dequantiser and macroblock paths index several arrays
 // in step with a position or block number taken straight from the

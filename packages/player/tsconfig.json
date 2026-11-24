@@ -5,6 +5,8 @@
     "src/player.ts",
     "src/mse.ts",
     "src/protocol.ts",
+    "src/media-takeover.ts",
+    "src/sound-output.ts",
     "src/sound/index.ts"
   ]
 }

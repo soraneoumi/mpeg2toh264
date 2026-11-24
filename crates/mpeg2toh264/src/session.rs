@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use crate::audio::{downmix, parse_block, AacDecoder, ParsedBlock, PcmFrame, FRAME_SAMPLES};
 use crate::container::adts::{
     aac_frame_count_through_video_time, silent_frame, AacConfig, AacFrame, AacUnit, AdtsOutput,
     AdtsStream, AudioGain, DualMono, AAC_FRAME_SAMPLES,
@@ -126,10 +127,10 @@ pub enum VideoMode {
     /// packaging costs almost nothing -- but a decoder that does not take
     /// MPEG-2 plays none of it.
     Passthrough,
-    /// Hand the MPEG-2 out for the caller to decode, and put only the sound
-    /// into the MP4: the media element plays the sound and keeps the clock
-    /// the pictures are shown by. Groups are always cut into anchor units.
-    /// Needs AAC sound.
+    /// Hand the MPEG-2 out for the caller to decode, and the sound decoded
+    /// to PCM for the caller to play: the sound keeps the clock the pictures
+    /// are shown by. Nothing is muxed. Groups are always cut into anchor
+    /// units. Needs AAC sound.
     Decode,
 }
 
@@ -200,7 +201,8 @@ pub struct VideoScan {
     pub scan: Interlacing,
 }
 
-/// One thing to hand to Media Source Extensions.
+/// One thing the session hands out: for Media Source Extensions, or, in
+/// decode mode, for the caller to decode or play.
 #[derive(Clone, Debug)]
 pub enum Fragment {
     /// An initialization segment, emitted before the media it describes.
@@ -210,6 +212,11 @@ pub enum Fragment {
     /// any longer, so another goes out in front of the first fragment coded
     /// under the new description -- which is a fragment a decoder can start
     /// on, since nothing else can activate it.
+    ///
+    /// Decode mode muxes nothing, and `data` and `mime_codec` are empty: the
+    /// fragment carries the coded size of the unit it goes out in front of,
+    /// and goes out in front of the first unit with sound and again where the
+    /// sound changes configuration.
     Init {
         data: Vec<u8>,
         /// The MIME type to open the `SourceBuffer` with.
@@ -220,6 +227,11 @@ pub enum Fragment {
     },
     /// One unit of media: a whole GOP, or, when the session cuts groups, one
     /// anchor picture of it with the B pictures coded after it.
+    ///
+    /// In decode mode it muxes nothing and `data` is empty: it goes out for
+    /// each unit that carries sound, after that sound's [`Fragment::Sound`],
+    /// and says where the unit starts and how many access units of sound it
+    /// carried.
     Media {
         data: Vec<u8>,
         /// Where this fragment starts on the presentation timeline, in seconds.
@@ -237,9 +249,22 @@ pub enum Fragment {
         /// Picture-accurate field changes in presentation order.
         scans: Vec<VideoScan>,
     },
+    /// The sound of one unit decoded to PCM, in decode mode only. It goes out
+    /// in front of the unit's `Media` fragment, one for each run of the unit's
+    /// access units at one sample rate.
+    Sound {
+        /// Presentation time of the first sample, in seconds, on the timeline
+        /// `Media::start` is on.
+        start: f64,
+        sample_rate: u32,
+        /// Stereo, full scale 1.0, 1024 samples for each access unit. The mix
+        /// is the one a receiver plays; see [`downmix::to_stereo`].
+        left: Vec<f32>,
+        right: Vec<f32>,
+    },
     /// One unit of MPEG-2 for the caller to decode, in decode mode only. It
-    /// follows the `Media` fragment carrying the same unit's sound, where
-    /// the unit has any.
+    /// follows the `Media` fragment of the same unit, where the unit has
+    /// sound.
     Video {
         /// The unit's elementary stream, which `parse_elementary_stream`
         /// splits into the pictures named below.
@@ -465,7 +490,7 @@ enum VideoPipeline {
         recovery_pending: bool,
         split_field_samples: bool,
     },
-    /// Handed out for the caller to decode, with only the sound muxed.
+    /// Handed out for the caller to decode, with the sound decoded to PCM.
     Decode {
         /// As for passthrough: nothing is kept until an intra picture.
         awaiting_intra: bool,
@@ -568,11 +593,14 @@ pub struct Session {
     /// Whether the next fragment has to carry an initialization segment: the
     /// first one does, and so does the first one after a stream changes what
     /// its sequence header says -- or, where the pictures are handed out and
-    /// the segment holds only the sound, what the sound is described by.
+    /// the initialization fragment follows the sound, what the sound is
+    /// described by.
     describe_pending: bool,
 
     pending_gops: Vec<WaitingUnit>,
     pending_audio: Vec<AacFrame>,
+    /// What decode mode turns the sound into PCM with; `None` in passthrough.
+    sound: Option<SoundDecoder>,
     /// Units dropped because their headers could not be read, which count
     /// among the errors.
     unreadable_units: u64,
@@ -643,6 +671,75 @@ pub struct Session {
     count_broken: bool,
     /// Source field clock and the end time already committed across GOPs.
     rff: RffState,
+}
+
+/// Decode mode's sound, from AAC to the stereo PCM a receiver plays.
+///
+/// The frames it is given are the ones that would have been muxed, stand-ins
+/// for lost ones included, and they follow on from each other from one unit
+/// to the next, so one decoder carries its overlap across.
+struct SoundDecoder {
+    decoder: AacDecoder,
+    block: ParsedBlock,
+    pcm: PcmFrame,
+    /// The AudioSpecificConfig the decoder was last configured with.
+    configured: Vec<u8>,
+    /// Access units that could not be decoded and were concealed.
+    concealed: u64,
+}
+
+impl SoundDecoder {
+    fn new() -> Self {
+        Self {
+            decoder: AacDecoder::new(),
+            block: ParsedBlock::new(),
+            pcm: PcmFrame::new(),
+            configured: Vec::new(),
+            concealed: 0,
+        }
+    }
+
+    /// The left and right samples of `frames`.
+    ///
+    /// The session's frames are already rebuilt for stereo playback -- a mono
+    /// or dual-mono service as a channel pair of the chosen service, the gain
+    /// in `global_gain` -- so they are mixed as they are. A frame that does not
+    /// decode is concealed, never refused: the sound has to cover its time.
+    fn decode(&mut self, frames: &[AacFrame]) -> (Vec<f32>, Vec<f32>) {
+        let mut left = vec![0.0; frames.len() * FRAME_SAMPLES];
+        let mut right = vec![0.0; frames.len() * FRAME_SAMPLES];
+        let outputs = left
+            .chunks_exact_mut(FRAME_SAMPLES)
+            .zip(right.chunks_exact_mut(FRAME_SAMPLES));
+        for (frame, (left, right)) in frames.iter().zip(outputs) {
+            let config = &frame.config;
+            let asc = &config.audio_specific_config;
+            if *asc != self.configured {
+                // A configuration that is refused leaves the blocks to describe
+                // themselves, and the ones that cannot are concealed below.
+                let _ = self.decoder.configure(asc);
+                self.configured.clone_from(asc);
+            }
+            let channel_configuration = (asc[1] >> 3) & 0x0f;
+            let frequency_index = config.sampling_frequency_index;
+            let decoded = parse_block(&frame.data, frequency_index, &mut self.block)
+                && self
+                    .decoder
+                    .decode(
+                        &self.block,
+                        channel_configuration,
+                        frequency_index,
+                        &mut self.pcm,
+                    )
+                    .is_ok();
+            if !decoded {
+                self.decoder.conceal(&mut self.pcm);
+                self.concealed += 1;
+            }
+            downmix::to_stereo(&self.pcm, false, 1.0, left, right);
+        }
+        (left, right)
+    }
 }
 
 impl Session {
@@ -734,8 +831,13 @@ impl Session {
     pub fn scrambled(&self) -> u64 {
         self.demuxer.scrambled()
     }
+    /// Damage the session worked around: packets and units it could not
+    /// read, and, in decode mode, access units of sound it could not decode
+    /// and concealed.
     pub fn errors(&self) -> u64 {
-        self.demuxer.errors() + self.unreadable_units
+        self.demuxer.errors()
+            + self.unreadable_units
+            + self.sound.as_ref().map_or(0, |sound| sound.concealed)
     }
 
     /// Start a session whose timeline is measured from a PES timestamp of the
@@ -788,6 +890,7 @@ impl Session {
             describe_pending: true,
             pending_gops: Vec::new(),
             pending_audio: Vec::new(),
+            sound: (options.video == VideoMode::Decode).then(SoundDecoder::new),
             unreadable_units: 0,
             unreadable_run: None,
             audio_config: None,
@@ -1758,8 +1861,9 @@ impl Session {
         if self.described.is_some() {
             self.video.request_random_access();
         }
-        // The decoder is given the pictures' own headers. The initialization
-        // segment holds the sound alone, whatever the picture is coded under.
+        // The decoder is given the pictures' own headers, and decode mode's
+        // initialization fragment follows the sound, whatever the picture is
+        // coded under.
         if !matches!(self.video, VideoPipeline::Decode { .. }) {
             self.describe_pending = true;
         }
@@ -2165,14 +2269,24 @@ impl Session {
             .first()
             .map(|frame| frame.config.clone())
             .or_else(|| self.audio_config.clone());
-        let audio_track = config.as_ref().map(|config| Fmp4AudioSamples {
-            config: config.clone(),
-            samples: audio_frames
-                .iter()
-                .map(|frame| frame.data.clone())
-                .collect(),
-            base_decode_time: self.audio_base_decode_time(config.sample_rate),
-        });
+        let decode = matches!(plan, UnitPlan::Decode(_));
+        // Before the count of frames that went out moves past these, which is
+        // where they start.
+        let mut sound = Vec::new();
+        if decode {
+            self.decode_sound(&audio_frames, &mut sound);
+        }
+        let audio_track = config
+            .as_ref()
+            .filter(|_| !decode)
+            .map(|config| Fmp4AudioSamples {
+                config: config.clone(),
+                samples: audio_frames
+                    .iter()
+                    .map(|frame| frame.data.clone())
+                    .collect(),
+                base_decode_time: self.audio_base_decode_time(config.sample_rate),
+            });
         let Packaged {
             fragment,
             recovery_point,
@@ -2253,11 +2367,17 @@ impl Session {
 
         // A fragment that muxes the video describes it exactly when the
         // pictures in it are the first coded under their description, which is
-        // the fragment a `SourceBuffer` has to be given one for. One that
-        // carries only the sound is described when the sound changes.
+        // the fragment a `SourceBuffer` has to be given one for. In decode mode
+        // nothing is muxed, and the initialization fragment -- no segment,
+        // only the coded size -- goes out where the sound starts and where it
+        // changes configuration.
         let description = stream_sequence_description(&gop.data);
-        let decode = matches!(plan, UnitPlan::Decode(_));
-        if !fragment.init_segment.is_empty() {
+        let describes = if decode {
+            self.describe_pending && !audio_frames.is_empty()
+        } else {
+            !fragment.init_segment.is_empty()
+        };
+        if describes {
             self.initialized = true;
             self.describe_pending = false;
             if !decode {
@@ -2271,7 +2391,7 @@ impl Session {
                 height: description.map_or(0, |description| description.height),
             });
         }
-        // Sound alone: every fragment is somewhere a decoder can begin.
+        // Nothing muxed: every fragment is somewhere a decoder can begin.
         let random_access = restarts || recovery_point || decode;
         if random_access {
             self.media_bytes_since_random_access = fragment.media_segment.len();
@@ -2281,9 +2401,11 @@ impl Session {
                 .saturating_add(fragment.media_segment.len());
         }
         let restart_offset = gop.restart_offset.filter(|_| !gop.continues_group);
-        // In decode mode the pictures go out on their own, and a unit with no
-        // sound has nothing for the media element.
+        // In decode mode the pictures go out on their own, and the sound in
+        // front of the fragment that places it; a unit with no sound has
+        // neither.
         if !decode || !audio_frames.is_empty() {
+            out.append(&mut sound);
             out.push(Fragment::Media {
                 data: fragment.media_segment,
                 start,
@@ -2325,6 +2447,30 @@ impl Session {
                     })
                     .collect(),
             });
+        }
+    }
+
+    /// Decode the sound of a unit going out in decode mode into `out`, one
+    /// [`Fragment::Sound`] for each run of `frames` at one sample rate, each
+    /// placed where the audio track would have put its first sample.
+    fn decode_sound(&mut self, frames: &[AacFrame], out: &mut Vec<Fragment>) {
+        let mut at = 0;
+        while at < frames.len() {
+            let rate = frames[at].config.sample_rate;
+            let run = frames[at..]
+                .iter()
+                .position(|frame| frame.config.sample_rate != rate)
+                .unwrap_or(frames.len() - at);
+            let first = self.audio_base_decode_time(rate) + at as u64 * AAC_FRAME_SAMPLES;
+            let sound = self.sound.as_mut().expect("decode mode decodes its sound");
+            let (left, right) = sound.decode(&frames[at..at + run]);
+            out.push(Fragment::Sound {
+                start: first as f64 / f64::from(rate),
+                sample_rate: rate,
+                left,
+                right,
+            });
+            at += run;
         }
     }
 
@@ -2385,11 +2531,8 @@ impl Session {
                 *awaiting_intra &= unit.samples.is_empty();
                 let (fragment, pictures) = mpeg2_decode_unit_to_fmp4(
                     unit,
-                    self.sequence_number,
                     self.video_presentation_start,
                     plan.lead_in(restarts),
-                    self.describe_pending,
-                    audio_track,
                 );
                 Packaged {
                     fragment,

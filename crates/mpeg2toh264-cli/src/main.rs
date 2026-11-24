@@ -539,8 +539,10 @@ fn write_fragment(
             }
             data
         }
-        // Only decode mode hands pictures out, and this writes MP4.
-        Fragment::PrivateStream { .. } | Fragment::Video { .. } => return Ok(()),
+        // Only decode mode hands pictures and sound out, and this writes MP4.
+        Fragment::PrivateStream { .. } | Fragment::Video { .. } | Fragment::Sound { .. } => {
+            return Ok(())
+        }
     };
     output.write_all(&data)?;
     totals.bytes += data.len();

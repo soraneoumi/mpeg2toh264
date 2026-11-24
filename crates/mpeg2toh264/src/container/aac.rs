@@ -799,8 +799,9 @@ impl PceElements {
 /// What a `program_config_element` says.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PceInfo {
-    /// The bit after `element_instance_tag`, where the part of the element an
-    /// AudioSpecificConfig carries begins.
+    /// The bit `element_instance_tag` starts at, after the `id_syn_ele` a
+    /// raw_data_block puts in front of it: where the part of the element an
+    /// AudioSpecificConfig carries begins (ISO/IEC 14496-3 table 4.2).
     pub body_start: usize,
     /// One past the channel description, before the byte alignment and the
     /// comment field.
@@ -885,7 +886,7 @@ pub(crate) fn read_block<S: Sink>(
                 cpe_end(data, at, tables, &mut gains, sink).ok()?
             }
             ID_PCE => {
-                let (info, end) = program_config_element(data, at);
+                let (info, end) = program_config_element(data, at + 3);
                 if !elements.iter().any(Element::is_channel) {
                     pce = Some(info);
                 }
@@ -917,10 +918,12 @@ pub(crate) fn read_block<S: Sink>(
     }
 }
 
-/// The `program_config_element` at `start`, and one past its end. Whether it
-/// fits the block is the caller's question.
-fn program_config_element(data: &[u8], start: usize) -> (PceInfo, usize) {
-    let mut r = BitReader::at_bit(data, start + 7); // id_syn_ele, element_instance_tag
+/// The `program_config_element` whose `element_instance_tag` is at `start`,
+/// and one past its end. A raw_data_block has the element's `id_syn_ele` in
+/// front of that, and an AudioSpecificConfig does not. Whether it fits what it
+/// is in is the caller's question.
+pub(crate) fn program_config_element(data: &[u8], start: usize) -> (PceInfo, usize) {
+    let mut r = BitReader::at_bit(data, start + 4); // element_instance_tag
     r.skip(2 + 4); // object_type, sampling_frequency_index
     let front = r.u(4);
     let side = r.u(4);
@@ -952,7 +955,7 @@ fn program_config_element(data: &[u8], start: usize) -> (PceInfo, usize) {
     r.skip(comments * 8);
     (
         PceInfo {
-            body_start: start + 7,
+            body_start: start,
             body_end,
             channels,
             matrix_mixdown_idx_present,

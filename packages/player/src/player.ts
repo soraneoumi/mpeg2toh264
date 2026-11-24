@@ -37,6 +37,9 @@ import {
   type TimingMark,
 } from "./protocol.js";
 import bundledWorkerURL from "./worker.ts?worker&url";
+import { MediaTakeover, Ready } from "./media-takeover.js";
+import { SoundOutput } from "./sound-output.js";
+import type { SoundPosition } from "./sound/index.js";
 
 /** The Worker URL emitted with this package for consumers that re-bundle the player. */
 const mpeg2TsPlayerWorkerURL = bundledWorkerURL;
@@ -386,6 +389,19 @@ export class Mpeg2TsPlayer extends EventTarget {
   #placingAt: number | null = null;
   #needs: ReturnType<typeof setInterval> | null = null;
   #videoSize: { width: number; height: number } | null = null;
+  /** Decode mode: the sound's way out, and the element's media interface. */
+  #sound: SoundOutput | null = null;
+  #takeover: MediaTakeover | null = null;
+  /**
+   * Decode mode: where the current epoch starts, and whether each of the two
+   * things playback waits for after a start or a seek is there -- the sound
+   * buffered in the worklet, and the first picture at or after the start in
+   * the deinterlacer. The worklet is told to play only once both are, so
+   * that the clock never starts with the picture behind it.
+   */
+  #epochAt = 0;
+  #soundReady = false;
+  #pictureReady = false;
 
   constructor(video: HTMLVideoElement, options: Mpeg2TsPlayerOptions = {}) {
     super();
@@ -700,10 +716,136 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.#startPlayhead();
     if (this.#decoding && decodedVideo) {
       decodedVideo.onrelease = this.#recycle;
+      try {
+        this.#openSound(id);
+      } catch (error) {
+        // A browser without Web Audio, which decode mode cannot play on.
+        queueMicrotask(() => {
+          if (id === this.#generation) this.#fail(toError(error));
+        });
+        return promise;
+      }
       this.#newEpoch();
+      this.#beginSoundEpoch(0);
+      const port = this.#sound!.workerPort;
+      worker.postMessage(
+        {
+          type: "sound-port",
+          id,
+          port,
+          epoch: this.#epoch,
+          at: 0,
+        } satisfies Command,
+        [port],
+      );
       this.#needs = setInterval(this.#postNeed, PICTURE_NEED_INTERVAL_MS);
     }
     return promise;
+  }
+
+  /**
+   * Decode mode: the AudioWorklet the sound plays through, and the element's
+   * media interface answered from here for the length of the load.
+   */
+  #openSound(id: number): void {
+    const sound = new SoundOutput({
+      report: (position) => {
+        if (id === this.#generation) this.#onSoundReport(position);
+      },
+      error: (error) => {
+        if (id === this.#generation) this.#fail(error);
+      },
+    });
+    const takeover = new MediaTakeover(this.video, {
+      play: () => this.#startIfReady(),
+      pause: () => sound.control({ type: "pause" }),
+      seek: (time) => this.#seekDecoded(time),
+      rate: (rate) => {
+        sound.control({ type: "rate", rate });
+        this.#postNeed();
+      },
+      volume: (gain) => sound.control({ type: "volume", gain }),
+      heard: () => sound.clock.at(performance.now()),
+      resume: () => sound.resume(),
+    });
+    sound.control({ type: "rate", rate: takeover.rate });
+    sound.control({ type: "volume", gain: takeover.gain });
+    takeover.install();
+    this.#sound = sound;
+    this.#takeover = takeover;
+  }
+
+  /**
+   * Start the sound's epoch at media time `at`, held: it plays once both its
+   * sound and its first picture are in (`#startIfReady`).
+   */
+  #beginSoundEpoch(at: number): void {
+    this.#epochAt = at;
+    this.#soundReady = false;
+    this.#pictureReady = false;
+    this.#sound!.control({ type: "pause" });
+    this.#sound!.control({ type: "epoch", epoch: this.#epoch, at });
+  }
+
+  /** The viewer moved the playhead, in decode mode: a new epoch from `time`. */
+  #seekDecoded(time: number): void {
+    if (this.#state === "idle" || this.#state === "error") return;
+    const takeover = this.#takeover!;
+    if (takeover.readyState > Ready.Metadata)
+      takeover.setReadyState(Ready.Metadata);
+    this.#newEpoch();
+    this.#beginSoundEpoch(time);
+    // After the request of the new epoch, so that the worker has it when it
+    // decides whether the units for it are still there.
+    this.#worker?.postMessage({
+      type: "seek",
+      id: this.#generation,
+      time,
+      epoch: this.#epoch,
+    } satisfies Command);
+  }
+
+  /** Let the sound play, where the epoch has what it waits for and playback is wanted. */
+  #startIfReady(): void {
+    const takeover = this.#takeover;
+    if (!takeover || !this.#soundReady || !this.#pictureReady) return;
+    takeover.seeked();
+    takeover.setReadyState(Ready.EnoughData);
+    if (!takeover.paused) this.#sound!.control({ type: "play" });
+  }
+
+  /** What the worklet says it is doing, for the element and the start. */
+  #onSoundReport(position: SoundPosition): void {
+    const takeover = this.#takeover;
+    if (!takeover || position.epoch !== this.#epoch) return;
+    switch (position.state) {
+      case "ready":
+        if (this.#soundReady) break;
+        this.#soundReady = true;
+        this.#startIfReady();
+        break;
+      case "playing":
+        takeover.setReadyState(Ready.EnoughData);
+        takeover.soundStarted(position.media);
+        break;
+      case "starved":
+        takeover.soundStopped(position.media, false);
+        takeover.setReadyState(Ready.CurrentData);
+        break;
+      case "paused":
+        takeover.soundStopped(position.media, false);
+        break;
+      case "ended":
+        // A seek to the very end has nothing to buffer before it ends.
+        if (!this.#soundReady) {
+          this.#soundReady = true;
+          this.#startIfReady();
+        }
+        takeover.soundStopped(position.media, true);
+        break;
+      case "buffering":
+        break;
+    }
   }
 
   /** Give a picture's buffer back to the worker that made it. */
@@ -760,6 +902,17 @@ export class Mpeg2TsPlayer extends EventTarget {
     } catch (error) {
       // The deinterlacer released the buffer; the pictures after it go on.
       this.#emit("error", { error: toError(error) });
+      return;
+    }
+    if (
+      !this.#pictureReady &&
+      picture.timestamp + picture.duration > this.#epochAt
+    ) {
+      this.#pictureReady = true;
+      const takeover = this.#takeover!;
+      if (takeover.readyState < Ready.CurrentData)
+        takeover.setReadyState(Ready.CurrentData);
+      this.#startIfReady();
     }
   }
 
@@ -883,7 +1036,11 @@ export class Mpeg2TsPlayer extends EventTarget {
       case "seekable":
         this.#duration = notification.duration;
         this.#sink?.setDuration(notification.duration);
+        this.#takeover?.setDuration(notification.duration);
         this.#emit("seekable", { duration: notification.duration });
+        break;
+      case "buffered":
+        this.#takeover?.setBuffered(notification.range);
         break;
       case "reset":
         this.#clearVideoTimeline();
@@ -894,8 +1051,14 @@ export class Mpeg2TsPlayer extends EventTarget {
         this.#takePicture(notification.epoch, notification.picture);
         break;
       case "pictures-end":
-        if (this.#decoding && notification.epoch === this.#epoch)
+        if (this.#decoding && notification.epoch === this.#epoch) {
           this.#deinterlacer?.decodedVideo?.finish();
+          // No picture at or after the start is coming.
+          if (!this.#pictureReady) {
+            this.#pictureReady = true;
+            this.#startIfReady();
+          }
+        }
         break;
       case "no-aac-audio":
         this.#passthroughInstead();
@@ -925,6 +1088,9 @@ export class Mpeg2TsPlayer extends EventTarget {
         this.#sink?.holdStart(notification.seconds);
         break;
       case "progress":
+        // An input with no length is a live one, with no end to be at.
+        if (notification.totalBytes === null)
+          this.#takeover?.setDuration(Number.POSITIVE_INFINITY);
         this.#emit("progress", {
           bytesRead: notification.bytesRead,
           totalBytes: notification.totalBytes,
@@ -1066,6 +1232,11 @@ export class Mpeg2TsPlayer extends EventTarget {
    * held back for them has not been let into the element any earlier.
    */
   #placePlayhead(time: number): void {
+    // Decode mode's timeline is the sound's, which starts where it starts.
+    if (this.#takeover) {
+      this.#takeover.place(time);
+      return;
+    }
     if (this.video.currentTime >= time) return;
     this.video.currentTime = time;
     // Read back, since the element keeps a time only to its own precision.
@@ -1082,6 +1253,8 @@ export class Mpeg2TsPlayer extends EventTarget {
    * from where the viewer asked to be.
    */
   #onSeeking = (): void => {
+    // Decode mode's seeks come in through the element's own interface.
+    if (this.#takeover) return;
     const placed = this.#placingAt === this.video.currentTime;
     this.#placingAt = null;
     if (placed) return;
@@ -1101,13 +1274,15 @@ export class Mpeg2TsPlayer extends EventTarget {
       type: "seek",
       id: this.#generation,
       time,
+      epoch: null,
     } satisfies Command);
   };
 
   #onTimedEvent = (event: Event): void => {
     if (this.#state === "idle") return;
     this.#mark(event.type as TimingMark, now());
-    if (event.type === "waiting") this.#crossGap();
+    // Decode mode's sound steps over holes itself; see the sound queue.
+    if (event.type === "waiting" && !this.#decoding) this.#crossGap();
   };
 
   /**
@@ -1182,7 +1357,9 @@ export class Mpeg2TsPlayer extends EventTarget {
    */
   #reportPlayhead = (): void => {
     const currentTime = this.video.currentTime;
-    if (this.#sinkKind === "main") this.#sink?.setCurrentTime(currentTime);
+    // Decode mode's worker drops the units of pictures behind it.
+    if (this.#sinkKind === "main" && !this.#decoding)
+      this.#sink?.setCurrentTime(currentTime);
     else
       this.#worker?.postMessage({
         type: "time",
@@ -1248,6 +1425,11 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.#clearVideoTimeline();
     this.#sink?.close();
     this.#sink = null;
+    this.#sound?.close();
+    this.#sound = null;
+    // Before the element is reset below, which is its own again by then.
+    this.#takeover?.uninstall();
+    this.#takeover = null;
     if (this.#objectUrl) URL.revokeObjectURL(this.#objectUrl);
     this.#objectUrl = null;
     this.#source?.remove();

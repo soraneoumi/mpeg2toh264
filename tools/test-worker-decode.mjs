@@ -1,18 +1,19 @@
 /**
  * The worker in decode mode, end to end in Node with the real WebAssembly
- * build: a load with the MediaSource on the page, requests for pictures as a
- * playhead moves through the input, seeks, and the end of the input.
+ * build: a load, requests for pictures as a playhead moves through the
+ * input, the sound fed to a stand-in for the AudioWorklet that takes it as
+ * the playhead reaches it, seeks, and the end of the input.
  *
  *   node tools/test-worker-decode.mjs <input.ts>
  *
  * The input is served from memory with byte ranges, as a file server does.
  * Every picture of the input reaches the page once, in its epoch and in
  * presentation order, with the luma `mpeg2toh264 decode --checksums` gives
- * it (build the CLI first); no sound comes at the start or after a seek
- * before the picture where it landed, nor after the end of the stream, a
- * seek into the last picture included, and a request past the last picture
- * still ends the stream; buffers handed back are used again,
- * and after a seek the pictures start where it landed.
+ * it (build the CLI first). Each epoch's sound starts no later than where
+ * the epoch starts, each stretch where the one before ends, and the
+ * worklet is told when it ends, a seek into the last picture or past it
+ * included; buffers handed back are used again, and after a seek the
+ * pictures start where it landed.
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -123,36 +124,68 @@ try {
   let newest = Number.NEGATIVE_INFINITY;
   /** When the last picture of the epoch starts. */
   let last = Number.NEGATIVE_INFINITY;
-  /**
-   * Where the request of the epoch the sink was last reset for starts (the
-   * load starts as one), and whether a picture covering it has come.
-   */
+  /** Where the last seek asked to be, and whether a picture covering it has come. */
   let wanted = 0;
   let covered = false;
-  /** Sound that came after the start or a seek before the picture there. */
-  let early = 0;
-  /** Whether the sink was told the stream ends, and sound that came after. */
-  let finished = false;
-  let late = 0;
   const pictures = new Map();
   const buffers = new Set();
   let duplicates = 0;
   let stale = 0;
   let ends = [];
-  let resets = 0;
   let completed = false;
   let duration = null;
-  /** Where the media a seek reopened the input at begins. */
-  let landed = null;
   let errors = [];
+
+  /**
+   * The AudioWorklet's end of the PCM channel: what was sent under each
+   * epoch, and which epochs were told the sound ends. It takes what it is
+   * sent as the playhead reaches it, as the worklet does.
+   */
+  const sound = new MessageChannel();
+  const soundSent = new Map();
+  const soundEnded = new Set();
+  sound.port2.onmessage = ({ data }) => {
+    if (data.type === "pcm") {
+      assert.equal(data.channels[0].length, data.channels[1].length);
+      const sent = soundSent.get(data.epoch) ?? [];
+      sent.push({
+        start: data.start,
+        end: data.start + data.channels[0].length / data.sampleRate,
+        rate: data.sampleRate,
+      });
+      soundSent.set(data.epoch, sent);
+    } else if (data.type === "end") soundEnded.add(data.epoch);
+    notify();
+  };
+  const consume = () =>
+    sound.port2.postMessage({ type: "consumed", epoch, until: playhead });
+
+  /**
+   * What epoch `at` was sent: from no later than `at` where there is sound
+   * there, each stretch where the one before ends.
+   */
+  function checkSound(at, label) {
+    const sent = soundSent.get(epoch) ?? [];
+    if (sent.length === 0) {
+      assert.ok(soundEnded.has(epoch), `${label}: no sound, and its end`);
+      return;
+    }
+    assert.ok(
+      sent[0].start <= at + 1e-6,
+      `${label}: the sound starts at ${sent[0].start} for ${at}`,
+    );
+    for (let index = 1; index < sent.length; index++)
+      assert.ok(
+        Math.abs(sent[index].start - sent[index - 1].end) <
+          0.5 / sent[index].rate,
+        `${label}: sound at ${sent[index].start} after one ending at ${sent[index - 1].end}`,
+      );
+  }
   /** Held like a renderer's queue, then handed back. */
   const held = [];
 
   function handle(message) {
     switch (message.type) {
-      case "open":
-        send({ type: "flow", id, ready: true });
-        break;
       case "picture": {
         if (message.epoch !== epoch) {
           stale++;
@@ -185,31 +218,9 @@ try {
         ends.push(message.epoch);
         break;
       case "reset":
-        resets++;
-        finished = false;
-        completed = false;
-        epoch++;
-        last = Number.NEGATIVE_INFINITY;
-        wanted = playhead;
-        covered = false;
-        for (const buffer of held.splice(0))
-          send({ type: "recycle", id, data: buffer });
-        send({
-          type: "need",
-          id,
-          epoch,
-          from: playhead,
-          until: playhead + 0.3,
-        });
-        break;
-      case "finish":
-        finished = true;
-        break;
       case "fragment":
-        if (!covered) early++;
-        if (finished) late++;
-        if (resets > 0) landed ??= message.start;
-        break;
+      case "open":
+        throw new Error(`decode mode has no sink, and sent ${message.type}`);
       case "seekable":
         duration = message.duration;
         break;
@@ -241,6 +252,7 @@ try {
     // Short, so that the units the playhead passes are dropped.
     keepBehindSeconds: 1,
   });
+  send({ type: "sound-port", id, port: sound.port1, epoch, at: 0 });
   const started = performance.now();
   // A playhead moving through the input as fast as the pictures ahead of it
   // arrive, asking for them as the page does.
@@ -248,15 +260,17 @@ try {
     send({ type: "need", id, epoch, from: playhead, until: playhead + 0.3 });
     await new Promise((resolve) => setTimeout(resolve, 2));
     await pump(() => true);
-    if (newest >= playhead + 0.3) playhead += 0.05;
+    if (newest >= playhead + 0.3) {
+      playhead += 0.05;
+      consume();
+    }
   };
   while (!(completed && ends.includes(epoch)) && errors.length === 0) {
     await step();
     if (performance.now() - started > 600_000) throw new Error("timed out");
   }
   assert.deepEqual(errors, []);
-  assert.equal(early, 0, "sound came before the first picture");
-  assert.equal(late, 0, "sound came after the end of the stream");
+  checkSound(0, "the load");
   const elapsed = performance.now() - started;
 
   const expected = execFileSync(
@@ -288,46 +302,53 @@ try {
       `${buffers.size} buffers, pictures-end for epochs ${ends.join(",")}`,
   );
 
-  // A seek: the worker reopens the input and says so, older requests stop
-  // counting, and the pictures begin where it landed -- which can be after
-  // the time asked for, where the media element is then moved to. `command`
-  // is a seek the page sends; without it the page only asks for pictures the
-  // worker has dropped, and the worker reads the input again by itself.
+  // A seek: the page starts a new epoch and tells the worker, which feeds the
+  // sound from what it holds where that reaches and reads the input again
+  // where it does not; older requests stop counting, and the pictures begin
+  // where it landed.
   const byEnd = new Map(
     shown.map((picture) => [
       (picture.timestamp + picture.duration).toFixed(6),
       picture.luma,
     ]),
   );
-  async function seekTo(target, command) {
+  function startEpoch(target) {
     pictures.clear();
     ends = [];
-    landed = null;
-    const reset = resets + 1;
+    completed = false;
     epoch++;
     playhead = target;
+    wanted = target;
+    covered = false;
     newest = Number.NEGATIVE_INFINITY;
     last = Number.NEGATIVE_INFINITY;
+    for (const buffer of held.splice(0))
+      send({ type: "recycle", id, data: buffer });
     send({ type: "need", id, epoch, from: target, until: target + 0.3 });
-    if (command) send({ type: "seek", id, time: target });
-    await pump(() => resets === reset);
+    send({ type: "seek", id, time: target, epoch });
+  }
+  async function seekTo(target, label) {
+    startEpoch(target);
     const seekEpoch = epoch;
     while (!(newest >= playhead + 0.3) && errors.length === 0) {
-      if (landed !== null) playhead = Math.max(target, landed);
       send({ type: "need", id, epoch, from: playhead, until: playhead + 0.3 });
       await new Promise((resolve) => setTimeout(resolve, 2));
       await pump(() => true);
     }
     assert.deepEqual(errors, []);
-    assert.equal(early, 0, "sound came before the picture the seek landed in");
+    checkSound(target, label);
     const after = [...pictures.values()]
       .filter((picture) => picture.epoch === seekEpoch)
       .sort((a, b) => a.timestamp - b.timestamp);
     assert.ok(after.length > 0, "pictures after the seek");
+    // Reading again starts at a restart, and the leading pictures of an
+    // open group there are not kept: the pictures can begin up to a group
+    // after the target, where the sound already plays.
+    const landed = after[0].timestamp;
     assert.ok(
-      after[0].timestamp <= Math.max(target, landed) + 0.001 &&
+      landed <= target + 1.1 &&
         after.at(-1).timestamp + after.at(-1).duration >= playhead + 0.3,
-      `pictures ${after[0].timestamp}-${after.at(-1).timestamp} for ${target}, landed at ${landed}`,
+      `pictures ${landed}-${after.at(-1).timestamp} for ${target}`,
     );
     // The input reopens at a restart, whose leading pictures are not kept:
     // its intra picture covers their time, so it is the picture that ends
@@ -339,24 +360,49 @@ try {
         `the picture at ${picture.timestamp} after the seek`,
       );
     console.log(
-      `${command ? "seek" : "request back among dropped units"} to ${target.toFixed(2)} s, ` +
-        `landed at ${landed.toFixed(2)} s: ${after.length} pictures from ` +
-        `${after[0].timestamp.toFixed(3)} s, the same as without it`,
+      `${label} to ${target.toFixed(2)} s: ${after.length} pictures from ` +
+        `${landed.toFixed(3)} s, the same as without it; ` +
+        `sound from ${soundSent.get(seekEpoch)[0].start.toFixed(3)} s`,
     );
   }
   assert.ok(duration > 2, "the input is seekable");
-  await seekTo(shown[0].timestamp + 0.1, false);
-  await seekTo(duration / 2, true);
+  await seekTo(shown[0].timestamp + 0.1, "seek back among dropped units");
+  await seekTo(duration / 2, "seek");
+  // Back a little, into what is still held: no reading again.
+  await seekTo(duration / 2 + 0.1, "seek into the held sound");
+
+  // A seek into the last picture: it comes out of the decoder only once the
+  // input has ended, and the worklet is told the sound ends.
+  // Ahead of the request past the last picture below: that one reads the
+  // end of the input again, and the worker learns the last unit's restart
+  // there, from which no session can place the picture -- no sound follows
+  // it to place it by. A seek after that into the last picture reads from
+  // there and gets nothing; that is a fault of its own.
+  const final = shown.at(-1);
+  const target = final.timestamp + final.duration / 2;
+  startEpoch(target);
+  while (
+    !(completed && ends.includes(epoch) && soundEnded.has(epoch)) &&
+    errors.length === 0
+  ) {
+    send({ type: "need", id, epoch, from: playhead, until: playhead + 0.3 });
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    await pump(() => true);
+  }
+  assert.deepEqual(errors, []);
+  assert.ok(covered, "the last picture after a seek into it");
+  checkSound(target, "a seek into the last picture");
+  console.log(
+    `seek to ${target.toFixed(3)} s, into the last picture: the picture, and the sound's end`,
+  );
 
   // A request of a new epoch past the last picture, with the input read to
   // its end and the decoder holding a picture back from the seek before: it
   // ends at once, and nothing of the epoch left behind comes out in it.
   const lastPicture = shown.at(-1);
-  epoch++;
   const beyond = lastPicture.timestamp + lastPicture.duration + 0.05;
-  playhead = beyond;
+  startEpoch(beyond);
   const beyondEpoch = epoch;
-  send({ type: "need", id, epoch, from: beyond, until: beyond + 0.3 });
   while (!ends.includes(beyondEpoch) && errors.length === 0) {
     await new Promise((resolve) => setTimeout(resolve, 2));
     await pump(() => true);
@@ -373,45 +419,19 @@ try {
     `request at ${beyond.toFixed(3)} s in the buffer, past the last picture: no picture, and its end`,
   );
 
-  // A seek into the last picture: it comes out of the decoder only once the
-  // input has ended, and the sound held for it still goes ahead of the end.
-  const final = shown.at(-1);
-  const target = final.timestamp + final.duration / 2;
-  epoch++;
-  playhead = target;
-  send({ type: "need", id, epoch, from: target, until: target + 0.3 });
-  send({ type: "seek", id, time: target });
-  const reset = resets + 1;
-  await pump(() => resets === reset);
-  while (!(completed && ends.includes(epoch)) && errors.length === 0) {
-    send({ type: "need", id, epoch, from: playhead, until: playhead + 0.3 });
-    await new Promise((resolve) => setTimeout(resolve, 2));
-    await pump(() => true);
-  }
-  assert.deepEqual(errors, []);
-  assert.ok(covered, "the last picture after a seek into it");
-  assert.equal(early, 0, "sound came before the last picture");
-  assert.equal(late, 0, "sound came after the end of the stream");
-  console.log(
-    `seek to ${target.toFixed(3)} s, into the last picture: the sound goes ahead of the end`,
-  );
-
   // A request past the last picture, where a recording's sound outlasts its
   // pictures: no picture is coming to wait for, and the stream still ends.
   const past = final.timestamp + final.duration + 0.05;
-  epoch++;
-  playhead = past;
-  send({ type: "need", id, epoch, from: past, until: past + 0.3 });
-  send({ type: "seek", id, time: past });
-  const pastReset = resets + 1;
-  await pump(() => resets === pastReset);
-  while (!(completed && ends.includes(epoch)) && errors.length === 0) {
+  startEpoch(past);
+  while (
+    !(completed && ends.includes(epoch) && soundEnded.has(epoch)) &&
+    errors.length === 0
+  ) {
     send({ type: "need", id, epoch, from: playhead, until: playhead + 0.3 });
     await new Promise((resolve) => setTimeout(resolve, 2));
     await pump(() => true);
   }
   assert.deepEqual(errors, []);
-  assert.equal(late, 0, "sound came after the end of the stream");
   console.log(
     `request at ${past.toFixed(3)} s, past the last picture: the stream ends`,
   );

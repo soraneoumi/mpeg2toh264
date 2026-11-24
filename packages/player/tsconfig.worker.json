@@ -9,6 +9,8 @@
     "src/source.ts",
     "src/mse.ts",
     "src/protocol.ts",
+    "src/sound-feed.ts",
+    "src/sound/messages.ts",
     "src/worker-mse.d.ts"
   ]
 }

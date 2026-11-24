@@ -258,6 +258,8 @@ export class Packager {
  * The fragment's bytes are a copy wasm-bindgen made for us, so no one else
  * holds the buffer: it can be transferred rather than copied a second time.
  */
-export function detach(fragment: Fragment): ArrayBuffer {
+export function detach(
+  fragment: Extract<Fragment, { data: Uint8Array }>,
+): ArrayBuffer {
   return fragment.data.buffer as ArrayBuffer;
 }

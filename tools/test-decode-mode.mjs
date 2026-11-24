@@ -13,18 +13,20 @@
  *   cargo build --release -p mpeg2toh264-cli);
  * - presentation times increase strictly and each picture ends where the
  *   next begins;
- * - the audio initialization and media fragments concatenated make a file
- *   ffmpeg decodes without a message, holding packet for packet the sound
- *   of the MP4 `mpeg2toh264 --split-groups` makes. How far the sound and
- *   the pictures each reach is printed beside what the input says of its
- *   own streams, which need not cover the same span.
+ * - the sound comes out decoded, as `sound` fragments that follow on from
+ *   one another, as many samples as the units' AAC frames, starting where
+ *   the sound of the MP4 `mpeg2toh264 --split-groups` makes starts, and
+ *   within 2^-15 of ffmpeg's decoding of that MP4's sound where it is
+ *   stereo. How far the sound and the pictures each reach is printed
+ *   beside what the input says of its own streams, which need not cover
+ *   the same span.
  *
  * It prints the wall time, the pictures per second and the time spent copying
  * pictures out of the decoder.
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -116,6 +118,7 @@ async function check(input, workDir) {
   );
   const decoder = new PictureDecoder();
   const sound = [];
+  let aacFrames = 0;
   const pictures = [];
   let buffer = new Uint8Array(0);
   let inits = 0;
@@ -148,12 +151,17 @@ async function check(input, workDir) {
   const take = (fragments) => {
     for (const fragment of fragments) {
       if (fragment.kind === "init") {
-        assert.equal(fragment.mimeCodec, 'audio/mp4; codecs="mp4a.40.2"');
+        // Decode mode's sound goes out decoded; the init is the picture size.
+        assert.equal(fragment.mimeCodec, "");
+        assert.equal(fragment.data.byteLength, 0);
         inits++;
-        sound.push(fragment.data);
       } else if (fragment.kind === "media") {
         assert.equal(fragment.videoSamples, 0);
-        sound.push(fragment.data);
+        assert.equal(fragment.data.byteLength, 0);
+        aacFrames += fragment.audioSamples;
+      } else if (fragment.kind === "sound") {
+        assert.equal(fragment.left.length, fragment.right.length);
+        sound.push(fragment);
       } else if (fragment.kind === "video") {
         units++;
         const decodeStarted = performance.now();
@@ -231,31 +239,86 @@ async function check(input, workDir) {
   const videoStart = first.time;
   const videoEnd = last.time + last.duration;
 
-  // (c) The sound alone is a file ffmpeg plays through.
-  const soundFile = join(workDir, "sound.mp4");
-  await writeFile(soundFile, Buffer.concat(sound));
-  const messages = execFileSync(
-    "ffmpeg",
-    ["-v", "error", "-i", soundFile, "-f", "null", "-"],
-    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
-  );
-  assert.equal(messages, "", `${input}: ffmpeg reported ${messages}`);
-  // Packet for packet the sound of the MP4 passthrough makes of the input.
+  // (c) The sound, decoded: stretch after stretch, as long as the AAC frames
+  // the units carried, from where the passthrough MP4's sound starts, and as
+  // ffmpeg decodes that sound.
+  assert.ok(sound.length > 0, `${input}: sound`);
+  let samples = 0;
+  for (const [index, stretch] of sound.entries()) {
+    samples += stretch.left.length;
+    if (index === 0) continue;
+    const previous = sound[index - 1];
+    const end = previous.start + previous.left.length / previous.sampleRate;
+    assert.ok(
+      Math.abs(stretch.start - end) < 0.5 / stretch.sampleRate,
+      `${input}: sound at ${stretch.start} s after sound ending at ${end} s`,
+    );
+  }
+  assert.equal(samples, aacFrames * 1024, `${input}: samples per AAC frame`);
   const passthroughFile = join(workDir, "passthrough.mp4");
   execFileSync(CLI, ["-q", "--split-groups", input, passthroughFile]);
-  const packets = soundPackets(soundFile);
   const muxed = soundPackets(passthroughFile);
-  // ffmpeg gives the first packet of a fragmented file with no video track
-  // no duration (its own such files too), so that one is read off the next.
-  if (Number.isNaN(packets[0][1]) && packets.length > 1)
-    packets[0][1] = Number((packets[1][0] - packets[0][0]).toFixed(6));
-  assert.deepEqual(
-    packets,
-    muxed,
-    `${input}: the sound differs from the passthrough MP4's`,
+  const audioStart = sound[0].start;
+  const lastSound = sound.at(-1);
+  const audioEnd =
+    lastSound.start + lastSound.left.length / lastSound.sampleRate;
+  assert.ok(
+    Math.abs(audioStart - muxed[0][0]) < 1e-5,
+    `${input}: the sound starts at ${audioStart} s, the passthrough MP4's at ${muxed[0][0]} s`,
   );
-  const audioStart = packets[0][0];
-  const audioEnd = packets.at(-1)[0] + packets.at(-1)[1];
+  assert.equal(muxed.length, aacFrames, `${input}: AAC frames as passthrough`);
+  const channels = Number(
+    execFileSync(
+      "ffprobe",
+      [
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=channels",
+        "-of",
+        "csv=p=0",
+        passthroughFile,
+      ],
+      { encoding: "utf8" },
+    ).trim(),
+  );
+  let worst = null;
+  if (channels === 2) {
+    const reference = execFileSync(
+      "ffmpeg",
+      [
+        "-v",
+        "error",
+        "-i",
+        passthroughFile,
+        "-map",
+        "0:a:0",
+        "-f",
+        "f32le",
+        "-",
+      ],
+      { maxBuffer: 1 << 30 },
+    );
+    const interleaved = new Float32Array(
+      reference.buffer,
+      reference.byteOffset,
+      reference.byteLength / 4,
+    );
+    assert.equal(interleaved.length, samples * 2, `${input}: ffmpeg's samples`);
+    worst = 0;
+    let at = 0;
+    for (const stretch of sound)
+      for (let n = 0; n < stretch.left.length; n++, at++) {
+        worst = Math.max(
+          worst,
+          Math.abs(stretch.left[n] - interleaved[2 * at]),
+          Math.abs(stretch.right[n] - interleaved[2 * at + 1]),
+        );
+      }
+    assert.ok(worst <= 2 ** -15, `${input}: ${worst} from ffmpeg's sound`);
+  }
   const source = sourceSpans(input);
 
   const concealed = pictures.reduce(
@@ -267,7 +330,8 @@ async function check(input, workDir) {
       `checksums match; ${[...new Set(pictures.map((p) => `${p.size} ${p.matrix}${p.interlaced ? " interlaced" : ""}`))].join(", ")}; ` +
       `${concealed} concealed macroblocks\n` +
       `  pictures ${videoStart.toFixed(3)}-${videoEnd.toFixed(3)} s, ` +
-      `sound ${audioStart.toFixed(3)}-${audioEnd.toFixed(3)} s (${packets.length} AAC frames, as passthrough); ` +
+      `sound ${audioStart.toFixed(3)}-${audioEnd.toFixed(3)} s (${aacFrames} AAC frames, as passthrough; ` +
+      `${worst === null ? `${channels} channels, not compared` : `${worst.toExponential(2)} from ffmpeg`}); ` +
       `the input's own video ${source.video} s and audio ${source.audio} s\n  ` +
       `durations in ticks ${[...durations].map(([ticks, count]) => `${ticks}x${count}`).join(" ")}\n` +
       `  wall ${wallMs.toFixed(0)} ms, ${((pictures.length * 1000) / wallMs).toFixed(1)} pictures/s; ` +

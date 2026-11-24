@@ -11,11 +11,13 @@
  * with a session anchored to the same timeline, so what it produces belongs
  * where the viewer asked to be. See `Playback`.
  *
- * In decode mode the sink gets the sound alone, and the units of MPEG-2 wait
- * in a `PictureSchedule` until the page asks for their pictures: what is read
- * ahead is bounded by the sink as before, since sound held back for the
- * pictures goes on once nothing more for the request can come, and decoding
- * is bounded by the requests.
+ * In decode mode there is no sink. The sound comes out of the session as PCM
+ * and waits in a `SoundFeed`, which feeds the page's AudioWorklet and bounds
+ * how far ahead the input is read; the units of MPEG-2 wait in a
+ * `PictureSchedule` until the page asks for their pictures, so decoding is
+ * bounded by the requests. Which comes first after a start or a seek, the
+ * sound or the picture, is the page's to decide: the worklet plays nothing
+ * until it is told to.
  */
 import { MseSink, ReadyGate, type FragmentSink } from "./mse.js";
 import {
@@ -33,6 +35,7 @@ import {
   type Services,
   type TimingMark,
 } from "./protocol.js";
+import { SoundFeed } from "./sound-feed.js";
 import {
   PictureBuffers,
   PictureSchedule,
@@ -245,9 +248,9 @@ interface Sample {
   seconds: number;
 }
 
-/** What goes to the sink in order: sound, and the end of a leg's stream. */
+/** What goes to the sink in order: media, and the end of a leg's stream. */
 type SinkStep =
-  | { kind: "sound"; fragment: Extract<Fragment, { kind: "media" }> }
+  | { kind: "media"; fragment: Extract<Fragment, { kind: "media" }> }
   | { kind: "end"; leg: number };
 
 /**
@@ -255,9 +258,12 @@ type SinkStep =
  */
 class Playback {
   readonly #command: LoadCommand;
-  readonly #sink: FragmentSink;
+  /** Passthrough's way to Media Source Extensions; decode mode has none. */
+  readonly #sink: FragmentSink | null;
   /** The same sink, when this worker owns the MediaSource. */
   readonly #mseSink: MseSink | null;
+  /** Decode mode's sound, fed to the page's AudioWorklet; null in passthrough. */
+  readonly #sound: SoundFeed | null;
   /** Aborted when the load is abandoned, which the tail probe rides on. */
   readonly #life = new AbortController();
   /** Aborted when this leg is superseded, without disturbing the load. */
@@ -302,33 +308,33 @@ class Playback {
   #decodingPictures = false;
   /** The epoch of the last request taken, which a new one starts again from. */
   #requestEpoch: number | null = null;
-  /**
-   * Decode mode's way to the sink, shut from a request of a new epoch -- the
-   * start, or a seek -- until the first picture of the epoch that ends after
-   * where it starts has gone to the page, or until no such picture can come
-   * before the playhead moves on. An element plays whatever sound it is
-   * given, so sound let in first would start the clock with the pictures
-   * behind it; a player of muxed video starts only once the picture is there
-   * as well. The end of the stream waits behind the sound it follows.
-   */
-  #soundHold: {
-    epoch: number;
-    from: number;
-    waiting: SinkStep[];
-  } | null = null;
-
   constructor(command: LoadCommand) {
     this.#command = command;
-    this.#pictures =
-      command.video === "decode"
-        ? new PictureSchedule(command.keepBehindSeconds)
-        : null;
-    const sink =
-      command.sink === "worker"
+    const decode = command.video === "decode";
+    this.#pictures = decode
+      ? new PictureSchedule(command.keepBehindSeconds)
+      : null;
+    this.#sound = decode
+      ? new SoundFeed({
+          maxAheadSeconds: command.maxAheadSeconds,
+          keepBehindSeconds: command.keepBehindSeconds,
+          onRange: (range) => post({ type: "buffered", id: command.id, range }),
+        })
+      : null;
+    const sink = decode
+      ? null
+      : command.sink === "worker"
         ? createWorkerSink(command)
         : new RemoteSink(command.id);
     this.#sink = sink;
     this.#mseSink = sink instanceof MseSink ? sink : null;
+  }
+
+  /** Decode mode: the port to the AudioWorklet, and the epoch to feed it. */
+  attachSound(port: MessagePort, epoch: number, at: number): void {
+    if (!this.#sound) throw new Error("this load does not decode the sound");
+    this.#sound.attach(port);
+    this.#sound.begin(epoch, at);
   }
 
   get id(): number {
@@ -355,8 +361,23 @@ class Playback {
    * It aims a little before the mark on purpose: landing after it would lose
    * what the viewer asked to see.
    */
-  async seek(time: number): Promise<void> {
-    if (this.#totalBytes === null || this.#duration === null) return;
+  async seek(time: number, epoch: number | null): Promise<void> {
+    const sound = this.#sound;
+    if (sound !== null) {
+      if (epoch === null)
+        throw new TypeError("a decode-mode seek has no epoch");
+      // Played a moment ago, or converted already: both the sound and the
+      // units of the pictures are still here.
+      if (sound.covers(time) && !this.#pictures!.dropped(time)) {
+        sound.begin(epoch, time);
+        return;
+      }
+    }
+    if (this.#totalBytes === null || this.#duration === null) {
+      // A live input has nowhere else to be read from.
+      sound?.begin(epoch!, time);
+      return;
+    }
     mark(this.#command.id, "seek");
     // Stop reading where we are before emptying the buffer, and before the
     // search that now stands between the two. Whatever the running leg
@@ -365,14 +386,14 @@ class Playback {
     // at -- which is a seek quietly undoing itself.
     const leg = this.#nextLeg();
     const signal = this.#leg!.signal;
-    this.#sink.reset();
-    // What is held belongs to the part of the file being left.
-    if (this.#soundHold) this.#soundHold.waiting = [];
+    this.#sink?.reset();
     if (this.#pictures) {
-      this.#pictures.clear();
+      // What is held belongs to the part of the file being left. The page
+      // emptied its side when it started the seek.
+      this.#pictures.clear(epoch!);
       this.#decoder?.reset();
-      // A sink on the page says so itself when it is reset.
-      if (this.#mseSink) post({ type: "reset", id: this.#command.id });
+      sound!.reset();
+      sound!.begin(epoch!, time);
     }
     const restart = this.#restartBefore(time);
     const offset =
@@ -517,16 +538,10 @@ class Playback {
       // What the decoder holds back belongs to the epoch being left; the
       // first unit of this one begins decoding again anyway.
       this.#decoder?.reset();
-      this.#soundHold = {
-        epoch,
-        from,
-        waiting: this.#soundHold?.waiting ?? [],
-      };
     }
-    // The sound is still buffered there but the units are gone: read the
-    // input again, as for a seek the buffer does not reach.
-    if (this.#pictures.dropped(from)) void this.seek(from);
-    else void this.#decodePictures();
+    // A request of a new epoch comes with the page's `seek`, which reads the
+    // input again where the units are gone.
+    void this.#decodePictures();
   }
 
   /** A picture's buffer is back from the page. */
@@ -558,9 +573,6 @@ class Playback {
         if (held !== undefined) this.#sendPicture(held, epoch);
         post({ type: "pictures-end", id: this.#command.id, epoch });
       }
-      // Nothing that ends after where the request starts is coming before the
-      // playhead moves on, and the playhead moves only with the sound.
-      if (schedule.exhausted && this.#soundHold !== null) this.#releaseSound();
     } finally {
       this.#decodingPictures = false;
     }
@@ -628,39 +640,23 @@ class Playback {
       },
       [data],
     );
-    const hold = this.#soundHold;
-    if (
-      hold !== null &&
-      hold.epoch === epoch &&
-      info.time + info.duration > hold.from
-    )
-      this.#releaseSound();
   }
 
-  /** Hand a step to the sink, or keep it behind the hold. */
+  /** Hand a step to whichever way the media leaves this worker. */
   #toSink(step: SinkStep): void {
-    if (this.#soundHold !== null) {
-      this.#soundHold.waiting.push(step);
-      return;
-    }
     if (step.kind === "end") {
+      this.#sound?.end();
       void this.#endStream(step.leg);
       return;
     }
     const { fragment } = step;
-    this.#sink.push(detach(fragment), fragment.start, fragment.randomAccess);
-  }
-
-  #releaseSound(): void {
-    const waiting = this.#soundHold!.waiting;
-    this.#soundHold = null;
-    for (const step of waiting) this.#toSink(step);
+    this.#sink!.push(detach(fragment), fragment.start, fragment.randomAccess);
   }
 
   /** End the stream once the sink has taken all it was given, and say so. */
   async #endStream(leg: number): Promise<void> {
     try {
-      await this.#sink.finish();
+      await this.#sink?.finish();
     } catch (error) {
       this.#fail(leg, error);
       return;
@@ -680,8 +676,8 @@ class Playback {
     this.#pictures?.clear();
     this.#decoder?.free();
     this.#decoder = null;
-    this.#soundHold = null;
-    this.#sink.close();
+    this.#sound?.close();
+    this.#sink?.close();
   }
 
   /**
@@ -793,7 +789,7 @@ class Playback {
         // without waiting for its whole group of pictures.
         this.#totalBytes === null,
       );
-      if (this.#totalBytes === null) this.#sink.holdStart(LIVE_START_SECONDS);
+      if (this.#totalBytes === null) this.#sink?.holdStart(LIVE_START_SECONDS);
       // A PID the program map has yet to name is remembered until it does, so
       // this can go in before a byte has been read.
       if (this.#audioPid !== null) converter.selectAudio(this.#audioPid);
@@ -952,7 +948,7 @@ class Playback {
       }
       const waitStarted = performance.now();
       await breathe();
-      await this.#sink.ready();
+      await (this.#sound ?? this.#sink!).ready();
       this.#waitingMs += performance.now() - waitStarted;
       if (!this.#running(leg)) return;
       const chunk = chunks.shift()!;
@@ -1015,13 +1011,26 @@ class Playback {
           height: fragment.height,
           start: media.start,
         });
-        await this.#sink.open(fragment.mimeCodec, detach(fragment));
-        if (!this.#running(leg)) return false;
+        // Decode mode's sound goes to the AudioWorklet instead, which needs
+        // no opening.
+        if (this.#sink) {
+          await this.#sink.open(fragment.mimeCodec, detach(fragment));
+          if (!this.#running(leg)) return false;
+        }
         mark(this.#command.id, "opened");
         post({ type: "opened", id: this.#command.id });
       } else if (fragment.kind === "media") {
         post({ type: "scans", id: this.#command.id, scans: fragment.scans });
-        this.#toSink({ kind: "sound", fragment });
+        // In decode mode the unit's sound came as a `sound` fragment before
+        // this, and there is nothing in this one for a sink.
+        if (this.#sink) this.#toSink({ kind: "media", fragment });
+      } else if (fragment.kind === "sound") {
+        this.#sound!.push(
+          fragment.start,
+          fragment.sampleRate,
+          fragment.left,
+          fragment.right,
+        );
       } else if (fragment.kind === "video") {
         // Only decode mode makes these.
         this.#pictures!.add(fragment);
@@ -1200,7 +1209,10 @@ self.onmessage = (event: MessageEvent<Command>) => {
       flow.set(command.ready);
       break;
     case "seek":
-      void playback?.seek(command.time);
+      void playback?.seek(command.time, command.epoch);
+      break;
+    case "sound-port":
+      playback?.attachSound(command.port, command.epoch, command.at);
       break;
     case "audio":
       playback?.selectAudio(command.pid, command.dualMonoSub);

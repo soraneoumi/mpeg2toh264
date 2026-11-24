@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use mpeg2toh264::audio::{downmix, parse_block, AacDecoder, ParsedBlock, PcmFrame};
 use mpeg2toh264::mpeg2::constants::{PictureStructure, PictureType};
 use mpeg2toh264::mpeg2::headers::parse_elementary_stream;
 use mpeg2toh264::{Fragment, SessionOptions, VideoMode};
@@ -907,38 +908,287 @@ fn init_tracks(init: &[u8]) -> Vec<&[u8]> {
         .collect()
 }
 
-/// Decode mode is the passthrough timeline without the video muxed: the same
-/// sound sample for sample, a picture for every video sample at its time and
-/// for its duration, and units that name pictures their bytes hold.
-pub fn assert_decode_matches_passthrough(label: &str, decoded: &[Fragment], muxed: &[Fragment]) {
-    let sound_tracks = |fragments: &[Fragment]| -> Vec<Vec<u8>> {
-        init_segments(fragments)
+/// The `AudioSpecificConfig` and timescale of the sound track an
+/// initialization segment describes, read out of its `mdhd` and `esds`.
+fn sound_description(init: &[u8]) -> (Vec<u8>, u32) {
+    let trak = init_tracks(init)
+        .into_iter()
+        .find(|trak| &track_handler(trak) == b"soun")
+        .expect("the segment describes the sound");
+    let child = |body: &[u8], kind: &[u8; 4], skip: usize| -> Vec<u8> {
+        child_boxes(&body[skip..])
             .into_iter()
-            .map(|init| {
-                init_tracks(init)
-                    .into_iter()
-                    .find(|trak| &track_handler(trak) == b"soun")
-                    .expect("the segment describes the sound")
-                    .to_vec()
-            })
-            .collect()
+            .find(|(found, _)| found == kind)
+            .unwrap_or_else(|| panic!("no {}", String::from_utf8_lossy(kind)))
+            .1
+            .to_vec()
     };
+    let mdia = child(trak, b"mdia", 0);
+    let mdhd = child(&mdia, b"mdhd", 0);
+    assert_eq!(mdhd[0], 0, "a version 0 mdhd");
+    let timescale = be32(&mdhd, 12);
+    let stbl = child(&child(&mdia, b"minf", 0), b"stbl", 0);
+    // stsd: version, flags and entry_count; mp4a: the 28 bytes of an audio
+    // sample entry; esds: version and flags.
+    let esds = child(&child(&child(&stbl, b"stsd", 0), b"mp4a", 8), b"esds", 28);
+    // ES_Descriptor, DecoderConfigDescriptor, DecoderSpecificInfo, each a tag
+    // and an expandable size (ISO/IEC 14496-1 8.3.3).
+    let mut at = 4;
+    let descriptor = |at: &mut usize, tag: u8| -> usize {
+        assert_eq!(esds[*at], tag, "descriptor {tag:#x}");
+        *at += 1;
+        let mut size = 0;
+        loop {
+            let byte = esds[*at];
+            *at += 1;
+            size = (size << 7) | usize::from(byte & 0x7f);
+            if byte & 0x80 == 0 {
+                break size;
+            }
+        }
+    };
+    descriptor(&mut at, 0x03);
+    let flags = esds[at + 2];
+    assert_eq!(flags, 0, "no stream dependence, URL or OCR stream");
+    at += 3;
+    descriptor(&mut at, 0x04);
+    at += 13;
+    let size = descriptor(&mut at, 0x05);
+    (esds[at..at + size].to_vec(), timescale)
+}
+
+/// The sound of one fragment of a passthrough session's output, decoded.
+pub struct MuxedSound {
+    /// The decode time of the fragment's first access unit, in `timescale`.
+    pub decode_time: u64,
+    pub timescale: u32,
+    pub frames: usize,
+    pub left: Vec<f32>,
+    pub right: Vec<f32>,
+}
+
+/// The sound a passthrough session muxed, fragment by fragment, decoded from
+/// the MP4 alone: each access unit with one [`AacDecoder`] across the whole
+/// stream, told the AudioSpecificConfig of the initialization segment in
+/// front of it, concealed where it does not decode, and mixed to stereo.
+pub fn decode_muxed_sound(muxed: &[Fragment]) -> Vec<MuxedSound> {
+    let mut decoder = AacDecoder::new();
+    let mut block = ParsedBlock::new();
+    let mut pcm = PcmFrame::new();
+    let mut description = None;
+    let mut configured = Vec::new();
+    let mut out = Vec::new();
+    for fragment in muxed {
+        match fragment {
+            Fragment::Init { data, .. } => description = Some(sound_description(data)),
+            Fragment::Media { data, .. } => {
+                let Some((_, samples)) = fragment_samples(data)
+                    .into_iter()
+                    .find(|(track, _)| *track == 2)
+                else {
+                    continue;
+                };
+                let (asc, timescale) = description.clone().expect("described before");
+                if asc != configured {
+                    decoder
+                        .configure(&asc)
+                        .expect("a configuration the decoder takes");
+                    configured = asc.clone();
+                }
+                let frequency_index = ((asc[0] & 7) << 1) | (asc[1] >> 7);
+                let channel_configuration = (asc[1] >> 3) & 0x0f;
+                let mut left = vec![0.0; samples.len() * 1024];
+                let mut right = vec![0.0; samples.len() * 1024];
+                for (index, sample) in samples.iter().enumerate() {
+                    let decoded = parse_block(&sample.data, frequency_index, &mut block)
+                        && decoder
+                            .decode(&block, channel_configuration, frequency_index, &mut pcm)
+                            .is_ok();
+                    if !decoded {
+                        decoder.conceal(&mut pcm);
+                    }
+                    let span = index * 1024..(index + 1) * 1024;
+                    downmix::to_stereo(&pcm, false, 1.0, &mut left[span.clone()], &mut right[span]);
+                }
+                out.push(MuxedSound {
+                    decode_time: samples[0].decode_time,
+                    timescale,
+                    frames: samples.len(),
+                    left,
+                    right,
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// One access unit of a session's sound: where the audio track puts it, in
+/// samples at `rate`, and its stereo PCM.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SoundFrame {
+    pub time: u64,
+    pub rate: u32,
+    pub left: Vec<f32>,
+    pub right: Vec<f32>,
+}
+
+/// Every access unit of a session's sound, in order: decode mode's out of its
+/// `Sound` fragments, passthrough's decoded out of its MP4 by
+/// [`decode_muxed_sound`].
+pub fn sound_frames(fragments: &[Fragment]) -> Vec<SoundFrame> {
+    let mut out = Vec::new();
+    let mut decoded = false;
+    for fragment in fragments {
+        if let Fragment::Sound {
+            start,
+            sample_rate,
+            left,
+            right,
+        } = fragment
+        {
+            decoded = true;
+            let first = (start * f64::from(*sample_rate)).round() as u64;
+            for (index, (left, right)) in left.chunks(1024).zip(right.chunks(1024)).enumerate() {
+                out.push(SoundFrame {
+                    time: first + index as u64 * 1024,
+                    rate: *sample_rate,
+                    left: left.to_vec(),
+                    right: right.to_vec(),
+                });
+            }
+        }
+    }
+    if decoded {
+        return out;
+    }
+    for sound in decode_muxed_sound(fragments) {
+        for (index, (left, right)) in sound
+            .left
+            .chunks(1024)
+            .zip(sound.right.chunks(1024))
+            .enumerate()
+        {
+            out.push(SoundFrame {
+                time: sound.decode_time + index as u64 * 1024,
+                rate: sound.timescale,
+                left: left.to_vec(),
+                right: right.to_vec(),
+            });
+        }
+    }
+    out
+}
+
+/// One `Sound` fragment.
+pub struct SoundRun<'a> {
+    pub start: f64,
+    pub sample_rate: u32,
+    pub left: &'a [f32],
+    pub right: &'a [f32],
+}
+
+/// The `Sound` fragments of a decode-mode session's output, grouped by the
+/// `Media` fragment that follows them, which has to be the next fragment that
+/// is not sound; and that fragment's `audio_samples`.
+pub fn sound_by_unit(decoded: &[Fragment]) -> Vec<(Vec<SoundRun<'_>>, usize)> {
+    let mut out = Vec::new();
+    let mut runs = Vec::new();
+    for fragment in decoded {
+        match fragment {
+            Fragment::Sound {
+                start,
+                sample_rate,
+                left,
+                right,
+            } => {
+                assert_eq!(left.len(), right.len(), "as many samples on each side");
+                assert!(!left.is_empty(), "a run of sound holds some");
+                assert_eq!(left.len() % 1024, 0, "whole access units");
+                runs.push(SoundRun {
+                    start: *start,
+                    sample_rate: *sample_rate,
+                    left,
+                    right,
+                });
+            }
+            Fragment::Media { audio_samples, .. } => {
+                out.push((std::mem::take(&mut runs), *audio_samples));
+            }
+            _ => assert!(runs.is_empty(), "sound goes out in front of its media"),
+        }
+    }
+    assert!(runs.is_empty(), "sound goes out in front of its media");
+    out
+}
+
+/// Decode mode's sound is what passthrough muxed, decoded: per unit the same
+/// access units, at the decode time the audio track gives the first of them,
+/// following on from the unit before wherever the track does, and the PCM a
+/// decoder makes of them.
+pub fn assert_sound_is_muxed_sound_decoded(label: &str, decoded: &[Fragment], muxed: &[Fragment]) {
+    let units = sound_by_unit(decoded);
+    let expected = decode_muxed_sound(muxed);
+    assert!(!expected.is_empty(), "{label}: the stream has sound");
+    assert_eq!(units.len(), expected.len(), "{label}: units with sound");
+    let mut previous: Option<(&SoundRun<'_>, &MuxedSound)> = None;
+    for ((runs, audio_samples), want) in units.iter().zip(&expected) {
+        assert!(
+            !runs.is_empty(),
+            "{label}: a unit with sound has a run of it"
+        );
+        let frames: usize = runs.iter().map(|run| run.left.len() / 1024).sum();
+        assert_eq!(frames, *audio_samples, "{label}: audio_samples counts it");
+        assert_eq!(frames, want.frames, "{label}: the muxed access units");
+        let mut offset = 0;
+        for run in runs {
+            assert_eq!(run.sample_rate, want.timescale, "{label}: sample rate");
+            let rate = f64::from(run.sample_rate);
+            let first = want.decode_time + offset as u64;
+            assert!(
+                (run.start * rate - first as f64).abs() < 1e-6,
+                "{label}: sound at {} s, where the track has it at {first}/{rate}",
+                run.start
+            );
+            let span = offset..offset + run.left.len();
+            assert!(
+                run.left == &want.left[span.clone()] && run.right == &want.right[span],
+                "{label}: the PCM at {} s is not the muxed sound decoded",
+                run.start
+            );
+            offset += run.left.len();
+        }
+        if let Some((before, muxed_before)) = previous {
+            let follows = muxed_before.timescale == want.timescale
+                && muxed_before.decode_time + muxed_before.frames as u64 * 1024 == want.decode_time;
+            if follows {
+                let rate = f64::from(before.sample_rate);
+                let end = before.start + before.left.len() as f64 / rate;
+                assert!(
+                    (runs[0].start - end).abs() <= 0.5 / rate,
+                    "{label}: sound at {} s does not follow on from {end} s",
+                    runs[0].start
+                );
+            }
+        }
+        previous = Some((runs.last().expect("checked above"), want));
+    }
+}
+
+/// Decode mode is the passthrough timeline without anything muxed: the same
+/// sound decoded to PCM, a picture for every video sample at its time and for
+/// its duration, and units that name pictures their bytes hold.
+pub fn assert_decode_matches_passthrough(label: &str, decoded: &[Fragment], muxed: &[Fragment]) {
     for fragment in decoded {
         if let Fragment::Init {
             data, mime_codec, ..
         } = fragment
         {
-            assert_eq!(mime_codec, "audio/mp4; codecs=\"mp4a.40.2\"", "{label}");
-            let tracks = init_tracks(data);
-            assert_eq!(tracks.len(), 1, "{label}: one track");
-            assert_eq!(&track_handler(tracks[0]), b"soun", "{label}: sound only");
+            assert!(data.is_empty(), "{label}: no segment");
+            assert!(mime_codec.is_empty(), "{label}: nothing to open");
         }
     }
-    assert_eq!(
-        sound_tracks(decoded),
-        sound_tracks(muxed),
-        "{label}: the sound is described as the passthrough MP4 describes it"
-    );
     let sizes = |fragments: &[Fragment]| -> Vec<(u32, u32)> {
         fragments
             .iter()
@@ -964,12 +1214,9 @@ pub fn assert_decode_matches_passthrough(label: &str, decoded: &[Fragment], muxe
                 scans,
             } => {
                 assert_eq!(*video_samples, 0, "{label}: no video in the MP4");
-                assert!(*random_access, "{label}: every sound fragment is a start");
+                assert!(*random_access, "{label}: every fragment is a start");
                 assert!(scans.is_empty(), "{label}: no scans without video");
-                let tracks = fragment_samples(data);
-                assert_eq!(tracks.len(), 1, "{label}: one traf");
-                assert_eq!(tracks[0].0, 2, "{label}: the sound's track");
-                assert_eq!(tracks[0].1.len(), *audio_samples, "{label}: sample count");
+                assert!(data.is_empty(), "{label}: nothing muxed");
                 assert!(*audio_samples > 0, "{label}: no fragment without sound");
                 media.push((*start, *restart_offset));
             }
@@ -1049,19 +1296,8 @@ pub fn assert_decode_matches_passthrough(label: &str, decoded: &[Fragment], muxe
         "{label}: the first unit restarts"
     );
 
-    let (decoded_samples, muxed_samples) = (track_samples(decoded), track_samples(muxed));
-    assert!(
-        decoded_samples.video.is_empty(),
-        "{label}: no video samples"
-    );
-    assert!(
-        !muxed_samples.audio.is_empty(),
-        "{label}: the stream has sound"
-    );
-    assert!(
-        decoded_samples.audio == muxed_samples.audio,
-        "{label}: the sound samples differ"
-    );
+    assert_sound_is_muxed_sound_decoded(label, decoded, muxed);
+    let muxed_samples = track_samples(muxed);
     let pictures: Vec<(f64, f64)> = units
         .iter()
         .flat_map(|unit| {
@@ -1148,6 +1384,23 @@ pub fn fragments_digest(fragments: &[Fragment]) -> Vec<String> {
                  {audio_samples} {scans:?} {:x}",
                 fnv1a(data)
             ),
+            Fragment::Sound {
+                start,
+                sample_rate,
+                left,
+                right,
+            } => {
+                let bytes: Vec<u8> = left
+                    .iter()
+                    .chain(right)
+                    .flat_map(|sample| sample.to_le_bytes())
+                    .collect();
+                format!(
+                    "sound {start} {sample_rate} {} {:x}",
+                    left.len(),
+                    fnv1a(&bytes)
+                )
+            }
             Fragment::Video {
                 data,
                 start,

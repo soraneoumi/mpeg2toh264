@@ -5,6 +5,7 @@ mod support;
 
 use std::collections::HashMap;
 
+use mpeg2toh264::audio::{parse_block, AacDecoder, ParsedBlock, PcmFrame};
 use mpeg2toh264::container::adts::{AacFrame, AacUnit, AdtsOutput, AdtsStream};
 use mpeg2toh264::mpeg2::constants::PictureType;
 use mpeg2toh264::mpeg2::gop_stream::Mpeg2Gop;
@@ -15,7 +16,7 @@ use support::{
     adts_frame, adts_frame_filled, adts_frame_protected, adts_frame_with_payload, adts_stream,
     assert_decode_matches_passthrough, decode, decoding, fragments_digest, init_segments,
     mux_programs, mux_transport_stream, mux_with_sound, non_intra_matrix_extension, passthrough,
-    passthrough_like_decode, picture_starts, read_fixture, track_samples,
+    passthrough_like_decode, picture_starts, read_fixture, sound_frames, track_samples,
     with_extension_in_pictures, with_pts_shifted, wrap_mpeg2_es_in_ts, PesUnit, TrackSample,
     AUDIO_PID, FIXTURES, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID,
 };
@@ -3995,19 +3996,17 @@ fn assert_decode_mode_keeps_its_timeline(label: &str, lossy: &[u8], whole: &[u8]
         );
     }
     assert_eq!(kept.last(), all.last(), "{label}: the stream ends in place");
-    let sound = |fragments: &[Fragment]| -> Vec<(u64, u32)> {
-        track_samples(fragments)
-            .audio
+    let times = |fragments: &[Fragment]| -> Vec<u64> {
+        sound_frames(fragments)
             .iter()
-            .map(|sample| (sample.decode_time, sample.duration))
+            .map(|frame| frame.time)
             .collect()
     };
-    assert_eq!(sound(&lossy), sound(&whole), "{label}: the sound's timing");
-    assert_sound_in_place(
-        label,
-        &track_samples(&lossy).audio,
-        &track_samples(&whole).audio,
-    );
+    // Which access unit sits in which slot shows only in the stream's own
+    // bytes, which decode mode no longer hands out: the damaged-sound tests
+    // check it on passthrough, and that decode mode's sound is passthrough's
+    // decoded.
+    assert_eq!(times(&lossy), times(&whole), "{label}: the sound's timing");
 }
 
 /// Every access unit of the sound of a damaged stream is the one the whole
@@ -4158,6 +4157,142 @@ fn decode_mode_leaves_a_join_and_a_wrap_where_the_source_has_them() {
 
     let wrapped = timed_av_stream_from(6, (1u64 << 33) - group * 2);
     assert_decode_mode_agrees("a wrap", &wrapped, passthrough());
+}
+
+/// The ADTS frames of `stream`, each whole.
+fn adts_frames(stream: &[u8]) -> Vec<&[u8]> {
+    let mut frames = Vec::new();
+    let mut at = 0;
+    while at < stream.len() {
+        assert_eq!(stream[at], 0xff, "a frame at {at}");
+        let length = ((stream[at + 3] as usize & 3) << 11)
+            | (stream[at + 4] as usize) << 3
+            | (stream[at + 5] >> 5) as usize;
+        frames.push(&stream[at..at + length]);
+        at += length;
+    }
+    frames
+}
+
+#[test]
+fn decode_mode_hands_out_the_streams_sound_decoded() {
+    // Real AAC, so that the PCM is something other than the silence the
+    // synthetic frames decode to: what the session hands out has to be every
+    // access unit of it decoded, in order and in place, as ffmpeg decodes it.
+    let adts = read_fixture("aac/stereo48.adts");
+    let reference: Vec<f32> = read_fixture("aac/stereo48.f32")
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect();
+    let frames = adts_frames(&adts);
+    const PES_FRAMES: usize = 3;
+    let sound: Vec<(Vec<u8>, u64)> = frames
+        .chunks(PES_FRAMES)
+        .enumerate()
+        .map(|(index, chunk)| {
+            (
+                chunk.concat(),
+                900_000 + (index * PES_FRAMES) as u64 * 1_920,
+            )
+        })
+        .collect();
+    let stream = stream_with_sound_packets(3, &sound);
+
+    assert_decode_mode_agrees("stereo48", &stream, passthrough());
+
+    let mut session = Session::new(decode());
+    let mut decoded = Vec::new();
+    for chunk in stream.chunks(64 * 1024) {
+        decoded.extend(session.push(chunk).expect("push succeeds"));
+    }
+    decoded.extend(session.finish().expect("finish succeeds"));
+    assert_eq!(session.errors(), 0, "nothing concealed");
+    let pcm = sound_frames(&decoded);
+    assert_eq!(pcm.len(), frames.len(), "every access unit");
+    for (index, frame) in pcm.iter().enumerate() {
+        assert_eq!(frame.rate, 48_000);
+        assert_eq!(frame.time, pcm[0].time + index as u64 * 1024, "in place");
+        let expected = &reference[index * 2048..(index + 1) * 2048];
+        for (at, (&left, &right)) in frame.left.iter().zip(&frame.right).enumerate() {
+            let (want_left, want_right) = (expected[2 * at], expected[2 * at + 1]);
+            assert!(
+                (left - want_left).abs() <= 1.0 / 32768.0
+                    && (right - want_right).abs() <= 1.0 / 32768.0,
+                "frame {index}, sample {at}: ({left}, {right}) where ffmpeg has \
+                 ({want_left}, {want_right})"
+            );
+        }
+    }
+    // The first access unit's timestamp is the stream's first sound, and the
+    // timeline opens at whichever track starts first.
+    let origin = origin_of(&stream, decode());
+    let first = decoded
+        .iter()
+        .find_map(|fragment| match fragment {
+            Fragment::Sound { start, .. } => Some(*start),
+            _ => None,
+        })
+        .expect("sound");
+    assert!(
+        (first - (900_000 - origin as i64) as f64 / 90_000.0).abs() <= 0.5 / 48_000.0,
+        "the sound starts at {first} s"
+    );
+}
+
+#[test]
+fn decode_mode_decodes_a_layout_only_the_configuration_describes() {
+    // A program_config_element in the first frame only: the frames after it
+    // are described by the AudioSpecificConfig it was moved into.
+    let pce = packed_bits(concat!(
+        "101", // ID_PCE
+        "0110", "01", "0011", // tag 6, AAC-LC, 48 kHz
+        "0010", "0000", "0001", "01", "000", "0000", // 2 front, 1 back, 1 LFE
+        "0", "0", "0", // no mixdown metadata
+        "0", "0000", // front centre SCE 0
+        "1", "0000", // front left/right CPE 0
+        "1", "0001",     // back left/right CPE 1
+        "0000",     // LFE tag 0
+        "00000000", // no PCE comment (already byte aligned)
+    ));
+    let first = [pce, five_point_one_payload(0)].concat();
+    let rest = five_point_one_payload(0);
+    let frames = AdtsStream::new()
+        .read(
+            &[
+                adts_frame_with_payload(3, 0, &first),
+                adts_frame_with_payload(3, 0, &rest),
+            ]
+            .concat(),
+        )
+        .expect("both frames read");
+    assert_eq!(frames.len(), 2);
+    let asc = frames[1].config.audio_specific_config.clone();
+    assert_eq!(asc, frames[0].config.audio_specific_config);
+    // ISO/IEC 14496-3 table 4.2: the element in a configuration opens with its
+    // element_instance_tag.
+    assert_eq!(asc[2] >> 4, 6, "the PCE's element_instance_tag");
+    assert_eq!((asc[2] >> 2) & 3, 1, "then its object_type");
+
+    let mut block = ParsedBlock::new();
+    let mut pcm = PcmFrame::new();
+    assert!(parse_block(&frames[1].data, 3, &mut block));
+    assert!(block.pce().is_none());
+    assert!(
+        AacDecoder::new().decode(&block, 0, 3, &mut pcm).is_err(),
+        "nothing in the block says what its channels are"
+    );
+    let mut decoder = AacDecoder::new();
+    decoder.configure(&asc).expect("the configuration is taken");
+    decoder
+        .decode(&block, 0, 3, &mut pcm)
+        .expect("the configuration says it");
+    let mut with_pce = PcmFrame::new();
+    assert!(parse_block(&frames[0].data, 3, &mut block));
+    AacDecoder::new()
+        .decode(&block, 0, 3, &mut with_pce)
+        .expect("the block says it");
+    assert_eq!(pcm.layout(), with_pce.layout());
+    assert_eq!(pcm.channels(), 6);
 }
 
 #[test]
@@ -4394,12 +4529,29 @@ fn a_damaged_timestamp_of_the_only_one_a_group_has_is_judged_by_the_next_group()
 fn a_damaged_audio_timestamp_does_not_fill_the_jump_with_silence() {
     let intact = stamped_stream(&plain_groups(10), false, &[], 10);
     let damaged = with_pts_shifted(&intact, AUDIO_PID, 4, 20 * 90_000);
-    for (mode, options) in [("passthrough", passthrough()), ("decode", decode())] {
-        let intact = track_samples(&run_session_with_options(&intact, 64 * 1024, options)).audio;
-        let damaged = track_samples(&run_session_with_options(&damaged, 64 * 1024, options)).audio;
-        assert_eq!(damaged.len(), intact.len(), "{mode}: access units");
-        assert!(damaged == intact, "{mode}: where the access units sit");
-    }
+    let run = |stream: &[u8], options| run_session_with_options(stream, 64 * 1024, options);
+    let muxed = |stream: &[u8]| track_samples(&run(stream, passthrough())).audio;
+    let (intact_muxed, damaged_muxed) = (muxed(&intact), muxed(&damaged));
+    assert_eq!(
+        damaged_muxed.len(),
+        intact_muxed.len(),
+        "passthrough: access units"
+    );
+    assert!(
+        damaged_muxed == intact_muxed,
+        "passthrough: where the access units sit"
+    );
+    let decoded = |stream: &[u8]| sound_frames(&run(stream, decode()));
+    let (intact_decoded, damaged_decoded) = (decoded(&intact), decoded(&damaged));
+    assert_eq!(
+        damaged_decoded.len(),
+        intact_decoded.len(),
+        "decode: access units"
+    );
+    assert!(
+        damaged_decoded == intact_decoded,
+        "decode: where the access units sit"
+    );
 }
 
 #[test]
@@ -4686,7 +4838,7 @@ fn units_carry_every_timestamp_that_begins_in_them_and_say_when_the_stream_broke
 
 /// How many access units of sound a run carries.
 fn sound_units(fragments: &[Fragment]) -> usize {
-    track_samples(fragments).audio.len()
+    sound_frames(fragments).len()
 }
 
 #[test]
@@ -5000,10 +5152,9 @@ fn a_first_timestamp_waiting_across_a_change_of_sample_rate_places_the_whole_tra
         let damaged = stream_with_sound_packets(6, &sound(shift));
         for options in [passthrough(), decode()] {
             let times = |stream: &[u8]| {
-                track_samples(&run_session_with_options(stream, 64 * 1024, options))
-                    .audio
+                sound_frames(&run_session_with_options(stream, 64 * 1024, options))
                     .iter()
-                    .map(|sample| sample.decode_time)
+                    .map(|frame| frame.time)
                     .collect::<Vec<_>>()
             };
             assert_eq!(times(&damaged), times(&intact), "{shift} ticks");
@@ -5157,12 +5308,12 @@ fn sound_cut_across_pes_is_laid_where_its_timestamps_put_it() {
     let stream = broadcast_like_stream();
     for options in [passthrough(), decode()] {
         let fragments = run_session_with_options(&stream, 64 * 1024, options);
-        let sound = track_samples(&fragments).audio;
+        let sound = sound_frames(&fragments);
         assert_eq!(sound.len(), BROADCAST_AAC_FRAMES, "{:?}", options.video);
-        for (index, sample) in sound.iter().enumerate() {
+        for (index, frame) in sound.iter().enumerate() {
             assert_eq!(
-                sample.decode_time,
-                sound[0].decode_time + index as u64 * 1024,
+                frame.time,
+                sound[0].time + index as u64 * 1024,
                 "{:?}: frame {index}",
                 options.video
             );
@@ -5187,7 +5338,7 @@ fn sixteen_lost_packets_of_sound_neither_end_the_stream_nor_move_it() {
     let mut cases = 0;
     for first in (8..sound_packets - 24).step_by(5) {
         let lossy = with_packets_of_pid_lost(&stream, AUDIO_PID, first, 16);
-        for options in [passthrough(), decode()] {
+        let run = |options: SessionOptions| {
             let label = format!("{:?}, sixteen from {first}", options.video);
             let mut session = Session::new(options);
             let mut fragments = Vec::new();
@@ -5203,11 +5354,20 @@ fn sixteen_lost_packets_of_sound_neither_end_the_stream_nor_move_it() {
                     .finish()
                     .unwrap_or_else(|error| panic!("{label}: {error}")),
             );
-            let sound = track_samples(&fragments).audio;
-            assert_eq!(timing(&sound), timing(&whole.audio), "{label}");
-            assert_sound_in_place(&label, &sound, &whole.audio);
-            cases += 1;
-        }
+            (label, fragments)
+        };
+        let (label, muxed) = run(passthrough());
+        let sound = track_samples(&muxed).audio;
+        assert_eq!(timing(&sound), timing(&whole.audio), "{label}");
+        assert_sound_in_place(&label, &sound, &whole.audio);
+        // Decode mode lays down the same access units in the same places, which
+        // only passthrough's bytes can tell apart, and decodes them.
+        let (label, decoded) = run(decode());
+        assert!(
+            sound_frames(&decoded) == sound_frames(&muxed),
+            "{label}: the muxed sound decoded"
+        );
+        cases += 2;
     }
     assert!(cases > 10);
 }

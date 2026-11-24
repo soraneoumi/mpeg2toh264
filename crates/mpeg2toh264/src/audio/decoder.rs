@@ -5,7 +5,7 @@ use super::layout::{layout_of, ChannelLayout, LayoutKey};
 use super::parse::{ChannelData, ChannelElement, ParsedBlock};
 use super::spectrum::{joint_stereo, reconstruct, Noise};
 use super::{tns, FRAME_SAMPLES};
-use crate::container::aac::{PceInfo, ID_CPE};
+use crate::container::aac::{program_config_element, PceInfo, ID_CPE};
 use crate::container::adts::SAMPLE_RATES;
 use crate::error::{bail, Result};
 
@@ -153,6 +153,10 @@ pub struct AacDecoder {
     /// The last `program_config_element` the stream carried, which describes
     /// the blocks after it that carry none.
     pce: Option<PceInfo>,
+    /// The one the stream's AudioSpecificConfig carries, which describes the
+    /// blocks that carry none when the stream has not carried one itself; see
+    /// [`AacDecoder::configure`].
+    configured_pce: Option<PceInfo>,
     /// By output channel.
     channels: Vec<ChannelState>,
     /// The spectra of the element being decoded, one per channel.
@@ -172,11 +176,54 @@ impl AacDecoder {
         Self {
             current: None,
             pce: None,
+            configured_pce: None,
             channels: Vec::new(),
             spectra: Box::new([[0.0; 1024]; 2]),
             filterbank: Box::new(Filterbank::new()),
             noise: Noise::new(),
         }
+    }
+
+    /// Take the stream's AudioSpecificConfig (ISO/IEC 14496-3 1.6.2.1), as a
+    /// container hands it over. All that is used of it is the
+    /// `program_config_element` a channelConfiguration of zero carries: the
+    /// blocks of such a stream need not carry one, and nothing else says what
+    /// their channels are. It describes those blocks from here on, in place of
+    /// any the stream carried under an earlier configuration; one that a block
+    /// carries later takes over from it. Any other configuration leaves the
+    /// blocks to describe themselves, or their ADTS headers to.
+    ///
+    /// Fails on a configuration that is not AAC-LC as `decode` takes it, and
+    /// on a `program_config_element` that does not fit in it, leaving the
+    /// decoder with no configured element.
+    pub fn configure(&mut self, audio_specific_config: &[u8]) -> Result<()> {
+        self.configured_pce = None;
+        self.pce = None;
+        let Some(&[first, second]) = audio_specific_config.first_chunk::<2>() else {
+            bail!("an AudioSpecificConfig is at least two bytes");
+        };
+        let object_type = first >> 3;
+        let frequency_index = ((first & 7) << 1) | (second >> 7);
+        let channel_configuration = (second >> 3) & 0x0f;
+        // GASpecificConfig: frameLengthFlag, dependsOnCoreCoder, extensionFlag.
+        let flags = second & 7;
+        if object_type != 2 {
+            bail!("AudioSpecificConfig is audio object type {object_type}, not AAC-LC");
+        }
+        if usize::from(frequency_index) >= SAMPLE_RATES.len() {
+            bail!("unsupported AudioSpecificConfig sampling_frequency_index {frequency_index}");
+        }
+        if flags != 0 {
+            bail!("AudioSpecificConfig asks for 960-sample frames, a core coder or an extension");
+        }
+        if channel_configuration == 0 {
+            let (pce, end) = program_config_element(audio_specific_config, 16);
+            if end > audio_specific_config.len() * 8 {
+                bail!("the AudioSpecificConfig's program_config_element runs past its end");
+            }
+            self.configured_pce = Some(pce);
+        }
+        Ok(())
     }
 
     /// Decode one parsed block. `channel_configuration` and `frequency_index`
@@ -201,7 +248,8 @@ impl AacDecoder {
         let Some(&sample_rate) = SAMPLE_RATES.get(frequency_index as usize) else {
             bail!("unsupported AAC sampling_frequency_index {frequency_index}");
         };
-        let key = layout_of(block, channel_configuration, self.pce.as_ref())?;
+        let kept = self.pce.as_ref().or(self.configured_pce.as_ref());
+        let key = layout_of(block, channel_configuration, kept)?;
         if channel_configuration == 0 {
             if let Some(pce) = block.pce() {
                 self.pce = Some(pce.clone());
@@ -270,7 +318,9 @@ impl AacDecoder {
         }
     }
 
-    /// Forget all state, as at a seek or a discontinuity.
+    /// Forget all state, as at a seek or a discontinuity. What
+    /// [`AacDecoder::configure`] was given still holds: it describes the
+    /// stream, not a place in it.
     pub fn reset(&mut self) {
         self.current = None;
         self.pce = None;
