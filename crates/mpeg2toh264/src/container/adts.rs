@@ -818,9 +818,8 @@ impl AdtsStream {
                 2
             }
         };
-        let both_services = self.keep_dual_mono
-            && single_channel
-            && block.channel_elements().count() == 2;
+        let both_services =
+            self.keep_dual_mono && single_channel && block.channel_elements().count() == 2;
         let sce_service = single_channel && input_channels <= 2 && !both_services;
         let output_channels = if sce_service || both_services {
             2

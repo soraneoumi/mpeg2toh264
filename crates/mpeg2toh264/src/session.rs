@@ -2041,23 +2041,23 @@ impl Session {
     /// only thing left is to package it.
     fn take_ready(&mut self, final_flush: bool) -> Result<Option<Ready>> {
         loop {
-            let has_audio = self.demuxer.has_aac_audio();
-            if !has_audio {
-                if self.pending_gops.is_empty() {
-                    return Ok(None);
-                }
-                // The sound is the clock decoded pictures are shown by.
-                if matches!(self.video, VideoPipeline::Decode { .. }) {
-                    return Err(Error::no_aac_audio());
-                }
-            } else {
+            if self.pending_gops.is_empty() {
+                return Ok(None);
+            }
+            // The sound is the clock decoded pictures are shown by.
+            if !self.demuxer.has_aac_audio() && matches!(self.video, VideoPipeline::Decode { .. }) {
+                return Err(Error::no_aac_audio());
+            }
+            // Sound the program names but none of which has arrived by the end
+            // of the input -- a read that opens after it has ended -- is no
+            // sound for these units to wait for, and they go out without it.
+            let has_audio =
+                self.demuxer.has_aac_audio() && !(final_flush && self.audio_config.is_none());
+            if has_audio {
                 // A unit goes out as soon as the sound that belongs beside it has
                 // arrived, which the frame count below checks. Holding it until
                 // the unit after it is complete as well would add a whole unit of
                 // delay to a live stream and change nothing in the fragment.
-                if self.pending_gops.is_empty() {
-                    return Ok(None);
-                }
                 if self.audio_config.is_none() {
                     return Ok(None);
                 }
@@ -2254,8 +2254,12 @@ impl Session {
                     // opening fragment's decode timeline is clamped to zero and
                     // runs a frame into the one after it. One that has yet to
                     // name its audio waits, because the origin cannot be moved
-                    // afterwards.
-                    None if self.demuxer.has_aac_audio() => return,
+                    // afterwards. Sound that never arrived names nothing, and
+                    // a unit only goes out without it at the end of the input,
+                    // where none is coming.
+                    None if self.demuxer.has_aac_audio() && self.audio_config.is_some() => {
+                        return;
+                    }
                     None => video_start - timeline.decode_lead.max(timeline.sample_duration) as i64,
                 };
                 self.timeline_origin = Some(chosen);
@@ -2487,9 +2491,8 @@ impl Session {
             let first = self.audio_base_decode_time(rate) + at as u64 * AAC_FRAME_SAMPLES;
             let sound = self.sound.as_mut().expect("decode mode decodes its sound");
             let (left, right, dual) = sound.decode(&frames[at..at + run]);
-            let start = |from: usize| {
-                (first + from as u64 * AAC_FRAME_SAMPLES) as f64 / f64::from(rate)
-            };
+            let start =
+                |from: usize| (first + from as u64 * AAC_FRAME_SAMPLES) as f64 / f64::from(rate);
             if dual.iter().all(|&kind| kind == dual[0]) {
                 out.push(Fragment::Sound {
                     start: start(0),
