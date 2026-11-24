@@ -134,6 +134,23 @@ const GRID_PHASE_GAIN = 0.1;
 const PRESENT_HYSTERESIS_MS = 1;
 
 /**
+ * Decoded pictures are shown for counted refreshes, and how far the sound has
+ * run from the output being shown corrects the count only past this much, in
+ * media seconds, and past a refresh: less is the counting's rounding, which
+ * the sound's speed takes back over time. As mpv's display sync has it.
+ */
+const AV_CORRECTION_SECONDS = 0.02;
+/**
+ * How far the screen's refresh may be from a whole number of picture steps
+ * (or a step from a whole number of refreshes) for decoded pictures to be
+ * counted in whole steps a refresh; the player's display lock moves the
+ * sound's speed by up to this much to match.
+ */
+const MAX_DISPLAY_DEVIATION = 0.005;
+/** Time constant of the average of that difference which `avDifference` reports, in ms. */
+const AV_FILTER_MS = 1000;
+
+/**
  * How far from the moment a frame was taken in hand its reported display time
  * may be and still be believed, in whichever of the refresh and frame periods
  * is longer. A report that cannot describe this frame is not one to schedule
@@ -366,6 +383,13 @@ export interface DeinterlaceStats {
    * but not those from before the place playback last started from.
    */
   late: number;
+  /**
+   * With decoded pictures: the media time being heard less that of the
+   * output being shown, in seconds, averaged over about the last second -- a
+   * player that plays the sound itself moves the sound's speed by it to keep
+   * the two together. NaN before pictures are shown by counting refreshes.
+   */
+  avDifference: number;
   /**
    * Times the presentation queue was reset because its scheduled lead exceeded
    * the useful display window. With decoded pictures, pictures dropped
@@ -838,8 +862,24 @@ export class Deinterlacer extends EventTarget {
   #previousStart: DecodedOutput | null = null;
   /** The media time of the output on the canvas; nothing older goes up after it. */
   #shownTime = Number.NEGATIVE_INFINITY;
-  /** Outputs the last refresh advanced by. Near a refresh boundary the next refresh does the same. */
-  #advanced = 1;
+  /**
+   * Decoded pictures are picked against a count of refreshes rather than the
+   * clock read at each one; see `#countRefresh`. Whether the count runs, the
+   * media time it has reached, and the refresh (wall ms) that time is for.
+   */
+  #counting = false;
+  #cursor = 0;
+  #cursorAt = 0;
+  /**
+   * The step decoded pictures change on -- a field, or a frame of
+   * progressive video -- in seconds, from the last picture taken; 0 before.
+   */
+  #pictureStep = 0;
+  /** The sound less the shown output, averaged, and when it was last taken; see `avDifference`. */
+  #avDifference = Number.NaN;
+  #avAt = 0;
+  /** `avDifference` as the Worker renderer last reported it. */
+  #workerAvDifference = Number.NaN;
   /** Field order of the decoded picture being filtered. */
   #fieldOrder = true;
   /** The size the decoded pictures are shown at. */
@@ -970,6 +1010,8 @@ export class Deinterlacer extends EventTarget {
         } satisfies WorkerCommand);
       },
       onrelease: null,
+      avDifference: () =>
+        this.#worker ? this.#workerAvDifference : this.#avDifference,
     };
     // The watch shares this GL context, so it works only while pictures are
     // drawn here. A Worker renderer is sent frames, not textures.
@@ -1373,6 +1415,7 @@ export class Deinterlacer extends EventTarget {
         if (this.#decoded)
           this.#workerPictureDrops =
             notification.stats.missed + notification.stats.queueResetted;
+        this.#workerAvDifference = notification.stats.avDifference;
         const stats: DeinterlaceStats = {
           ...notification.stats,
           dropped:
@@ -2308,6 +2351,8 @@ export class Deinterlacer extends EventTarget {
     this.#finished = false;
     this.#taken = false;
     this.#lastPushed = Number.NEGATIVE_INFINITY;
+    // The Worker's next report is from before the reset.
+    this.#workerAvDifference = Number.NaN;
     this.#awaiting = false;
     this.#awaitingFlushed = false;
     this.#frames = 0;
@@ -2315,7 +2360,8 @@ export class Deinterlacer extends EventTarget {
     this.#shownStart = null;
     this.#previousStart = null;
     this.#shownTime = Number.NEGATIVE_INFINITY;
-    this.#advanced = 1;
+    this.#counting = false;
+    this.#avDifference = Number.NaN;
     this.#resetFieldMetrics();
     this.#filmHold = 0;
     this.#clock.hold();
@@ -2401,7 +2447,7 @@ export class Deinterlacer extends EventTarget {
       )
     ) {
       this.#stats.resynced++;
-      this.#advanced = 1;
+      this.#counting = false;
     }
   }
 
@@ -2485,9 +2531,13 @@ export class Deinterlacer extends EventTarget {
     if (!this.#externalHost) this.#observeClock(performance.now());
     const rate = this.#clock.rate;
     // What is drawn now reaches the screen at the next refresh.
-    const time = this.#clock.at(this.#gridAt + this.#refreshMs);
+    const reading = this.#clock.at(this.#gridAt + this.#refreshMs);
     // Held for an event, and not read since.
-    if (Number.isNaN(time)) return;
+    if (Number.isNaN(reading)) return;
+    // While playing, the pictures' time is the count of refreshes, which the
+    // clock only steers; what is taken in, dropped and shown all goes by it.
+    const time = video.paused ? reading : this.#countRefresh(reading, rate);
+    if (video.paused) this.#counting = false;
     const revision = this.#playbackRevision;
     this.#feed(time, rate);
     if (this.#frameIsCurrent(revision))
@@ -2585,6 +2635,11 @@ export class Deinterlacer extends EventTarget {
    * which has its successor now.
    */
   #take(picture: DecodedPicture, time: number, rate: number): void {
+    // A field of interlaced video, three for one whose first is repeated;
+    // the picture of progressive video.
+    this.#pictureStep =
+      picture.duration /
+      (picture.interlaced ? (picture.repeatFirstField ? 3 : 2) : 1);
     const newest = this.#taken ? this.#held[this.#head]! : null;
     const end = newest === null ? 0 : newest.timestamp + newest.duration;
     const resized =
@@ -2915,39 +2970,117 @@ export class Deinterlacer extends EventTarget {
           this.#showOutput(start);
         return;
       }
-      this.#advanced = 1;
     } else {
-      // Outputs already shown in an earlier version, filtered against
-      // themselves while their successor was late.
-      let replaced = 0;
-      while (
-        replaced < queue.length &&
-        queue[replaced]!.time <= this.#shownTime
-      )
-        replaced++;
-      const hysteresis = (PRESENT_HYSTERESIS_MS * rate) / 1000;
-      let due = 0;
-      let near = 0;
-      for (let i = replaced; i < queue.length; i++) {
-        const slack = time - queue[i]!.time;
-        if (slack >= hysteresis) due++;
-        else if (slack >= -hysteresis) near++;
-        else break;
-      }
-      const count = Math.min(Math.max(this.#advanced, due), due + near);
-      this.#advanced = count;
-      if (count === 0) {
-        queue.splice(0, replaced);
-        return;
-      }
-      index = replaced + count - 1;
-      // Each output passed over was due until the one after it.
-      for (let i = replaced; i < index; i++)
-        if (this.#countable(queue[i + 1]!.time)) this.#stats.late++;
+      this.#showDue(queue, time, rate);
+      return;
     }
     const entry = queue[index]!;
     queue.splice(0, index + 1);
     this.#showOutput(entry);
+  }
+
+  /**
+   * The media time of the refresh being filled while playing, from `reading`,
+   * the clock's.
+   *
+   * Decoded pictures are shown against a count of refreshes, as mpv's display
+   * sync shows frames, rather than against the clock read at each refresh,
+   * which near the boundary of two outputs would show one twice and skip the
+   * other at the smallest wobble. The count moves the media time on by a
+   * fixed step each refresh. Where the screen runs within
+   * `MAX_DISPLAY_DEVIATION` of a whole number of picture steps a refresh (or
+   * of refreshes a step), the step is exactly that, so that every refresh
+   * moves by whole steps and none is ever shown twice or passed over; the
+   * sound is then played that much faster or slower to stay with the
+   * pictures (`avDifference`, which the player steers the sound's speed by).
+   * Elsewhere it is the refresh at this speed.
+   *
+   * The clock starts the count, so that the output due at the refresh being
+   * filled goes up first, and moves it by whole steps where it has come
+   * further from the count than `AV_CORRECTION_SECONDS` and a step: that
+   * much is no wobble or rounding but a stall, which the sound's speed would
+   * take too long over. While the clock stands -- a seek, a wait for data --
+   * there is nothing to count, and the time is the reading.
+   */
+  #countRefresh(reading: number, rate: number): number {
+    const target = this.#gridAt + this.#refreshMs;
+    const step = this.#countStep(rate);
+    if (!(rate > 0)) {
+      this.#counting = false;
+      return reading;
+    }
+    if (!this.#counting) {
+      this.#counting = true;
+      this.#cursor = reading;
+      this.#avDifference = Number.NaN;
+    } else {
+      // Refreshes the page did not get a frame for still went by.
+      const refreshes = Math.max(
+        1,
+        Math.round((target - this.#cursorAt) / this.#refreshMs),
+      );
+      this.#cursor += refreshes * step;
+      const difference = reading - this.#cursor;
+      if (Math.abs(difference) >= Math.max(AV_CORRECTION_SECONDS * rate, step))
+        this.#cursor += Math.trunc(difference / step) * step;
+    }
+    this.#cursorAt = target;
+    this.#noteAvDifference(reading - this.#cursor);
+    return this.#cursor;
+  }
+
+  /**
+   * Show the newest decoded output due by `time` while playing; see
+   * `#countRefresh` for what that time is.
+   */
+  #showDue(queue: DecodedOutput[], time: number, rate: number): void {
+    // Outputs already shown in an earlier version, filtered against
+    // themselves while their successor was late.
+    let replaced = 0;
+    while (replaced < queue.length && queue[replaced]!.time <= this.#shownTime)
+      replaced++;
+    if (replaced > 0) queue.splice(0, replaced);
+    // Pictures are timed to a 90 kHz tick, so one due exactly at a refresh
+    // may be a hair either side of the count.
+    const tolerance = TIMESTAMP_TOLERANCE * rate;
+    let due = -1;
+    for (let i = 0; i < queue.length && queue[i]!.time <= time + tolerance; i++)
+      due = i;
+    if (due < 0) return;
+    // Each output passed over was due until the one after it.
+    for (let i = 0; i < due; i++)
+      if (this.#countable(queue[i + 1]!.time)) this.#stats.late++;
+    const entry = queue[due]!;
+    queue.splice(0, due + 1);
+    this.#showOutput(entry);
+  }
+
+  /**
+   * Media seconds the count of `#countRefresh` moves by a refresh at speed
+   * `rate`: whole picture steps where the screen is close enough to them,
+   * else the refresh itself.
+   */
+  #countStep(rate: number): number {
+    const refresh = (this.#refreshMs * rate) / 1000;
+    const pictureStep = this.#pictureStep;
+    if (!(pictureStep > 0)) return refresh;
+    const steps = refresh / pictureStep;
+    const whole = steps >= 1 ? Math.round(steps) : 1 / Math.round(1 / steps);
+    return Math.abs(steps / whole - 1) <= MAX_DISPLAY_DEVIATION
+      ? whole * pictureStep
+      : refresh;
+  }
+
+  /** Average the sound's lead over the output just shown, for `avDifference`. */
+  #noteAvDifference(difference: number): void {
+    const now = performance.now();
+    const elapsed = now - this.#avAt;
+    this.#avAt = now;
+    if (Number.isNaN(this.#avDifference) || elapsed > AV_FILTER_MS)
+      this.#avDifference = difference;
+    else
+      this.#avDifference +=
+        ((difference - this.#avDifference) * elapsed) / AV_FILTER_MS;
   }
 
   #showOutput(entry: DecodedOutput): void {
@@ -3989,6 +4122,7 @@ export class Deinterlacer extends EventTarget {
 
     const stats: DeinterlaceStats = {
       ...this.#stats,
+      avDifference: this.#avDifference,
       // The element's own count of what its decoder could not keep up with,
       // which is the machine being behind rather than this filter.
       dropped: this.#video.getVideoPlaybackQuality?.().droppedVideoFrames ?? 0,

@@ -55,6 +55,14 @@ export interface DecodedVideoInput {
    * back exactly once, including on reset(), finish(), stop and destroy.
    */
   onrelease: ((data: ArrayBuffer) => void) | null;
+  /**
+   * The media time being heard less that of the picture on the screen, in
+   * seconds, averaged over about a second; NaN while pictures are not being
+   * shown. Pictures are shown for counted refreshes, in whole picture steps
+   * where the screen allows, so a player that plays the sound itself keeps
+   * the two together by moving the sound's speed by this.
+   */
+  avDifference(): number;
 }
 
 function positiveInteger(value: number): boolean {

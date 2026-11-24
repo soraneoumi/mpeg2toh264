@@ -82,6 +82,7 @@ function fakeDeinterlacer(withDecodedVideo) {
           push: (picture) => calls.push(["push", picture.timestamp]),
           reset: () => calls.push("reset"),
           finish: () => calls.push("finish"),
+          avDifference: () => Number.NaN,
         }
       : null,
     destroy: () => calls.push("destroy"),

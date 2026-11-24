@@ -83,8 +83,6 @@ class SoundProcessor extends AudioWorkletProcessor {
 
   #state: SoundState = "buffering";
   #wantPlay = false;
-  /** The context frame a start waits for, from `play`; 0 for none. */
-  #startAt = 0;
   #rate = 1;
   #adjust = 1;
   #gain = 1;
@@ -129,10 +127,7 @@ class SoundProcessor extends AudioWorkletProcessor {
         break;
       }
       case "play":
-        if (message.at !== undefined && !Number.isFinite(message.at))
-          throw new RangeError(`play at frame ${message.at}`);
         this.#wantPlay = true;
-        this.#startAt = message.at ?? 0;
         this.#forceReport = true;
         break;
       case "pause":
@@ -248,20 +243,18 @@ class SoundProcessor extends AudioWorkletProcessor {
     const queued = this.#queue.available / this.#sourceRate;
     const drains = this.#queue.drains;
     let envelope: Envelope | null = null;
-    // A start asked for at a later frame waits for it, whatever the state.
-    const due = frame >= this.#startAt;
     switch (this.#state) {
       case "buffering":
         if (
           (queued >= BUFFER_SECONDS || drains) &&
           this.#producible(2 * count, step)
         ) {
-          if (this.#wantPlay && due) envelope = Envelope.FadeIn;
+          if (this.#wantPlay) envelope = Envelope.FadeIn;
           else this.#state = "ready";
         }
         break;
       case "ready":
-        if (this.#wantPlay && due && this.#producible(2 * count, step))
+        if (this.#wantPlay && this.#producible(2 * count, step))
           envelope = Envelope.FadeIn;
         break;
       case "playing":
@@ -276,7 +269,6 @@ class SoundProcessor extends AudioWorkletProcessor {
       case "starved":
       case "paused":
         if (!this.#wantPlay) this.#state = "paused";
-        else if (!due) break;
         else if (
           (queued >= RESUME_SECONDS || drains) &&
           this.#producible(2 * count, step)

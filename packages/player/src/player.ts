@@ -42,14 +42,6 @@ import { MediaTakeover, Ready } from "./media-takeover.js";
 import { CONTEXT_SAMPLE_RATE, SoundOutput } from "./sound-output.js";
 import { SoundClock, type SoundPosition } from "./sound/index.js";
 
-/**
- * How long after it is asked for a start placed on the display's grid may be
- * heard at the earliest, besides the output latency: for the command to reach
- * the worklet before it renders that frame, which it does a device callback
- * or so ahead of the latency.
- */
-const START_MARGIN_MS = 40;
-
 /** The Worker URL emitted with this package for consumers that re-bundle the player. */
 const mpeg2TsPlayerWorkerURL = bundledWorkerURL;
 
@@ -88,6 +80,8 @@ export interface PlayerDecodedVideo {
   reset(): void;
   finish(): void;
   onrelease: ((data: ArrayBuffer) => void) | null;
+  /** The sound's lead over the picture on the screen, in seconds; see `DisplayLock`. */
+  avDifference(): number;
 }
 
 /**
@@ -412,11 +406,10 @@ export class Mpeg2TsPlayer extends EventTarget {
   /** Which dual-mono service was last chosen, which a new load keeps. */
   #dualMonoSub = false;
   /**
-   * The grid the pictures change on -- a field, or a frame of progressive
-   * video -- in seconds, and a media time on it; from the last picture taken.
+   * The step the pictures change on -- a field, or a frame of progressive
+   * video -- in seconds, from the last picture pushed.
    */
   #gridStep: number | null = null;
-  #gridOrigin = 0;
   /**
    * Decode mode: where the current epoch starts, and whether each of the two
    * things playback waits for after a start or a seek is there -- the sound
@@ -820,12 +813,12 @@ export class Mpeg2TsPlayer extends EventTarget {
     const takeover = this.#takeover!;
     this.#lock!.frame({
       now,
-      at: (wall) => sound.clock.at(wall),
       speed: sound.clock.speed,
       step: this.#gridStep,
-      origin: this.#gridOrigin,
       rate: takeover.rate,
       active: takeover.playing,
+      avDifference:
+        this.#deinterlacer?.decodedVideo?.avDifference() ?? Number.NaN,
     });
   }
 
@@ -834,7 +827,6 @@ export class Mpeg2TsPlayer extends EventTarget {
    * sound and its first picture are in (`#startIfReady`).
    */
   #beginSoundEpoch(at: number): void {
-    this.#lock?.reset();
     this.#epochAt = at;
     this.#soundReady = false;
     this.#pictureReady = false;
@@ -866,37 +858,7 @@ export class Mpeg2TsPlayer extends EventTarget {
     if (!takeover || !this.#soundReady || !this.#pictureReady) return;
     takeover.seeked();
     takeover.setReadyState(Ready.EnoughData);
-    if (!takeover.paused) this.#play();
-  }
-
-  /**
-   * Tell the worklet to play, timed so that its first sound is heard when the
-   * refresh after it falls in the middle of a picture step: the pictures are
-   * then shown each at its refresh from the first, rather than once the lock
-   * has moved the clock there. At once where the display or the clock is not
-   * known well enough yet.
-   */
-  #play(): void {
-    const sound = this.#sound!;
-    const takeover = this.#takeover!;
-    const step = this.#gridStep;
-    let at: number | undefined;
-    if (step !== null) {
-      const earliest =
-        performance.now() +
-        (sound.context.outputLatency ?? 0) * 1000 +
-        START_MARGIN_MS;
-      const wall = this.#lock!.startWall(
-        takeover.currentTime,
-        this.#gridOrigin,
-        step,
-        takeover.rate,
-        earliest,
-      );
-      const frame = sound.clock.frameAt(wall);
-      if (Number.isFinite(frame)) at = Math.round(frame);
-    }
-    sound.control({ type: "play", at });
+    if (!takeover.paused) this.#sound!.control({ type: "play" });
   }
 
   /** What the worklet says it is doing, for the element and the start. */
@@ -993,7 +955,6 @@ export class Mpeg2TsPlayer extends EventTarget {
     // the picture of progressive video.
     const fields = picture.interlaced ? (picture.repeatFirstField ? 3 : 2) : 1;
     this.#gridStep = picture.duration / fields;
-    this.#gridOrigin = picture.timestamp;
     if (
       !this.#pictureReady &&
       picture.timestamp + picture.duration > this.#epochAt
