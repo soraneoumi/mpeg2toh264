@@ -83,7 +83,7 @@ class SoundProcessor extends AudioWorkletProcessor {
 
   #state: SoundState = "buffering";
   #wantPlay = false;
-  /** The context frame a start waits for, from `play`; 0 for none. */
+  /** The context frame a start waits for, from `play`. */
   #startAt = 0;
   #rate = 1;
   #adjust = 1;
@@ -129,10 +129,10 @@ class SoundProcessor extends AudioWorkletProcessor {
         break;
       }
       case "play":
-        if (message.at !== undefined && !Number.isFinite(message.at))
+        if (!Number.isFinite(message.at))
           throw new RangeError(`play at frame ${message.at}`);
         this.#wantPlay = true;
-        this.#startAt = message.at ?? 0;
+        this.#startAt = message.at;
         this.#forceReport = true;
         break;
       case "pause":

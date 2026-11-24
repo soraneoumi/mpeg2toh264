@@ -64,11 +64,8 @@ export type SoundControl =
    * PCM of a later epoch that arrives before this message is held for it.
    */
   | { type: "epoch"; epoch: number; at: number }
-  /**
-   * Play: from the first quantum that starts at or after context frame `at`
-   * where it is given -- a start placed on the display's grid -- else at once.
-   */
-  | { type: "play"; at?: number }
+  /** Play from the first quantum that starts at or after context frame `at`. */
+  | { type: "play"; at: number }
   | { type: "pause" }
   /** Playback speed, 0.25 to 4, pitch preserved. Exactly 1 bypasses the time stretch. */
   | { type: "rate"; rate: number }

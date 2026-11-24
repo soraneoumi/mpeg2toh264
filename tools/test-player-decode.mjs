@@ -417,7 +417,18 @@ try {
     // the worklet saying it plays.
     await video.play();
     assert.equal(video.paused, false);
-    assert.equal(node.port.take("play").length, 1);
+    // At a refresh, once the refresh period is known.
+    let plays = [];
+    for (let i = 0; i < 300 && plays.length === 0; i++) {
+      await wait(10);
+      plays = node.port.take("play");
+    }
+    assert.equal(plays.length, 1);
+    assert.ok(Number.isFinite(plays[0].at), "placed at a frame");
+    assert.deepEqual(
+      deinterlacer.calls.filter((call) => call[0] === "startsAt"),
+      [["startsAt", 0]],
+    );
     assert.deepEqual(await takeEvents(), ["play"]);
     node.report({ epoch, state: "playing", media: 0, speed: 1 });
     assert.deepEqual(await takeEvents(), ["playing"]);

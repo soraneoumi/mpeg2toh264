@@ -155,7 +155,7 @@ const check = (name, ok, detail = "") =>
   const rig = new Rig();
   rig.control({ type: "epoch", epoch: 1, at: 10 });
   let end = rig.feed(1, 10, 1);
-  rig.control({ type: "play" });
+  rig.control({ type: "play", at: 0 });
   const keepFed = (r) => {
     if (r.reports.length > 0 && end - r.reports.at(-1).media < 1)
       end = r.feed(1, end, 0.5);
@@ -247,7 +247,7 @@ const check = (name, ok, detail = "") =>
   const rig = new Rig();
   rig.control({ type: "epoch", epoch: 1, at: 0 });
   let end = rig.feed(1, 0, 1.5);
-  rig.control({ type: "play" });
+  rig.control({ type: "play", at: 0 });
   const keepFed = (r) => {
     if (r.reports.length > 0 && end - r.reports.at(-1).media < 1.5)
       end = r.feed(1, end, 0.5);
@@ -290,7 +290,7 @@ const check = (name, ok, detail = "") =>
   const rig = new Rig();
   rig.control({ type: "epoch", epoch: 1, at: 0 });
   rig.feed(1, 0, 1);
-  rig.control({ type: "play" });
+  rig.control({ type: "play", at: 0 });
   rig.runSeconds(0.5);
   rig.send(chunk(2, 100)); // the Worker is ahead of the page
   rig.control({ type: "epoch", epoch: 2, at: 100 });
@@ -347,7 +347,7 @@ const check = (name, ok, detail = "") =>
   const jumpTo = 10; // more than 1 s ahead: the timeline jumps
   rig.feed(1, jumpTo, 0.5);
   rig.send({ type: "end", epoch: 1 });
-  rig.control({ type: "play" });
+  rig.control({ type: "play", at: 0 });
   rig.runSeconds(2.2);
   // The gap carries no sawtooth; the frames next to it are smeared by nothing
   // at rate 1, so only the gap itself is left out.
@@ -409,7 +409,7 @@ for (const how of ["starve", "pause"]) {
   const rig = new Rig();
   rig.control({ type: "epoch", epoch: 1, at: 0 });
   let end = rig.feed(1, 0, 0.6);
-  rig.control({ type: "play" });
+  rig.control({ type: "play", at: 0 });
   if (how === "starve") rig.runSeconds(0.8);
   else {
     rig.runSeconds(0.3);
@@ -459,7 +459,7 @@ for (const how of ["starve", "pause"]) {
       rig.reports.at(-1).state === "starved",
     );
     end = rig.feed(1, end, 0.3);
-  } else rig.control({ type: "play" });
+  } else rig.control({ type: "play", at: 0 });
   rig.runSeconds(0.2);
   const resumed = rig.reports.find(
     (r) => r.state === "playing" && r.frame > stop.frame,
@@ -487,7 +487,7 @@ for (const how of ["starve", "pause"]) {
   const change = (count * CHUNK) / 44100;
   rig.feed(1, change, 1);
   rig.send({ type: "end", epoch: 1 });
-  rig.control({ type: "play" });
+  rig.control({ type: "play", at: 0 });
   rig.runSeconds(2.6);
   const playing = rig.reports.filter((r) => r.state === "playing");
   check(
@@ -526,7 +526,7 @@ for (const how of ["starve", "pause"]) {
   const rig = new Rig();
   rig.control({ type: "epoch", epoch: 1, at: 0 });
   rig.feed(1, 0.05, 2); // ramp away from 0 so ratios are well defined
-  rig.control({ type: "play" });
+  rig.control({ type: "play", at: 0 });
   rig.runSeconds(0.3);
   const from = rig.left.length;
   rig.control({ type: "volume", gain: 0.25 });
@@ -576,7 +576,7 @@ for (const how of ["starve", "pause"]) {
   const count = Math.round((2 * C) / CHUNK);
   for (let k = 0; k < count; k++)
     rig.send({ ...chunk(1, (k * CHUNK) / C), dualMono: true });
-  rig.control({ type: "play" });
+  rig.control({ type: "play", at: 0 });
   rig.runSeconds(0.5);
   const main = rig.left.length;
   rig.control({ type: "dual-mono", sub: true });
