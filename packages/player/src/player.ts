@@ -394,6 +394,8 @@ export class Mpeg2TsPlayer extends EventTarget {
   #sound: SoundOutput | null = null;
   #takeover: MediaTakeover | null = null;
   #lock: DisplayLock | null = null;
+  /** Which dual-mono service was last chosen, which a new load keeps. */
+  #dualMonoSub = false;
   /**
    * The grid the pictures change on -- a field, or a frame of progressive
    * video -- in seconds, and a media time on it; from the last picture taken.
@@ -482,6 +484,9 @@ export class Mpeg2TsPlayer extends EventTarget {
    * one describes nothing anew, so the change costs no restart point.
    */
   selectDualMono(sub: boolean): void {
+    this.#dualMonoSub = sub;
+    // Decode mode's worklet holds both services and switches at once.
+    this.#sound?.control({ type: "dual-mono", sub });
     this.#worker?.postMessage({
       type: "audio",
       id: this.#generation,
@@ -784,6 +789,7 @@ export class Mpeg2TsPlayer extends EventTarget {
     });
     sound.control({ type: "rate", rate: takeover.rate });
     sound.control({ type: "volume", gain: takeover.gain });
+    sound.control({ type: "dual-mono", sub: this.#dualMonoSub });
     takeover.install();
     this.#sound = sound;
     this.#takeover = takeover;

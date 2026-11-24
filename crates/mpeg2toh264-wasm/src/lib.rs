@@ -82,6 +82,12 @@ export type Fragment =
        */
       left: Float32Array;
       right: Float32Array;
+      /**
+       * Whether these are the two services of a dual-mono stream instead:
+       * the main one in `left`, the second in `right`, each to be played on
+       * both sides, whichever is chosen.
+       */
+      dualMono: boolean;
     }
   | {
       /**
@@ -759,6 +765,7 @@ fn to_js_fragment(fragment: Fragment) -> Result<JsValue, JsError> {
             sample_rate,
             left,
             right,
+            dual_mono,
         } => {
             set(&object, "kind", &"sound".into())?;
             set(&object, "start", &start.into())?;
@@ -769,6 +776,7 @@ fn to_js_fragment(fragment: Fragment) -> Result<JsValue, JsError> {
                 "right",
                 &Float32Array::from(right.as_slice()).into(),
             )?;
+            set(&object, "dualMono", &dual_mono.into())?;
         }
         Fragment::Video {
             data,

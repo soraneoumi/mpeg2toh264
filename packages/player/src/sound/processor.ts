@@ -147,6 +147,9 @@ class SoundProcessor extends AudioWorkletProcessor {
           Math.max(2 - MAX_ADJUST, message.ratio),
         );
         break;
+      case "dual-mono":
+        this.#queue.selectService(message.sub);
+        break;
       case "volume":
         if (!(message.gain >= 0 && Number.isFinite(message.gain)))
           throw new RangeError(`volume ${message.gain}`);
@@ -173,7 +176,13 @@ class SoundProcessor extends AudioWorkletProcessor {
     // Build the kernel here rather than in `process()`.
     kernelFor(message.sampleRate, sampleRate);
     const [left, right] = message.channels;
-    this.#queue.push(message.start, message.sampleRate, left, right);
+    this.#queue.push(
+      message.start,
+      message.sampleRate,
+      left,
+      right,
+      message.dualMono,
+    );
   }
 
   #applyEpoch(epoch: number, at: number): void {

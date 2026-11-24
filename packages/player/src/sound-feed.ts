@@ -26,6 +26,8 @@ interface Chunk {
   sampleRate: number;
   left: Float32Array;
   right: Float32Array;
+  /** The two services of dual mono rather than a stereo pair; see `SoundPcm`. */
+  dualMono: boolean;
 }
 
 export interface SoundFeedOptions {
@@ -111,6 +113,7 @@ export class SoundFeed {
     sampleRate: number,
     left: Float32Array,
     right: Float32Array,
+    dualMono: boolean,
   ): void {
     this.#chunks.push({
       start,
@@ -118,6 +121,7 @@ export class SoundFeed {
       sampleRate,
       left,
       right,
+      dualMono,
     });
     this.#pump();
     this.#update();
@@ -164,6 +168,7 @@ export class SoundFeed {
           start: chunk.start,
           sampleRate: chunk.sampleRate,
           channels: [left, right],
+          dualMono: chunk.dualMono,
         } satisfies SoundPcm,
         [left.buffer, right.buffer],
       );

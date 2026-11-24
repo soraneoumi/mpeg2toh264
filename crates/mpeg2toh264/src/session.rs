@@ -9,7 +9,9 @@
 
 use std::sync::Arc;
 
-use crate::audio::{downmix, parse_block, AacDecoder, ParsedBlock, PcmFrame, FRAME_SAMPLES};
+use crate::audio::{
+    downmix, parse_block, AacDecoder, ChannelLayout, ParsedBlock, PcmFrame, FRAME_SAMPLES,
+};
 use crate::container::adts::{
     aac_frame_count_through_video_time, silent_frame, AacConfig, AacFrame, AacUnit, AdtsOutput,
     AdtsStream, AudioGain, DualMono, AAC_FRAME_SAMPLES,
@@ -261,6 +263,11 @@ pub enum Fragment {
         /// is the one a receiver plays; see [`downmix::to_stereo`].
         left: Vec<f32>,
         right: Vec<f32>,
+        /// Whether these are the two services of a dual-mono stream instead,
+        /// the main one in `left` and the second in `right`, each a mono
+        /// service for the player to play on both sides: which one is heard
+        /// is chosen as it plays, so a change is heard at once.
+        dual_mono: bool,
     },
     /// One unit of MPEG-2 for the caller to decode, in decode mode only. It
     /// follows the `Media` fragment of the same unit, where the unit has
@@ -705,9 +712,13 @@ impl SoundDecoder {
     /// or dual-mono service as a channel pair of the chosen service, the gain
     /// in `global_gain` -- so they are mixed as they are. A frame that does not
     /// decode is concealed, never refused: the sound has to cover its time.
-    fn decode(&mut self, frames: &[AacFrame]) -> (Vec<f32>, Vec<f32>) {
+    ///
+    /// A dual-mono frame gives its two services as they are, main left and
+    /// second right, which the returned flags mark frame by frame.
+    fn decode(&mut self, frames: &[AacFrame]) -> (Vec<f32>, Vec<f32>, Vec<bool>) {
         let mut left = vec![0.0; frames.len() * FRAME_SAMPLES];
         let mut right = vec![0.0; frames.len() * FRAME_SAMPLES];
+        let mut dual = Vec::with_capacity(frames.len());
         let outputs = left
             .chunks_exact_mut(FRAME_SAMPLES)
             .zip(right.chunks_exact_mut(FRAME_SAMPLES));
@@ -736,9 +747,16 @@ impl SoundDecoder {
                 self.decoder.conceal(&mut self.pcm);
                 self.concealed += 1;
             }
-            downmix::to_stereo(&self.pcm, false, 1.0, left, right);
+            let services = *self.pcm.layout() == ChannelLayout::DualMono;
+            if services {
+                left.copy_from_slice(self.pcm.channel(0));
+                right.copy_from_slice(self.pcm.channel(1));
+            } else {
+                downmix::to_stereo(&self.pcm, false, 1.0, left, right);
+            }
+            dual.push(services);
         }
-        (left, right)
+        (left, right, dual)
     }
 }
 
@@ -863,7 +881,12 @@ impl Session {
                 VideoMode::Passthrough => DamagedPictures::Drop,
                 VideoMode::Decode => DamagedPictures::Conceal,
             }),
-            adts: AdtsStream::new(),
+            adts: {
+                let mut adts = AdtsStream::new();
+                // Decode mode chooses between the services as it plays.
+                adts.keep_dual_mono(options.video == VideoMode::Decode);
+                adts
+            },
             video: match options.video {
                 VideoMode::Passthrough => VideoPipeline::Passthrough {
                     awaiting_intra: true,
@@ -2463,13 +2486,40 @@ impl Session {
                 .unwrap_or(frames.len() - at);
             let first = self.audio_base_decode_time(rate) + at as u64 * AAC_FRAME_SAMPLES;
             let sound = self.sound.as_mut().expect("decode mode decodes its sound");
-            let (left, right) = sound.decode(&frames[at..at + run]);
-            out.push(Fragment::Sound {
-                start: first as f64 / f64::from(rate),
-                sample_rate: rate,
-                left,
-                right,
-            });
+            let (left, right, dual) = sound.decode(&frames[at..at + run]);
+            let start = |from: usize| {
+                (first + from as u64 * AAC_FRAME_SAMPLES) as f64 / f64::from(rate)
+            };
+            if dual.iter().all(|&kind| kind == dual[0]) {
+                out.push(Fragment::Sound {
+                    start: start(0),
+                    sample_rate: rate,
+                    left,
+                    right,
+                    dual_mono: dual[0],
+                });
+                at += run;
+                continue;
+            }
+            // One fragment for each stretch of frames that are, or are not,
+            // two services: a programme turns dual mono on and off.
+            let mut from = 0;
+            while from < run {
+                let services = dual[from];
+                let to = dual[from..]
+                    .iter()
+                    .position(|&kind| kind != services)
+                    .map_or(run, |length| from + length);
+                let samples = from * FRAME_SAMPLES..to * FRAME_SAMPLES;
+                out.push(Fragment::Sound {
+                    start: start(from),
+                    sample_rate: rate,
+                    left: left[samples.clone()].to_vec(),
+                    right: right[samples].to_vec(),
+                    dual_mono: services,
+                });
+                from = to;
+            }
             at += run;
         }
     }

@@ -549,5 +549,36 @@ for (const how of ["starve", "pause"]) {
   );
 }
 
+// Dual mono: the chosen service on both sides, and a change of choice taken
+// at once, at the PCM read next.
+{
+  const rig = new Rig();
+  rig.control({ type: "epoch", epoch: 1, at: 0 });
+  const count = Math.round((2 * C) / CHUNK);
+  for (let k = 0; k < count; k++)
+    rig.send({ ...chunk(1, (k * CHUNK) / C), dualMono: true });
+  rig.control({ type: "play" });
+  rig.runSeconds(0.5);
+  const main = rig.left.length;
+  rig.control({ type: "dual-mono", sub: true });
+  rig.runSeconds(0.5);
+  const sides = (from, to) => {
+    let same = true;
+    let sign = 0;
+    for (let f = from; f < to; f++) {
+      if (rig.left[f] !== rig.right[f]) same = false;
+      sign += Math.sign(rig.left[f]);
+    }
+    return { same, sign };
+  };
+  // Past the fades and the stages' look-ahead on either side of the change.
+  const before = sides(main - 9600, main - 4800);
+  const after = sides(main + 4800, main + 9600);
+  check(
+    `dual mono: one service on both sides, the main one (${before.sign}) then the second (${after.sign})`,
+    before.same && after.same && before.sign > 0 && after.sign < 0,
+  );
+}
+
 const failed = results.filter((r) => !r.ok);
 assert.equal(failed.length, 0, `${failed.length} processor checks failed`);

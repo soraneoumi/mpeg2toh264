@@ -134,6 +134,9 @@ pub struct AdtsStream {
     is_dual_mono: bool,
     /// How far to raise the sound of every frame handed out.
     audio_gain: AudioGain,
+    /// Hand a dual-mono frame out as it is, both services, rather than
+    /// rebuilt from the one chosen; see [`AdtsStream::keep_dual_mono`].
+    keep_dual_mono: bool,
 }
 
 /// Where an ADTS header says its frame ends -- the part of it that frames the
@@ -585,6 +588,16 @@ impl AdtsStream {
         self.dual_mono = service;
     }
 
+    /// Hand dual-mono frames out with both services in them, as the stream
+    /// carries them, for a caller that decodes the sound and chooses between
+    /// the two as it plays: the choice is then the caller's, and immediate,
+    /// rather than this stream's from the next frame read. Such a frame is
+    /// described as `channel_configuration` 0 with no program config element,
+    /// which is what two single channel elements are to a decoder.
+    pub fn keep_dual_mono(&mut self, keep: bool) {
+        self.keep_dual_mono = keep;
+    }
+
     /// Raise the sound of every frame read from here on. See [`AudioGain`].
     pub fn set_audio_gain(&mut self, gain: AudioGain) {
         self.audio_gain = gain;
@@ -805,9 +818,21 @@ impl AdtsStream {
                 2
             }
         };
-        let sce_service = single_channel && input_channels <= 2;
-        let output_channels = if sce_service { 2 } else { input_channels };
-        let audio_specific_config = if sce_service {
+        let both_services = self.keep_dual_mono
+            && single_channel
+            && block.channel_elements().count() == 2;
+        let sce_service = single_channel && input_channels <= 2 && !both_services;
+        let output_channels = if sce_service || both_services {
+            2
+        } else {
+            input_channels
+        };
+        let audio_specific_config = if both_services {
+            vec![
+                (audio_object_type << 3) | (sampling_frequency_index >> 1),
+                (sampling_frequency_index & 1) << 7,
+            ]
+        } else if sce_service {
             vec![
                 (audio_object_type << 3) | (sampling_frequency_index >> 1),
                 ((sampling_frequency_index & 1) << 7) | (2 << 3),
@@ -870,7 +895,7 @@ impl AdtsStream {
             }
             rebuilt.data
         } else {
-            self.is_dual_mono = false;
+            self.is_dual_mono = both_services;
             let mut data = raw_data.to_vec();
             if steps != 0 {
                 let channels: Vec<&Element> = block.channel_elements().collect();

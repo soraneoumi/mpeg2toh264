@@ -1065,6 +1065,7 @@ class Playback {
           fragment.sampleRate,
           fragment.left,
           fragment.right,
+          fragment.dualMono,
         );
       } else if (fragment.kind === "video") {
         // Only decode mode makes these.

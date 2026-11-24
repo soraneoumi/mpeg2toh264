@@ -27,6 +27,12 @@ export interface SoundPcm {
   sampleRate: number;
   /** Left and right, the same length. */
   channels: [Float32Array, Float32Array];
+  /**
+   * Whether these are the two services of a dual-mono stream instead -- the
+   * main one first, the second next -- of which the one chosen with
+   * `dual-mono` is played on both sides.
+   */
+  dualMono: boolean;
 }
 
 /** No more PCM in this epoch, Worker → processor on the PCM port. */
@@ -65,7 +71,13 @@ export type SoundControl =
   /** Fine speed factor in [0.99, 1.01], applied by resampling (pitch follows). */
   | { type: "adjust"; ratio: number }
   /** Linear gain, ramped. */
-  | { type: "volume"; gain: number };
+  | { type: "volume"; gain: number }
+  /**
+   * Which service of dual-mono sound to play: the second if `sub`. It takes
+   * effect at the PCM being taken from the queue now, so it is heard after the
+   * stages behind the queue and the output latency, a few tens of ms.
+   */
+  | { type: "dual-mono"; sub: boolean };
 
 /**
  * Processor → page on `AudioWorkletNode.port`: where the output is in media

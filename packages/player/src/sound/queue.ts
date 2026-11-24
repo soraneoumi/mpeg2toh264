@@ -22,6 +22,10 @@ export class PcmQueue implements FrameSource {
   #left: (Float32Array | null)[] = new Array(256).fill(null);
   #right: (Float32Array | null)[] = new Array(256).fill(null);
   #offset = new Int32Array(256);
+  /** Whether each entry holds the two services of dual mono. */
+  #dual = new Uint8Array(256);
+  /** Which of the two is played: 0 the main one, 1 the second. */
+  #service = 0;
   #length = new Int32Array(256);
   #head = 0;
   #count = 0;
@@ -48,6 +52,11 @@ export class PcmQueue implements FrameSource {
   /** Source index one past the last queued frame. */
   get writeIndex(): number {
     return this.#writeIndex;
+  }
+
+  /** Play the second service of dual-mono entries, or the main one. */
+  selectService(sub: boolean): void {
+    this.#service = sub ? 1 : 0;
   }
 
   /** Media time at which the queued PCM ends. */
@@ -144,6 +153,7 @@ export class PcmQueue implements FrameSource {
     rate: number,
     left: Float32Array,
     right: Float32Array,
+    dualMono = false,
   ): void {
     if (this.#ended) return;
     let offset = 0;
@@ -158,9 +168,9 @@ export class PcmQueue implements FrameSource {
       this.#addSegment(this.#writeIndex, start, rate);
     } else {
       if (newRate) this.#addSegment(this.#writeIndex, this.#endMedia, rate);
-      if (delta >= 1) this.#append(null, null, 0, Math.round(delta));
+      if (delta >= 1) this.#append(null, null, 0, Math.round(delta), false);
     }
-    this.#append(left, right, offset, length - offset);
+    this.#append(left, right, offset, length - offset, dualMono);
   }
 
   /**
@@ -185,6 +195,11 @@ export class PcmQueue implements FrameSource {
       if (l === null || r === null) {
         left.fill(0, at + done, at + done + n);
         right.fill(0, at + done, at + done + n);
+      } else if (this.#dual[s]) {
+        // The chosen service of dual mono, on both sides.
+        const service = this.#service === 0 ? l : r;
+        copyFrames(left, at + done, service, o, n);
+        copyFrames(right, at + done, service, o, n);
       } else {
         copyFrames(left, at + done, l, o, n);
         copyFrames(right, at + done, r, o, n);
@@ -287,6 +302,7 @@ export class PcmQueue implements FrameSource {
     right: Float32Array | null,
     offset: number,
     length: number,
+    dualMono: boolean,
   ): void {
     if (length <= 0) return;
     if (this.#count === this.#left.length) {
@@ -295,16 +311,19 @@ export class PcmQueue implements FrameSource {
       const l: (Float32Array | null)[] = new Array(size).fill(null);
       const r: (Float32Array | null)[] = new Array(size).fill(null);
       const o = new Int32Array(size);
+      const dual = new Uint8Array(size);
       const n = new Int32Array(size);
       for (let i = 0; i < this.#count; i++) {
         l[i] = this.#left[order(i)]!;
         r[i] = this.#right[order(i)]!;
         o[i] = this.#offset[order(i)]!;
+        dual[i] = this.#dual[order(i)]!;
         n[i] = this.#length[order(i)]!;
       }
       this.#left = l;
       this.#right = r;
       this.#offset = o;
+      this.#dual = dual;
       this.#length = n;
       this.#head = 0;
     }
@@ -312,6 +331,7 @@ export class PcmQueue implements FrameSource {
     this.#left[s] = left;
     this.#right[s] = right;
     this.#offset[s] = offset;
+    this.#dual[s] = dualMono ? 1 : 0;
     this.#length[s] = length;
     this.#writeIndex += length;
     this.#endMedia += length / this.#segRate[this.#slot(this.#segCount - 1)]!;

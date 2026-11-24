@@ -354,7 +354,7 @@ try {
     assert.deepEqual(node.options.outputChannelCount, [2]);
     assert.deepEqual(
       node.port.posted.map((message) => message.type),
-      ["pcm-port", "rate", "volume", "pause", "epoch"],
+      ["pcm-port", "rate", "volume", "dual-mono", "pause", "epoch"],
     );
     assert.deepEqual(node.port.take("epoch")[0], {
       type: "epoch",

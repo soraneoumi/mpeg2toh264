@@ -1046,9 +1046,13 @@ pub fn sound_frames(fragments: &[Fragment]) -> Vec<SoundFrame> {
             sample_rate,
             left,
             right,
+            dual_mono,
         } = fragment
         {
             decoded = true;
+            // The main service, as it is heard when chosen: on both sides,
+            // which is what passthrough's rebuilt frames carry.
+            let right = if *dual_mono { left } else { right };
             let first = (start * f64::from(*sample_rate)).round() as u64;
             for (index, (left, right)) in left.chunks(1024).zip(right.chunks(1024)).enumerate() {
                 out.push(SoundFrame {
@@ -1102,8 +1106,11 @@ pub fn sound_by_unit(decoded: &[Fragment]) -> Vec<(Vec<SoundRun<'_>>, usize)> {
                 sample_rate,
                 left,
                 right,
+                dual_mono,
             } => {
                 assert_eq!(left.len(), right.len(), "as many samples on each side");
+                // The main service heard on both sides, as passthrough muxes it.
+                let right = if *dual_mono { left } else { right };
                 assert!(!left.is_empty(), "a run of sound holds some");
                 assert_eq!(left.len() % 1024, 0, "whole access units");
                 runs.push(SoundRun {
@@ -1389,6 +1396,7 @@ pub fn fragments_digest(fragments: &[Fragment]) -> Vec<String> {
                 sample_rate,
                 left,
                 right,
+                dual_mono,
             } => {
                 let bytes: Vec<u8> = left
                     .iter()
@@ -1396,7 +1404,7 @@ pub fn fragments_digest(fragments: &[Fragment]) -> Vec<String> {
                     .flat_map(|sample| sample.to_le_bytes())
                     .collect();
                 format!(
-                    "sound {start} {sample_rate} {} {:x}",
+                    "sound {start} {sample_rate} {dual_mono} {} {:x}",
                     left.len(),
                     fnv1a(&bytes)
                 )
