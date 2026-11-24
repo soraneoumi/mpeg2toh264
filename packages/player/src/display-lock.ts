@@ -19,9 +19,11 @@
  * player that syncs to the display does; the pitch moves by as little as the
  * speed, which no one hears.
  *
- * Only at the normal speed, while playing, and only where the grid is within
- * `MAX_DEVIATION` of a whole number of refreshes. Anything else plays at the
- * sound's own rate.
+ * While playing, at any speed where each refresh moves by a whole number of
+ * steps (2 at double speed on such a screen) or each step lasts a whole
+ * number of refreshes (2 at half speed), within `MAX_DEVIATION`. Anything
+ * else -- 1.5 times as fast, say, where refreshes take one step and two in
+ * turn whatever the clock does -- plays at the sound's own rate.
  */
 
 /** How far the grid may be from a whole number of refreshes and still be locked to it. */
@@ -50,7 +52,9 @@ export interface DisplayLockInput {
   step: number | null;
   /** A media time on the grid: where some picture began. */
   origin: number;
-  /** Whether locking applies now: playing, at the normal speed. */
+  /** The playback speed asked for. */
+  rate: number;
+  /** Whether locking applies now: playing. */
   active: boolean;
 }
 
@@ -106,12 +110,11 @@ export class DisplayLock {
       this.#release(now);
       return;
     }
-    // Whole refreshes per step, and how far from that the two rates are.
-    const per = Math.round((step * 1000) / period);
-    if (
-      per < 1 ||
-      Math.abs((step * 1000) / (per * period) - 1) > MAX_DEVIATION
-    ) {
+    // Steps a refresh moves by at this speed: whole steps per refresh, or
+    // whole refreshes per step, and how far from that the two rates are.
+    const steps = (input.rate * period) / (step * 1000);
+    const whole = steps >= 1 ? Math.round(steps) : 1 / Math.round(1 / steps);
+    if (!(whole > 0) || Math.abs(steps / whole - 1) > MAX_DEVIATION) {
       this.#release(now);
       return;
     }
@@ -130,10 +133,10 @@ export class DisplayLock {
       this.#error += delta * Math.min(1, elapsed / 1000 / PHASE_SMOOTHING);
       this.#error -= Math.round(this.#error);
     }
-    // Exactly `per` refreshes a step, less what moves the refresh back to the
-    // middle of its step within PHASE_CORRECTION.
+    // Exactly `whole` steps a refresh, less what moves the refresh back to
+    // the middle of its step within PHASE_CORRECTION.
     const target =
-      (step * 1000) / (per * period) - (this.#error * step) / PHASE_CORRECTION;
+      (whole * step * 1000) / period - (this.#error * step) / PHASE_CORRECTION;
     const base = input.speed / this.#adjust;
     if (!(base > 0)) return;
     const adjust = Math.min(

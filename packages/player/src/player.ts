@@ -801,7 +801,8 @@ export class Mpeg2TsPlayer extends EventTarget {
       speed: sound.clock.speed,
       step: this.#gridStep,
       origin: this.#gridOrigin,
-      active: takeover.playing && takeover.rate === 1,
+      rate: takeover.rate,
+      active: takeover.playing,
     });
   }
 
