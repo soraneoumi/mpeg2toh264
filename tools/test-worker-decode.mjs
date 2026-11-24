@@ -371,31 +371,6 @@ try {
   // Back a little, into what is still held: no reading again.
   await seekTo(duration / 2 + 0.1, "seek into the held sound");
 
-  // A seek into the last picture: it comes out of the decoder only once the
-  // input has ended, and the worklet is told the sound ends.
-  // Ahead of the request past the last picture below: that one reads the
-  // end of the input again, and the worker learns the last unit's restart
-  // there, from which no session can place the picture -- no sound follows
-  // it to place it by. A seek after that into the last picture reads from
-  // there and gets nothing; that is a fault of its own.
-  const final = shown.at(-1);
-  const target = final.timestamp + final.duration / 2;
-  startEpoch(target);
-  while (
-    !(completed && ends.includes(epoch) && soundEnded.has(epoch)) &&
-    errors.length === 0
-  ) {
-    send({ type: "need", id, epoch, from: playhead, until: playhead + 0.3 });
-    await new Promise((resolve) => setTimeout(resolve, 2));
-    await pump(() => true);
-  }
-  assert.deepEqual(errors, []);
-  assert.ok(covered, "the last picture after a seek into it");
-  checkSound(target, "a seek into the last picture");
-  console.log(
-    `seek to ${target.toFixed(3)} s, into the last picture: the picture, and the sound's end`,
-  );
-
   // A request of a new epoch past the last picture, with the input read to
   // its end and the decoder holding a picture back from the seek before: it
   // ends at once, and nothing of the epoch left behind comes out in it.
@@ -417,6 +392,29 @@ try {
   );
   console.log(
     `request at ${beyond.toFixed(3)} s in the buffer, past the last picture: no picture, and its end`,
+  );
+
+  // A seek into the last picture: it comes out of the decoder only once the
+  // input has ended, and the worklet is told the sound ends.
+  // After the request past the last picture above, which read the end of the
+  // input again: the restart learned there has to be one a reading can
+  // start from, before the program map's section rather than inside it.
+  const final = shown.at(-1);
+  const target = final.timestamp + final.duration / 2;
+  startEpoch(target);
+  while (
+    !(completed && ends.includes(epoch) && soundEnded.has(epoch)) &&
+    errors.length === 0
+  ) {
+    send({ type: "need", id, epoch, from: playhead, until: playhead + 0.3 });
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    await pump(() => true);
+  }
+  assert.deepEqual(errors, []);
+  assert.ok(covered, "the last picture after a seek into it");
+  checkSound(target, "a seek into the last picture");
+  console.log(
+    `seek to ${target.toFixed(3)} s, into the last picture: the picture, and the sound's end`,
   );
 
   // A request past the last picture, where a recording's sound outlasts its
