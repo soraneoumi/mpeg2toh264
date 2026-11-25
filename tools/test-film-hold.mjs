@@ -119,8 +119,8 @@ for (const rendering of ["main", "worker"]) {
   });
   const draws = result.draws;
   // Every program is drawn with once as the renderer is built: the
-  // detector's four, the filter, the blit and the picture conversion.
-  assert.equal(result.setupDraws.length, 7, "single rate: setup draws");
+  // detector's five, the filter, the blit and the picture conversion.
+  assert.equal(result.setupDraws.length, 8, "single rate: setup draws");
   const after = matchedFrames(draws, LOSS_AT, Infinity).size;
   assert.ok(
     after >= HOLD_FRAMES - 2 && after <= HOLD_FRAMES + 8,

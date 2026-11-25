@@ -50,7 +50,7 @@ import {
  * filtered. This is not done for the `second` field of a frame. `phase` is the
  * phase the page expects, for the debug overlay only. `comb` is the detector's
  * count of the combing each way of weaving would leave, block by block (see
- * COMB_FRAGMENT_SHADER), and a block past COMB_BLOCK_PIXELS is filtered
+ * COMB_FLAGS_FRAGMENT_SHADER), and a block past COMB_BLOCK_PIXELS is filtered
  * instead of woven.
  *
  * With `match`, a line that would be filtered is first taken from the field

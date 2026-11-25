@@ -221,25 +221,37 @@ class WebGL2RenderingContext {
       match: uniform("uMatch"),
       instant: uniform("uInstant"),
     };
-    if (this.#framebuffer) this.#framebuffer.texture.picture = picture;
+    // The comb count is drawn in two passes: the marks, which compare the
+    // frames, and their sums, which go where the filter reads them.
+    const marks = fragment.includes("float(combed(");
+    const sums = fragment.includes("uniform sampler2D uFlags;");
+    const flags = sums ? this.#textures.get(uniform("uFlags")) : null;
+    const prev = flags ? flags.prev : this.#textures.get(uniform("uPrev"))?.mediaTime;
+    const drawn = flags ? flags.picture : picture;
+    if (this.#framebuffer) {
+      this.#framebuffer.texture.picture = drawn;
+      this.#framebuffer.texture.prev = prev;
+    }
     if (luma && this.#framebuffer) this.#framebuffer.texture.mediaTime = luma.mediaTime;
     __host.draw(__realm, {
       t: __host.now(),
       blit,
       toCanvas: this.#framebuffer === null,
       texture: this.#texture ? this.#texture.id : null,
-      picture,
-      // comb marks the detector's comb-count pass. For it, prev (with the
-      // current frame in picture) are the frames compared and target is the
-      // texture the counts go to. For a filter draw, ahead is the texture the
-      // ahead counts are read from.
+      picture: drawn,
+      // comb marks the pass that puts the detector's comb counts where the
+      // filter reads them, after the pass that marks the combed pixels
+      // (marks). For it, prev (with the current frame in picture) are the
+      // frames compared and target is the texture the counts go to. For a
+      // filter draw, ahead is the texture the ahead counts are read from.
       filter: fragment.includes("uParity"),
-      comb: fragment.includes("woven += 1.0"),
+      comb: sums,
+      marks,
       // metrics marks the detector's last pass, which scores the frame from
       // its comb counts. combInput is the texture it reads them from.
       metrics: fragment.includes("vec4 instant("),
       combInput: this.#textures.get(uniform("uComb"))?.id ?? null,
-      prev: this.#textures.get(uniform("uPrev"))?.mediaTime,
+      prev,
       target: this.#framebuffer ? this.#framebuffer.texture.id : null,
       ahead: this.#textures.get(uniform("uCombAhead"))?.id ?? null,
     });

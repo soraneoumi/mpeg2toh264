@@ -6,8 +6,10 @@
  */
 import {
   COMB_BLOCK,
-  COMB_FRAGMENT_SHADER,
-  COMB_UNIFORMS,
+  COMB_FLAGS_FRAGMENT_SHADER,
+  COMB_FLAGS_UNIFORMS,
+  COMB_SUM_FRAGMENT_SHADER,
+  COMB_SUM_UNIFORMS,
   FIELD_COMPARE_BLOCK_H,
   FIELD_COMPARE_BLOCK_W,
   FIELD_COMPARE_FRAGMENT_SHADER,
@@ -32,7 +34,7 @@ export interface Phase {
 
 export const NO_PHASE: Phase = { phase: 0, run: 0 };
 
-/** RGBA32F textures of one size, drawn together as one framebuffer. */
+/** Textures of one size and format, drawn together as one framebuffer. */
 interface RenderTarget {
   framebuffer: WebGLFramebuffer;
   textures: WebGLTexture[];
@@ -85,11 +87,15 @@ export class FilmDetector {
   readonly #reductionLocation: Locations<typeof REDUCTION_UNIFORMS>;
   readonly #metricsProgram: WebGLProgram;
   readonly #metricsLocation: Locations<typeof METRICS_UNIFORMS>;
-  readonly #combProgram: WebGLProgram;
-  readonly #combLocation: Locations<typeof COMB_UNIFORMS>;
+  readonly #combFlagsProgram: WebGLProgram;
+  readonly #combFlagsLocation: Locations<typeof COMB_FLAGS_UNIFORMS>;
+  readonly #combSumProgram: WebGLProgram;
+  readonly #combSumLocation: Locations<typeof COMB_SUM_UNIFORMS>;
   /** The block comparisons of both fields, and the same folded most of the way. */
   #blocks: RenderTarget | null = null;
   #reduced: RenderTarget | null = null;
+  /** The combed pixels of the frame measured last, one field's lines; see COMB_FLAGS_FRAGMENT_SHADER. */
+  #combFlags: RenderTarget | null = null;
   /** Combed pixels per block of the frame being filtered, both ways of weaving it. */
   #comb: RenderTarget | null = null;
   /** Combed pixels per block of the frame after the one being filtered. */
@@ -136,12 +142,27 @@ export class FilmDetector {
       VERTEX_SHADER,
     );
     this.#metricsLocation = locate(gl, this.#metricsProgram, METRICS_UNIFORMS);
-    this.#combProgram = createProgram(gl, COMB_FRAGMENT_SHADER, VERTEX_SHADER);
-    this.#combLocation = locate(gl, this.#combProgram, COMB_UNIFORMS);
+    this.#combFlagsProgram = createProgram(
+      gl,
+      COMB_FLAGS_FRAGMENT_SHADER,
+      VERTEX_SHADER,
+    );
+    this.#combFlagsLocation = locate(
+      gl,
+      this.#combFlagsProgram,
+      COMB_FLAGS_UNIFORMS,
+    );
+    this.#combSumProgram = createProgram(
+      gl,
+      COMB_SUM_FRAGMENT_SHADER,
+      VERTEX_SHADER,
+    );
+    this.#combSumLocation = locate(gl, this.#combSumProgram, COMB_SUM_UNIFORMS);
     drawOnce(gl, this.#compareProgram, gl.RGBA32F, 2);
     drawOnce(gl, this.#reductionProgram, gl.RGBA32F, 2);
     drawOnce(gl, this.#metricsProgram, gl.RGBA32F);
-    drawOnce(gl, this.#combProgram, gl.RGBA32F);
+    drawOnce(gl, this.#combFlagsProgram, gl.RG8);
+    drawOnce(gl, this.#combSumProgram, gl.RGBA32F);
   }
 
   /** The newest measurements, or null before any frame has been measured. */
@@ -151,7 +172,7 @@ export class FilmDetector {
 
   /**
    * Combed pixels per block of the frame last measured by `measureComb`, or
-   * null before one has been. See COMB_FRAGMENT_SHADER.
+   * null before one has been. See COMB_FLAGS_FRAGMENT_SHADER.
    */
   get combTexture(): WebGLTexture | null {
     return this.#comb?.textures[0] ?? null;
@@ -288,13 +309,21 @@ export class FilmDetector {
     if (this.#width === 0 || this.#height === 0) return;
     this.#allocate();
     const comb = ahead ? this.#combAhead : this.#comb;
-    if (comb === null) return;
+    const flags = this.#combFlags;
+    if (comb === null || flags === null) return;
+    // The combed pixels, then their count in each block.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, flags.framebuffer);
+    gl.useProgram(this.#combFlagsProgram);
+    this.#bind(0, prev, this.#combFlagsLocation.prev);
+    this.#bind(1, cur, this.#combFlagsLocation.cur);
+    gl.uniform1i(this.#combFlagsLocation.first, first);
+    gl.uniform2i(this.#combFlagsLocation.size, this.#width, this.#height);
+    gl.viewport(0, 0, flags.width, flags.height);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
     gl.bindFramebuffer(gl.FRAMEBUFFER, comb.framebuffer);
-    gl.useProgram(this.#combProgram);
-    this.#bind(0, prev, this.#combLocation.prev);
-    this.#bind(1, cur, this.#combLocation.cur);
-    gl.uniform1i(this.#combLocation.first, first);
-    gl.uniform2i(this.#combLocation.size, this.#width, this.#height);
+    gl.useProgram(this.#combSumProgram);
+    this.#bind(0, flags.textures[0], this.#combSumLocation.flags);
+    gl.uniform2i(this.#combSumLocation.size, flags.width, flags.height);
     gl.viewport(0, 0, comb.width, comb.height);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -343,7 +372,8 @@ export class FilmDetector {
     gl.deleteProgram(this.#compareProgram);
     gl.deleteProgram(this.#reductionProgram);
     gl.deleteProgram(this.#metricsProgram);
-    gl.deleteProgram(this.#combProgram);
+    gl.deleteProgram(this.#combFlagsProgram);
+    gl.deleteProgram(this.#combSumProgram);
   }
 
   #bind(
@@ -361,10 +391,12 @@ export class FilmDetector {
     const gl = this.#gl;
     if (this.#blocks !== null) freeRenderTarget(gl, this.#blocks);
     if (this.#reduced !== null) freeRenderTarget(gl, this.#reduced);
+    if (this.#combFlags !== null) freeRenderTarget(gl, this.#combFlags);
     if (this.#comb !== null) freeRenderTarget(gl, this.#comb);
     if (this.#combAhead !== null) freeRenderTarget(gl, this.#combAhead);
     this.#blocks = null;
     this.#reduced = null;
+    this.#combFlags = null;
     this.#comb = null;
     this.#combAhead = null;
   }
@@ -375,6 +407,7 @@ export class FilmDetector {
     if (
       this.#blocks === null ||
       this.#reduced === null ||
+      this.#combFlags === null ||
       this.#comb === null ||
       this.#combAhead === null
     ) {
@@ -387,6 +420,15 @@ export class FilmDetector {
         Math.ceil(width / REDUCTION_FACTOR),
         Math.ceil(height / REDUCTION_FACTOR),
         2,
+      );
+      // A mark is 0 or 1: a byte holds it, and a pass over a million of
+      // them reads an eighth of what float ones would take.
+      this.#combFlags = allocateRenderTarget(
+        gl,
+        this.#width,
+        Math.ceil(this.#height / 2),
+        1,
+        "marks",
       );
       this.#comb = allocateRenderTarget(
         gl,
@@ -425,12 +467,20 @@ export class FilmDetector {
   }
 }
 
+/**
+ * What a render target's textures hold: measurements and their sums as
+ * floats, or two marks of 0 or 1 a pixel.
+ */
+type Holds = "floats" | "marks";
+
 function allocateRenderTarget(
   gl: WebGL2RenderingContext,
   width: number,
   height: number,
   count: number,
+  holds: Holds = "floats",
 ): RenderTarget {
+  const marks = holds === "marks";
   const framebuffer = gl.createFramebuffer();
   gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
   const textures: WebGLTexture[] = [];
@@ -442,12 +492,12 @@ function allocateRenderTarget(
     gl.texImage2D(
       gl.TEXTURE_2D,
       0,
-      gl.RGBA32F,
+      marks ? gl.RG8 : gl.RGBA32F,
       width,
       height,
       0,
-      gl.RGBA,
-      gl.FLOAT,
+      marks ? gl.RG : gl.RGBA,
+      marks ? gl.UNSIGNED_BYTE : gl.FLOAT,
       null,
     );
     gl.framebufferTexture2D(

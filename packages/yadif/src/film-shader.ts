@@ -434,7 +434,7 @@ void main()
 }
 `;
 
-export const COMB_UNIFORMS = {
+export const COMB_FLAGS_UNIFORMS = {
   prev: "uPrev",
   cur: "uCur",
   first: "uFirst",
@@ -442,7 +442,7 @@ export const COMB_UNIFORMS = {
 } as const;
 
 /**
- * Count, block by block, the pixels a woven film frame would show combed.
+ * Mark the pixels a woven film frame would show combed.
  *
  * Film reconstruction trusts the cadence: a frame whose phase says it is one
  * film frame goes out as it is, and the frame that holds two gets the previous
@@ -458,11 +458,15 @@ export const COMB_UNIFORMS = {
  * direction by more than the threshold, the five-line test (the same pattern
  * two lines apart) agrees that it alternates rather than being a thin line,
  * and it changed since the previous frame -- still detail is never combing,
- * whatever its shape. The filter interpolates a block past COMB_BLOCK_PIXELS
- * instead of weaving it; blocks rather than pixels, since weak combing left
- * between the pixels that crossed the threshold looks worse than either.
+ * whatever its shape.
+ *
+ * One fragment a pixel of the second field, line `y` of the target being
+ * that field's line `y` from the top, so that every pixel is looked at in
+ * parallel; COMB_SUM_FRAGMENT_SHADER counts them by block. (One fragment a
+ * block looking at its pixels in turn took half as long again as the two
+ * passes together.)
  */
-export const COMB_FRAGMENT_SHADER = `#version 300 es
+export const COMB_FLAGS_FRAGMENT_SHADER = `#version 300 es
 precision highp float;
 precision highp int;
 
@@ -490,30 +494,55 @@ bool combed(float above2, float above, float pixel, float below, float below2) {
 }
 
 void main() {
-  // Block rows count from the top of the frame, as the filter reads them.
+  ivec2 at = ivec2(gl_FragCoord.xy);
+  int x = at.x;
+  int y = 2 * at.y + 1 - uFirst;
+  outValue = vec4(0.0);
+  if (y >= uSize.y) return;
+  float current = luma(uCur, x, y);
+  float previous = luma(uPrev, x, y);
+  if (abs(current - previous) <= COMB) return;
+  // The first field's lines either side are the same whichever second
+  // field is woven between them.
+  float above = luma(uCur, x, y - 1);
+  float below = luma(uCur, x, y + 1);
+  outValue.r = float(combed(luma(uCur, x, y - 2), above, current, below, luma(uCur, x, y + 2)));
+  outValue.g = float(combed(luma(uPrev, x, y - 2), above, previous, below, luma(uPrev, x, y + 2)));
+}
+`;
+
+export const COMB_SUM_UNIFORMS = {
+  flags: "uFlags",
+  size: "uSize",
+} as const;
+
+/**
+ * Count the pixels COMB_FLAGS_FRAGMENT_SHADER marked, block by block: a
+ * block is COMB_BLOCK pixels square, so COMB_BLOCK by COMB_BLOCK / 2 of the
+ * marks, one field's lines. Block rows count from the top of the frame, as
+ * the filter reads them. The filter interpolates a block past
+ * COMB_BLOCK_PIXELS instead of weaving it; blocks rather than pixels, since
+ * weak combing left between the pixels that crossed the threshold looks
+ * worse than either.
+ */
+export const COMB_SUM_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+precision highp int;
+
+uniform sampler2D uFlags;
+/** The size of the marks. */
+uniform ivec2 uSize;
+
+out vec4 outValue;
+
+void main() {
   ivec2 block = ivec2(gl_FragCoord.xy);
-  ivec2 base = block * ${COMB_BLOCK};
-  float standing = 0.0;
-  float woven = 0.0;
-  for (int dy = 0; dy < ${COMB_BLOCK}; ++dy) {
-    int y = base.y + dy;
-    if (y >= uSize.y || (y & 1) == uFirst) continue;
-    for (int dx = 0; dx < ${COMB_BLOCK}; ++dx) {
-      int x = base.x + dx;
-      if (x >= uSize.x) break;
-      float current = luma(uCur, x, y);
-      float previous = luma(uPrev, x, y);
-      if (abs(current - previous) <= COMB) continue;
-      // The first field's lines either side are the same whichever second
-      // field is woven between them.
-      float above = luma(uCur, x, y - 1);
-      float below = luma(uCur, x, y + 1);
-      if (combed(luma(uCur, x, y - 2), above, current, below, luma(uCur, x, y + 2)))
-        standing += 1.0;
-      if (combed(luma(uPrev, x, y - 2), above, previous, below, luma(uPrev, x, y + 2)))
-        woven += 1.0;
-    }
-  }
-  outValue = vec4(standing, woven, 0.0, 0.0);
+  ivec2 base = block * ivec2(${COMB_BLOCK}, ${COMB_BLOCK / 2});
+  ivec2 end = min(base + ivec2(${COMB_BLOCK}, ${COMB_BLOCK / 2}), uSize);
+  vec2 count = vec2(0.0);
+  for (int y = base.y; y < end.y; ++y)
+    for (int x = base.x; x < end.x; ++x)
+      count += texelFetch(uFlags, ivec2(x, y), 0).rg;
+  outValue = vec4(count, 0.0, 0.0);
 }
 `;
