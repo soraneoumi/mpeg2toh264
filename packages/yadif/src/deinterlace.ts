@@ -2735,16 +2735,24 @@ export class Deinterlacer extends EventTarget {
       if (!this.#frameIsCurrent(revision)) return;
       this.#dropPassed(time);
     }
-    // Its successor is late, or there is none: filter it against itself when
-    // it is due. It is filtered again if the successor comes after all.
+    // Its successor is late, there is none, or the next picture is not its
+    // neighbour -- the ones between could not be decoded, as after a seek --
+    // and comes too late for its fields: filter it against itself when it is
+    // due. It is filtered again if its neighbour comes after all.
     if (
       !this.#awaiting ||
       this.#awaitingFlushed ||
-      this.#pending.length > 0 ||
       this.#spareOutputs() < this.#outputsPerPicture()
     )
       return;
     const newest = this.#held[this.#head]!;
+    const next = this.#pending[0];
+    if (
+      next !== undefined &&
+      next.timestamp - (newest.timestamp + newest.duration) <=
+        TIMESTAMP_TOLERANCE
+    )
+      return;
     const hysteresis = (PRESENT_HYSTERESIS_MS * rate) / 1000;
     if (this.#finished || newest.timestamp <= time + hysteresis) {
       this.#emit(true, time, rate);
@@ -2866,7 +2874,9 @@ export class Deinterlacer extends EventTarget {
       // Not a neighbour for the filter.
       this.#frames = 0;
     } else {
-      if (awaiting && !stale) {
+      // Filtered against itself already, it is not filtered again against a
+      // picture that is not its neighbour either.
+      if (awaiting && !stale && !(flushed && gap)) {
         const current = this.#held[(this.#head + HISTORY - 1) % HISTORY]!;
         this.#fieldOrder = current.topFieldFirst;
         this.#ensureFilm();
@@ -3014,7 +3024,8 @@ export class Deinterlacer extends EventTarget {
         if (slot !== null) queued = true;
       }
     }
-    if (!queued && next <= time) this.#countMissed(end);
+    if (!queued && next <= time && picture.timestamp > this.#shownTime)
+      this.#countMissed(end);
   }
 
   /**
@@ -3038,7 +3049,9 @@ export class Deinterlacer extends EventTarget {
     rate: number,
   ): number | null {
     if (!this.#useful(at, until, pictureUntil, time, rate)) {
-      if (this.#countable(until)) this.#stats.late++;
+      // One the canvas has gone past was counted, if at all, as it went past:
+      // this is it again, filtered against a successor that came late.
+      if (at > this.#shownTime && this.#countable(until)) this.#stats.late++;
       return null;
     }
     if (slot === null) {
@@ -3125,10 +3138,15 @@ export class Deinterlacer extends EventTarget {
     for (let i = 0; i < queue.length && queue[i]!.time <= time + tolerance; i++)
       due = i;
     if (due < 0) return;
-    // Each output passed over while playing was due until the one after it.
+    // Each output passed over while playing was due until the one after it,
+    // and late unless that one is due only within the tolerance, which is a
+    // choice between two outputs rather than lateness -- as at a start that
+    // falls just short of a field.
     if (!paused)
-      for (let i = 0; i < due; i++)
-        if (this.#countable(queue[i + 1]!.time)) this.#stats.late++;
+      for (let i = 0; i < due; i++) {
+        const until = queue[i + 1]!.time;
+        if (until <= time && this.#countable(until)) this.#stats.late++;
+      }
     const entry = queue[due]!;
     queue.splice(0, due + 1);
     this.#showOutput(entry);

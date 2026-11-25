@@ -2340,6 +2340,101 @@ for (const rendering of ["main", "worker"]) {
   console.log(`ok ${label}: the paused field, then the next, none passed over`);
 }
 
+// Announced starts that the pictures do not make easy. After a seek the
+// pictures that follow the one the start falls in may be missing -- the
+// decoder could not make them -- and that one is not held for a successor
+// that comes too late for its fields: it goes up with the sound. And a start
+// that falls just short of a field shows that field, within the tolerance,
+// which passes over the one before it without that being lateness.
+for (const rendering of ["main", "worker"])
+  for (const kind of ["gap", "short"]) {
+    const pictures = stream({ count: 900 });
+    if (kind === "gap") pictures.splice(600, 2);
+    const target = pictures[599];
+    const seekTo =
+      kind === "gap"
+        ? target.timestamp + FRAME * 0.3
+        : target.timestamp + FRAME / 2 - 0.0025;
+    // The field the first refresh shows, 2 ms on from where the sound starts.
+    const first =
+      kind === "gap" ? target.timestamp : target.timestamp + FRAME / 2;
+    const media = playing();
+    const marks = {};
+    const steps = timeline(
+      [
+        3,
+        (control, context) => {
+          media.set(control.now(), seekTo, 0);
+          control.video.seeking = true;
+          event(control, "seeking");
+          context.deinterlacer.decodedVideo.reset();
+          context.producer.seek(seekTo);
+          marks.seeking = control.now();
+        },
+      ],
+      [
+        3.2,
+        (control, context) => {
+          control.video.seeking = false;
+          event(control, "seeked");
+          event(control, "playing");
+          marks.played = control.now();
+          marks.start = control.now() + 3 * (1000 / (60000 / 1001));
+          context.deinterlacer.decodedVideo.startsAt(
+            seekTo,
+            control.pageContext.performance.now() +
+              (marks.start - control.now()) -
+              2,
+          );
+        },
+      ],
+    );
+    const { result, refreshMs, stats } = await play({
+      seconds: 6,
+      media,
+      pictures,
+      rendering,
+      script: (vsync, control, context) => {
+        steps(control, context);
+        if (
+          marks.start !== undefined &&
+          marks.started === undefined &&
+          control.now() >= marks.start - 1
+        ) {
+          media.set(control.now(), seekTo, 1);
+          marks.started = control.now();
+        }
+      },
+    });
+    const label = `announced start, ${kind}, ${rendering}`;
+    const shown = appearances(
+      { draws: canvasDraws(result, marks.played) },
+      outputs(pictures),
+      refreshMs,
+    );
+    assert.ok(
+      Math.abs(shown[0].time - first) < 1e-6,
+      `${label}: first went up ${shown[0].key}`,
+    );
+    assert.equal(
+      BASE_MS + shown[0].refresh * refreshMs,
+      marks.started,
+      `${label}: the first field went up at another refresh than the sound's`,
+    );
+    checkTiming(label, shown, media, refreshMs, {
+      from: marks.started,
+      toleranceMs: 2,
+    });
+    const before = result.stats.findLast(
+      (snapshot) => snapshot.t < marks.seeking,
+    ) ?? { missed: 0, late: 0 };
+    assert.equal(stats.late - before.late, 0, `${label}: fields late`);
+    assert.equal(stats.missed - before.missed, 0, `${label}: pictures missed`);
+    console.log(
+      `ok ${label}: the field of the start with the sound, none late`,
+    );
+  }
+
 // An element that publishes its position in steps, as Firefox does every
 // 40 ms of media: after `set`, the reading stays where it was set until
 // `phaseMs` of playing have passed, and from then on moves a step at a time.
