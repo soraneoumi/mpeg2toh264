@@ -68,8 +68,6 @@ export declare class SoundClock {
     sample(now?: number): void;
     /** Media time being heard at wall time `wall`, or NaN when not playing or not yet known. */
     at(wall: number): number;
-    /** Media seconds per wall second right now; 0 when not playing. */
-    get speed(): number;
     /** The processor's state as last reported; "idle" before the first report. */
     get state(): SoundPosition["state"] | "idle";
     /** Wall time at which the device plays context frame `frame` (outputLatency included); NaN until known. */

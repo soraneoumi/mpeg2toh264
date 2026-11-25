@@ -11,8 +11,6 @@
  * until it exists.
  */
 import { SoundClock, type SoundControl, type SoundPosition } from "./sound/index.js";
-/** Broadcast sound is 48 kHz; asking for it spares the browser a resampler. */
-export declare const CONTEXT_SAMPLE_RATE = 48000;
 export interface SoundOutputHandlers {
     /** Every report of the processor, after the clock has taken it. */
     report: (position: SoundPosition) => void;
