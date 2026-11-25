@@ -1789,15 +1789,14 @@ function canvasDraws(result, from = -Infinity, to = Infinity) {
   console.log("ok late pictures: one with nothing newer is still shown");
 }
 
-// Paused: the first field of the picture currentTime falls in, also after a
-// seek while paused once its picture is there; until then the last picture
-// stays up.
-// currentTime may stop behind the picture the canvas has gone on to.
+// Paused: the field due where currentTime stops, as playing would show it,
+// also after a seek while paused once its picture is there; until then the
+// last picture stays up. currentTime may stop behind the field the canvas
+// has gone on to, which then stays: the picture does not step back.
 for (const behindMs of [0, 12]) {
   const pictures = stream({ count: 400 });
   const media = playing();
   const pauseAt = pictures[91].timestamp + 0.001;
-  const pausedIn = behindMs === 0 ? pictures[91] : pictures[90];
   const seekTo = pictures[220].timestamp + FRAME * 0.6;
   const marks = {};
   let supplying = true;
@@ -1862,7 +1861,7 @@ for (const behindMs of [0, 12]) {
   });
   // What is on the canvas while paused, drawn before or after the pause.
   const paused = canvasDraws(result, -Infinity, marks.reset);
-  assert.equal(paused.at(-1).picture.mediaTime, pausedIn.timestamp);
+  assert.equal(paused.at(-1).picture.mediaTime, pictures[91].timestamp);
   assert.equal(paused.at(-1).picture.second, 0, "paused on the second field");
   assert.equal(
     canvasDraws(result, marks.paused + 200, marks.reset).length,
@@ -1874,9 +1873,10 @@ for (const behindMs of [0, 12]) {
     0,
     "drew before a picture for the new position arrived",
   );
+  // The seek lands 0.6 of a picture in: its second field.
   const sought = canvasDraws(result, marks.supplied, marks.played);
   assert.equal(sought.at(-1).picture.mediaTime, pictures[220].timestamp);
-  assert.equal(sought.at(-1).picture.second, 0);
+  assert.equal(sought.at(-1).picture.second, 1);
   assert.equal(marks.visibleBeforeSeek, "visible");
   const list = outputs(pictures);
   const shown = appearances(
@@ -1890,7 +1890,7 @@ for (const behindMs of [0, 12]) {
   });
   assert.equal(marks.scan.interlaced, true);
   console.log(
-    `ok paused ${behindMs} ms behind the canvas: the first field of the current picture, before and after a seek`,
+    `ok paused ${behindMs} ms behind the canvas: the field due there or the one up, before and after a seek`,
   );
 }
 
@@ -2055,12 +2055,12 @@ for (const paused of [false, true]) {
     ],
     label,
   );
-  // Seeking, the field whose time it is; paused, the picture's first.
+  // Seeking, playing or paused, the field whose time it is.
   const still = canvasDraws(result, marks.reset, marks.played);
   assert.ok(still.length > 0, label);
   for (const draw of still) {
     assert.equal(draw.picture.mediaTime, target.timestamp, label);
-    assert.equal(draw.picture.second, paused ? 0 : 1, label);
+    assert.equal(draw.picture.second, 1, label);
   }
   const shown = appearances(
     { draws: canvasDraws(result, marks.played) },
@@ -2246,6 +2246,98 @@ for (const rendering of ["main", "worker"]) {
   assert.equal(stats.late - before.late, 0, `${label}: fields late`);
   assert.equal(stats.missed - before.missed, 0, `${label}: pictures missed`);
   console.log(`ok ${label}: the first field with the sound, none passed over`);
+}
+
+// A pause near the end of a picture's second field, and play resumed from
+// there through `startsAt`, which the player places a little before a
+// refresh: paused, the canvas shows that second field, and the sound at the
+// first refresh is already in the next picture, whose first field goes up
+// then, with nothing passed over.
+for (const rendering of ["main", "worker"]) {
+  const pictures = stream({ count: 900 });
+  const media = playing();
+  const marks = {};
+  let pausedAt = null;
+  let next = null;
+  const steps = timeline(
+    [
+      3,
+      (control) => {
+        // 2 ms before a picture a little ahead, which a start placed 2 ms
+        // before its refresh reaches by that refresh. (Within 1 ms it
+        // would be at that picture already, as timestamps go.)
+        const truth = media.truth(control.now());
+        next = pictures.findIndex(
+          (picture) => picture.timestamp > truth + FRAME,
+        );
+        pausedAt = pictures[next].timestamp - 0.002;
+        media.set(control.now(), pausedAt, 0);
+        control.video.paused = true;
+        event(control, "pause");
+        marks.paused = control.now();
+      },
+    ],
+    [
+      4,
+      (control, context) => {
+        control.video.paused = false;
+        event(control, "play");
+        event(control, "playing");
+        marks.played = control.now();
+        marks.start = control.now() + 3 * (1000 / (60000 / 1001));
+        context.deinterlacer.decodedVideo.startsAt(
+          pausedAt,
+          control.pageContext.performance.now() +
+            (marks.start - control.now()) -
+            2,
+        );
+      },
+    ],
+  );
+  const { result, refreshMs, stats } = await play({
+    seconds: 7,
+    media,
+    pictures,
+    rendering,
+    script: (vsync, control, context) => {
+      steps(control, context);
+      if (
+        marks.start !== undefined &&
+        marks.started === undefined &&
+        control.now() >= marks.start - 1
+      ) {
+        media.set(control.now(), pausedAt, 1);
+        marks.started = control.now();
+      }
+    },
+  });
+  const label = `resume at a field boundary, ${rendering}`;
+  const paused = canvasDraws(result, marks.paused + 200, marks.played);
+  const up = canvasDraws(result, -Infinity, marks.played).at(-1);
+  assert.equal(up.picture.mediaTime, pictures[next - 1].timestamp, label);
+  assert.equal(up.picture.second, 1, `${label}: not the second field paused`);
+  assert.equal(paused.length, 0, `${label}: drew while paused`);
+  const shown = appearances(
+    { draws: canvasDraws(result, marks.played) },
+    outputs(pictures),
+    refreshMs,
+  );
+  assert.equal(shown[0].time, pictures[next].timestamp, label);
+  assert.equal(
+    BASE_MS + shown[0].refresh * refreshMs,
+    marks.started,
+    `${label}: the first field went up at another refresh than the sound's`,
+  );
+  checkTiming(label, shown, media, refreshMs, {
+    from: marks.started,
+    toleranceMs: 2,
+  });
+  const before = result.stats.findLast(
+    (snapshot) => snapshot.t < marks.paused,
+  ) ?? { missed: 0, late: 0 };
+  assert.equal(stats.late - before.late, 0, `${label}: fields late`);
+  assert.equal(stats.missed - before.missed, 0, `${label}: pictures missed`);
+  console.log(`ok ${label}: the paused field, then the next, none passed over`);
 }
 
 // An element that publishes its position in steps, as Firefox does every

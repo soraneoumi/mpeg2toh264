@@ -286,8 +286,6 @@ interface DecodedOutput {
    * the picture after it is due, or its own end where no successor is known.
    */
   end: number;
-  /** Whether it is the first output of that picture, which is what a paused element shows. */
-  start: boolean;
   scan: Scan;
 }
 
@@ -872,12 +870,6 @@ export class Deinterlacer extends EventTarget {
   readonly #decodedQueue: DecodedOutput[] = [];
   /** The decoded output on the canvas. */
   #shownOutput: DecodedOutput | null = null;
-  /**
-   * The first outputs of the last two pictures shown, whose slots are kept:
-   * a pause can land in the picture before the one the canvas has gone on to.
-   */
-  #shownStart: DecodedOutput | null = null;
-  #previousStart: DecodedOutput | null = null;
   /** The media time of the output on the canvas; nothing older goes up after it. */
   #shownTime = Number.NEGATIVE_INFINITY;
   /**
@@ -2467,8 +2459,6 @@ export class Deinterlacer extends EventTarget {
     this.#awaitingFlushed = false;
     this.#frames = 0;
     this.#dropQueue();
-    this.#shownStart = null;
-    this.#previousStart = null;
     this.#shownTime = Number.NEGATIVE_INFINITY;
     this.#counting = false;
     this.#startLine = null;
@@ -2780,8 +2770,6 @@ export class Deinterlacer extends EventTarget {
     const presented = this.#presentedPicture;
     if (presented?.kind === "texture" && presented.texture === output.texture)
       return false;
-    if (this.#shownStart?.slot === slot || this.#previousStart?.slot === slot)
-      return false;
     for (const entry of this.#decodedQueue)
       if (entry.slot === slot) return false;
     return true;
@@ -2939,7 +2927,6 @@ export class Deinterlacer extends EventTarget {
       time: picture.timestamp,
       picture: picture.timestamp,
       end: picture.timestamp + picture.duration,
-      start: true,
       scan: decodedScan(picture),
     });
   }
@@ -2980,7 +2967,6 @@ export class Deinterlacer extends EventTarget {
           next,
           picture.timestamp,
           end,
-          true,
           false,
           null,
           flush,
@@ -2996,7 +2982,6 @@ export class Deinterlacer extends EventTarget {
           next,
           picture.timestamp,
           end,
-          true,
           false,
           null,
           flush,
@@ -3018,7 +3003,6 @@ export class Deinterlacer extends EventTarget {
           next,
           picture.timestamp,
           end,
-          field === 0,
           field === 1,
           field === 2 ? first : null,
           flush,
@@ -3046,7 +3030,6 @@ export class Deinterlacer extends EventTarget {
     pictureUntil: number,
     picture: number,
     pictureEnd: number,
-    start: boolean,
     second: boolean,
     slot: number | null,
     flush: boolean,
@@ -3075,7 +3058,6 @@ export class Deinterlacer extends EventTarget {
       end: Number.isFinite(pictureUntil)
         ? Math.max(until, pictureUntil)
         : pictureEnd,
-      start,
       scan,
     });
     return slot;
@@ -3088,7 +3070,7 @@ export class Deinterlacer extends EventTarget {
    * keep up with, or after it was due. Refreshes are predicted from `time`,
    * the media time of the coming one, with a margin for the hysteresis.
    * While the clock stands still every output of a current picture is kept,
-   * since a paused element shows its picture's first field.
+   * since the one due at a paused position can be any of them.
    */
   #useful(
     at: number,
@@ -3113,7 +3095,15 @@ export class Deinterlacer extends EventTarget {
    * is within the hysteresis of `time`, the refresh advances by as many
    * outputs as the last one did if it can, so that the one slip a field rate
    * the refresh does not divide into must make happens once rather than
-   * flapping. Paused, it is the first output of the picture `time` falls in.
+   * flapping.
+   *
+   * Paused, it is the same: the output due at the paused position, which is
+   * where play resumes from, so that the outputs after it follow on. (The
+   * first output of the picture the position falls in instead would step
+   * the picture back a field at a pause in the second, and pass that field
+   * over when play resumes.) Where nothing newer than the output up is due,
+   * that output stays, and outputs passed over are no lateness: a seek
+   * while paused jumps over them.
    */
   #showDecoded(time: number, rate: number, paused: boolean): void {
     const queue = this.#decodedQueue;
@@ -3122,32 +3112,25 @@ export class Deinterlacer extends EventTarget {
     let behind = 0;
     while (behind < queue.length && !this.#wasDue(queue[behind]!.end)) behind++;
     if (behind > 0) queue.splice(0, behind);
-    let index = -1;
-    if (paused) {
-      for (let i = 0; i < queue.length && queue[i]!.picture <= time; i++)
-        if (queue[i]!.start) index = i;
-      if (index < 0) {
-        // The picture is one already shown.
-        const current = this.#shownStart;
-        const previous = this.#previousStart;
-        let start =
-          current !== null && current.picture <= time ? current : null;
-        if (
-          previous !== null &&
-          previous.picture <= time &&
-          (start === null || previous.picture > start.picture)
-        )
-          start = previous;
-        if (start !== null && start !== this.#shownOutput)
-          this.#showOutput(start);
-        return;
-      }
-    } else {
-      this.#showDue(queue, time, rate);
-      return;
-    }
-    const entry = queue[index]!;
-    queue.splice(0, index + 1);
+    // Outputs already shown in an earlier version, filtered against
+    // themselves while their successor was late.
+    let replaced = 0;
+    while (replaced < queue.length && queue[replaced]!.time <= this.#shownTime)
+      replaced++;
+    if (replaced > 0) queue.splice(0, replaced);
+    // Pictures are timed to a 90 kHz tick, so one due exactly at a refresh
+    // may be a hair either side of the count.
+    const tolerance = TIMESTAMP_TOLERANCE * (paused ? 1 : rate);
+    let due = -1;
+    for (let i = 0; i < queue.length && queue[i]!.time <= time + tolerance; i++)
+      due = i;
+    if (due < 0) return;
+    // Each output passed over while playing was due until the one after it.
+    if (!paused)
+      for (let i = 0; i < due; i++)
+        if (this.#countable(queue[i + 1]!.time)) this.#stats.late++;
+    const entry = queue[due]!;
+    queue.splice(0, due + 1);
     this.#showOutput(entry);
   }
 
@@ -3211,32 +3194,6 @@ export class Deinterlacer extends EventTarget {
   }
 
   /**
-   * Show the newest decoded output due by `time` while playing; see
-   * `#countRefresh` for what that time is.
-   */
-  #showDue(queue: DecodedOutput[], time: number, rate: number): void {
-    // Outputs already shown in an earlier version, filtered against
-    // themselves while their successor was late.
-    let replaced = 0;
-    while (replaced < queue.length && queue[replaced]!.time <= this.#shownTime)
-      replaced++;
-    if (replaced > 0) queue.splice(0, replaced);
-    // Pictures are timed to a 90 kHz tick, so one due exactly at a refresh
-    // may be a hair either side of the count.
-    const tolerance = TIMESTAMP_TOLERANCE * rate;
-    let due = -1;
-    for (let i = 0; i < queue.length && queue[i]!.time <= time + tolerance; i++)
-      due = i;
-    if (due < 0) return;
-    // Each output passed over was due until the one after it.
-    for (let i = 0; i < due; i++)
-      if (this.#countable(queue[i + 1]!.time)) this.#stats.late++;
-    const entry = queue[due]!;
-    queue.splice(0, due + 1);
-    this.#showOutput(entry);
-  }
-
-  /**
    * Media seconds the count of `#countRefresh` moves by a refresh at speed
    * `rate`: whole picture steps where the screen is close enough to them,
    * else the refresh itself.
@@ -3273,11 +3230,6 @@ export class Deinterlacer extends EventTarget {
     this.#showFramesSinceReport++;
     this.#shownOutput = entry;
     this.#shownTime = entry.time;
-    if (entry === this.#shownStart || entry === this.#previousStart) return;
-    if (entry.start || this.#shownStart?.picture !== entry.picture) {
-      this.#previousStart = this.#shownStart;
-      this.#shownStart = entry.start ? entry : null;
-    }
   }
 
   /** Take one input into the shared history and decide its YADIF or IVTC presentation. */
@@ -4619,8 +4571,6 @@ export class Deinterlacer extends EventTarget {
     if (this.#outputs.some((output) => output.texture === shownTexture))
       this.#presentedPicture = null;
     this.#shownOutput = null;
-    this.#shownStart = null;
-    this.#previousStart = null;
     for (const { texture, framebuffer } of this.#outputs) {
       gl.deleteFramebuffer(framebuffer);
       gl.deleteTexture(texture);
