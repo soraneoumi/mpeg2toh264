@@ -100,11 +100,17 @@ export interface PlayerDecodedVideo {
   avDifference(): number;
   /** Playback starts: media time `media` is heard at `wall`; see `DecodedVideoInput.startsAt`. */
   startsAt(media: number, wall: number): void;
-  /** Whether pictures can be put up on time; see `DecodedVideoInput.prepared`. */
-  prepared(): boolean;
-  /** Called when `prepared()` may have become true. */
-  onprepared: (() => void) | null;
+  /** Where the renderer stands; see `DecodedVideoInput.rendererStatus`. */
+  rendererStatus(): PlayerRendererStatus;
+  /** Called when `rendererStatus()` may have changed. */
+  onrendererstatus: (() => void) | null;
 }
+
+/** Where a deinterlacer's renderer stands; see `RendererStatus` in the yadif package. */
+export type PlayerRendererStatus =
+  | { state: "preparing" }
+  | { state: "prepared" }
+  | { state: "failed"; reason: string };
 
 /**
  * The element events after which decoded pictures are asked for at once,
@@ -696,6 +702,12 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.#duration = null;
     this.#placingAt = null;
     this.#startHold = 0;
+    // A renderer that failed stays failed; this load gets a new one.
+    if (this.#deinterlacer?.decodedVideo?.rendererStatus().state === "failed") {
+      this.#deinterlacer.destroy();
+      this.#deinterlacer = null;
+      this.#fedPictures = false;
+    }
     // Nothing is known about this source yet, so it gets whatever was asked
     // for until its first fragment says what it is.
     this.#clearVideoTimeline();
@@ -765,8 +777,8 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.#startPlayhead();
     if (this.#decoding && decodedVideo) {
       decodedVideo.onrelease = this.#recycle;
-      decodedVideo.onprepared = () => {
-        if (id === this.#generation) this.#startIfReady();
+      decodedVideo.onrendererstatus = () => {
+        if (id === this.#generation) this.#onRendererStatus(decodedVideo);
       };
       try {
         this.#openSound(id);
@@ -777,6 +789,11 @@ export class Mpeg2TsPlayer extends EventTarget {
         });
         return promise;
       }
+      // The renderer may have failed already, in starting for this load;
+      // that is raised once `load` has returned, as every other failure is.
+      queueMicrotask(() => {
+        if (id === this.#generation) this.#onRendererStatus(decodedVideo);
+      });
       this.#newEpoch();
       this.#beginSoundEpoch(0);
       const port = this.#sound!.workerPort;
@@ -898,12 +915,25 @@ export class Mpeg2TsPlayer extends EventTarget {
       !takeover ||
       !this.#soundReady ||
       !this.#pictureReady ||
-      !this.#deinterlacer!.decodedVideo!.prepared()
+      this.#deinterlacer!.decodedVideo!.rendererStatus().state !== "prepared"
     )
       return;
     takeover.seeked();
     takeover.setReadyState(Ready.EnoughData);
     if (!takeover.paused) this.#play();
+  }
+
+  /**
+   * The renderer is prepared, which a start waits for, or has failed, which
+   * ends the load: decoded pictures have nothing else to be shown with.
+   */
+  #onRendererStatus(decodedVideo: PlayerDecodedVideo): void {
+    const status = decodedVideo.rendererStatus();
+    if (status.state === "failed")
+      this.#fail(
+        new Error(`the decoded pictures cannot be shown: ${status.reason}`),
+      );
+    else this.#startIfReady();
   }
 
   /**

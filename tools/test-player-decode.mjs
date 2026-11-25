@@ -76,8 +76,8 @@ function fakeDeinterlacer(withDecodedVideo) {
     scan: null,
     enabled: false,
     videoTimeline: [],
-    /** Whether its renderer can put pictures up on time. */
-    isPrepared: true,
+    /** Where its renderer stands: what `rendererStatus()` answers. */
+    status: { state: "prepared" },
     decodedVideo: withDecodedVideo
       ? {
           onrelease: null,
@@ -86,8 +86,8 @@ function fakeDeinterlacer(withDecodedVideo) {
           finish: () => calls.push("finish"),
           avDifference: () => Number.NaN,
           startsAt: (media) => calls.push(["startsAt", media]),
-          prepared: () => deinterlacer.isPrepared,
-          onprepared: null,
+          rendererStatus: () => deinterlacer.status,
+          onrendererstatus: null,
         }
       : null,
     destroy: () => calls.push("destroy"),
@@ -314,7 +314,7 @@ try {
       mediaSource: "worker",
       deinterlacer: () => {
         deinterlacer = fakeDeinterlacer(true);
-        deinterlacer.isPrepared = false;
+        deinterlacer.status = { state: "preparing" };
         return deinterlacer;
       },
     });
@@ -422,8 +422,8 @@ try {
     assert.deepEqual(await takeEvents(), []);
 
     // Prepared: ready to play, but nobody asked.
-    deinterlacer.isPrepared = true;
-    deinterlacer.decodedVideo.onprepared();
+    deinterlacer.status = { state: "prepared" };
+    deinterlacer.decodedVideo.onrendererstatus();
     assert.equal(video.readyState, 4);
     assert.deepEqual(await takeEvents(), ["canplay"]);
     assert.equal(node.port.take("play").length, 0, "paused");
@@ -758,6 +758,71 @@ try {
     // Nothing was handed to the new one, so it stays for the load after.
     void player.load("https://example.invalid/f.ts").catch(() => {});
     assert.equal(made.length, 2);
+    player.destroy();
+  }
+
+  // A renderer that fails for good ends the load, whose pictures have nothing
+  // else to be shown with, and the next load gets a new one. One that has
+  // failed by the time a load starts fails that load, once `load` returns.
+  {
+    const made = [];
+    const player = new Mpeg2TsPlayer(new FakeVideo(), {
+      mediaSource: "worker",
+      deinterlacer: () => {
+        made.push(fakeDeinterlacer(true));
+        return made.at(-1);
+      },
+    });
+    const errors = [];
+    player.addEventListener("error", (event) =>
+      errors.push(event.detail.error),
+    );
+    const loaded = player.load("https://example.invalid/g.ts");
+    const worker = FakeWorker.last;
+    const [first] = worker.take("load");
+    worker.send({ type: "opened", id: first.id });
+    await loaded;
+    assert.equal(player.state, "converting");
+    made[0].status = { state: "failed", reason: "the context was lost" };
+    made[0].decodedVideo.onrendererstatus();
+    assert.equal(player.state, "error");
+    assert.equal(errors.length, 1);
+    assert.equal(
+      errors[0].message,
+      "the decoded pictures cannot be shown: the context was lost",
+    );
+
+    const again = player.load("https://example.invalid/h.ts");
+    assert.equal(made.length, 2, "a new renderer for the next load");
+    assert.ok(made[0].calls.includes("destroy"));
+    const [second] = worker.take("load");
+    assert.equal(second.video, "decode");
+    worker.send({ type: "opened", id: second.id });
+    await again;
+    assert.equal(player.state, "converting");
+    assert.equal(errors.length, 1);
+    player.destroy();
+  }
+  {
+    const player = new Mpeg2TsPlayer(new FakeVideo(), {
+      mediaSource: "worker",
+      deinterlacer: () => {
+        const deinterlacer = fakeDeinterlacer(true);
+        deinterlacer.status = { state: "failed", reason: "no Worker here" };
+        return deinterlacer;
+      },
+    });
+    const errors = [];
+    player.addEventListener("error", (event) =>
+      errors.push(event.detail.error),
+    );
+    const loading = player.load("https://example.invalid/i.ts");
+    assert.equal(errors.length, 0, "raised once `load` has returned");
+    await assert.rejects(loading, {
+      message: "the decoded pictures cannot be shown: no Worker here",
+    });
+    assert.equal(errors.length, 1);
+    assert.equal(player.state, "error");
     player.destroy();
   }
 

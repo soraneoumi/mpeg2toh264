@@ -3420,3 +3420,59 @@ for (const rendering of ["main", "worker"]) {
   }
   console.log(`ok page stall, ${rendering}: ${stats.missed} pictures dropped`);
 }
+
+// A Worker renderer that cannot take a picture in says so, rather than going
+// quiet: the page tries one new Worker, and when that one cannot either, the
+// renderer has failed for good, which the producer is told. Every buffer
+// still comes back once.
+{
+  const pictures = stream({ count: 120 });
+  const producer = new Producer(pictures);
+  const media = playing();
+  const statuses = [];
+  let input = null;
+  const result = await run(bundles, {
+    rendering: "worker",
+    vsyncs: 120,
+    arrival: () => false,
+    pictureTime: (buffer) => producer.stamp(buffer)[0],
+    deinterlacerOptions: { doubleRate: true },
+    // No framebuffer in the Worker takes a picture.
+    resourceAvailable: (resource) => resource.realm !== "worker",
+    beforeVsync(vsync, control) {
+      if (vsync === 0) {
+        Object.defineProperty(control.video, "currentTime", {
+          configurable: true,
+          get: () => media.reading(control.now()),
+          set: () => {},
+        });
+        control.video.paused = false;
+        input = control.pageContext.__deinterlacer.decodedVideo;
+        producer.attach(input);
+        input.onrendererstatus = () => statuses.push(input.rendererStatus());
+      }
+      if (!control.video.seeking)
+        producer.supply(control.video.currentTime, control.video.playbackRate);
+    },
+  });
+  const workers = result.commands.filter(
+    (command) => command.type === "initialize",
+  );
+  assert.equal(workers.length, 2, "one new Worker after the first failure");
+  const status = input.rendererStatus();
+  assert.equal(status.state, "failed");
+  assert.match(status.reason, /^deinterlacer worker stopped: /);
+  assert.deepEqual(statuses.at(-1), status);
+  assert.deepEqual(
+    result.failures.map((failure) => failure.message),
+    [status.reason],
+  );
+  assert.ok(producer.pushed > 0);
+  result.pageContext.__deinterlacer.destroy();
+  assert.equal(
+    producer.outstanding.size,
+    0,
+    `${producer.outstanding.size} buffers never came back`,
+  );
+  console.log(`ok worker that cannot take a picture in: ${status.reason}`);
+}

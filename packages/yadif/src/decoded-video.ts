@@ -77,15 +77,31 @@ export interface DecodedVideoInput {
    */
   startsAt(media: number, wall: number): void;
   /**
-   * Whether the renderer can put a picture up in the refresh it is due in:
-   * the GPU has run its setup, the first draw of every program it draws with
-   * included (see `drawOnce`). A start waits for it; pictures can be pushed
-   * before.
+   * Where the renderer stands. A start waits for `prepared`; pictures can be
+   * pushed before. Decoded pictures have no picture of the element's to fall
+   * back on, so at `failed` the producer has nothing to show them with.
    */
-  prepared(): boolean;
-  /** Set by the producer. Called when `prepared()` may have become true. */
-  onprepared: (() => void) | null;
+  rendererStatus(): RendererStatus;
+  /** Set by the producer. Called when `rendererStatus()` may have changed. */
+  onrendererstatus: (() => void) | null;
 }
+
+/** Where the renderer of decoded pictures stands; see `DecodedVideoInput.rendererStatus`. */
+export type RendererStatus =
+  /**
+   * The GPU has not yet run the renderer's setup, the first draw of every
+   * program it draws with included (see `drawOnce`): a picture could miss
+   * the refresh it is due in.
+   */
+  | { state: "preparing" }
+  /** Pictures go up in the refresh they are due in. */
+  | { state: "prepared" }
+  /**
+   * It has stopped for good: a lost WebGL context, a Worker that died again
+   * after its restart, Worker rendering asked for where there is none, or a
+   * picture it could not take in. Nothing pushed is shown any more.
+   */
+  | { state: "failed"; reason: string };
 
 function positiveInteger(value: number): boolean {
   return Number.isInteger(value) && value > 0;

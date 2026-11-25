@@ -30,6 +30,7 @@ export type {
   PlayerDecodedVideo,
   PlayerDeinterlacer,
   PlayerDeinterlacerFactory,
+  PlayerRendererStatus,
 } from "./player.js";
 export {
   DEFAULT_KEEP_BEHIND_SECONDS,

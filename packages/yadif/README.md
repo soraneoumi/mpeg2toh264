@@ -100,7 +100,8 @@ deinterlacer.enabled = true;
 この間も WebGL コンテキストが健全で `doubleRate` が有効なら、フィールドごとのデインターレースを継続します。
 
 `start()` 、`scan` の変化、映像サイズの変化、明示的な `film = true` の再設定で復旧を試み、再び失敗した場合は通知します。  
-WebGL コンテキスト喪失や Worker 再起動後の再失敗は、元の動画要素の表示への切り替え、または描画停止を伴います。
+WebGL コンテキスト喪失、Worker 再起動後の再失敗、Worker が使えない環境での `rendering: "worker"` 指定、デコード済み画像を取り込めない場合は、描画を停止して元の動画要素の表示に戻し、同じ理由を通知します。この Deinterlacer は以後 `start()` でも再開しないため、続けて表示するには新しく作り直します。  
+デコード済みの画像を渡している場合は、元の動画要素に表示できる画像がないため、`decodedVideo.rendererStatus()` が `failed` になり、`onrendererstatus` で知らされます。`rendererStatus()` は GPU の初期化が終わるまで `preparing`、その後は `prepared` を返し、再生の開始はこれを待ちます。
 
 ### `capture()` と統計イベント
 

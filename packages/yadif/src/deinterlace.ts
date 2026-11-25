@@ -510,7 +510,9 @@ export interface DeinterlacerOptions {
   film?: boolean;
   /**
    * Called when a rendering resource fails after construction: a GPU film detector that throws mid-stream,
-   * a Worker that died twice, or a lost WebGL context.
+   * which leaves plain YADIF running, or the renderer itself -- a Worker that died again after its restart,
+   * Worker rendering asked for where there is none, a lost WebGL context, a decoded picture it could not
+   * take in -- which stops it for good (see `DecodedVideoInput.rendererStatus`).
    * The same message is dispatched as a `failure` event.
    * This option lets callers install the handler alongside `onStats`.
    */
@@ -752,6 +754,8 @@ export class Deinterlacer extends EventTarget {
   #scan: Scan | null = null;
   #videoTimeline: readonly VideoState[] = [];
   #lost = false;
+  /** Why the renderer stopped for good, or null; see `#rendererFailed`. */
+  #failure: string | null = null;
   readonly #onStats: ((stats: DeinterlaceStats) => void) | undefined;
   readonly #onFailure: ((message: string) => void) | undefined;
   readonly #externalHost: ExternalRenderingHost | null;
@@ -1055,13 +1059,18 @@ export class Deinterlacer extends EventTarget {
         }
         this.#startLine = { media, wall };
       },
-      // The renderer is the Worker once it has said it is ready, which it
-      // does when its own setup is through, and this context otherwise.
-      prepared: () =>
-        this.#workerState === "main"
-          ? this.#gpuPrepared
-          : this.#workerState === "active",
-      onprepared: null,
+      rendererStatus: () => {
+        if (this.#failure !== null)
+          return { state: "failed", reason: this.#failure };
+        // The renderer is the Worker once it has said it is ready, which it
+        // does when its own setup is through, and this context otherwise.
+        const prepared =
+          this.#workerState === "main"
+            ? this.#gpuPrepared
+            : this.#workerState === "active";
+        return { state: prepared ? "prepared" : "preparing" };
+      },
+      onrendererstatus: null,
     };
     // The watch shares this GL context, so it works only while pictures are
     // drawn here. A Worker renderer is sent frames, not textures.
@@ -1323,7 +1332,8 @@ export class Deinterlacer extends EventTarget {
    * Note when the GPU has run the setup issued so far, every program's first
    * draw included (see `drawOnce`). The draws only queue the work, and how
    * long it takes shows nowhere but here; until then a picture can miss the
-   * refresh it is due in, which is why a start waits for `prepared()`.
+   * refresh it is due in, which is why a start waits for `rendererStatus()`
+   * to say so.
    */
   #watchPrepared(): void {
     const gl = this.#gl;
@@ -1339,9 +1349,30 @@ export class Deinterlacer extends EventTarget {
       }
       gl.deleteSync(fence);
       this.#gpuPrepared = true;
-      if (this.#workerState === "main") this.decodedVideo.onprepared?.();
+      if (this.#workerState === "main") this.decodedVideo.onrendererstatus?.();
     };
     timers.setTimeout(poll, PREPARED_POLL_MS);
+  }
+
+  /**
+   * Stop for good, for `reason`: the renderer cannot go on. The element's
+   * own picture shows again, and decoded pictures, which have none to fall
+   * back on, are left to their producer through `rendererStatus()`; nothing
+   * starts this renderer again (see `start()`), and its owner makes a new
+   * one if it wants another. A renderer in a Worker reports to the page
+   * instead, which tries one new Worker before it gives up.
+   */
+  #rendererFailed(reason: string): void {
+    // First, so that nothing a listener does starts it again.
+    this.#failure = reason;
+    if (this.#externalHost) {
+      this.#externalHost.onFailure(reason);
+      this.stop();
+      return;
+    }
+    this.#notifyFailure(reason);
+    this.stop();
+    this.decodedVideo.onrendererstatus?.();
   }
 
   /** Build the GPU pulldown detector the `film` option needs, or throw. */
@@ -1382,7 +1413,9 @@ export class Deinterlacer extends EventTarget {
         return false;
       }
       this.#workerState = "failed";
-      this.#running = false;
+      this.#rendererFailed(
+        "rendering in a Worker needs Worker, VideoFrame, OffscreenCanvas transfer and a worker URL, and this page lacks one",
+      );
       return true;
     }
     this.#startWorker();
@@ -1416,6 +1449,7 @@ export class Deinterlacer extends EventTarget {
 
     const generation = ++this.#workerGeneration;
     this.#workerState = "starting";
+    this.decodedVideo.onrendererstatus?.();
     let worker: Worker;
     let offscreen: OffscreenCanvas;
     try {
@@ -1465,7 +1499,7 @@ export class Deinterlacer extends EventTarget {
     switch (notification.type) {
       case "ready":
         this.#workerState = "active";
-        this.decodedVideo.onprepared?.();
+        this.decodedVideo.onrendererstatus?.();
         if (this.#running) {
           this.#request();
           this.#startCaptureLoop();
@@ -1620,8 +1654,7 @@ export class Deinterlacer extends EventTarget {
     this.#worker = null;
     this.#closePendingWorkerFrame();
     this.#releaseSentPictures();
-    this.#notifyFailure(`deinterlacer worker stopped: ${message}`);
-    this.stop();
+    this.#rendererFailed(`deinterlacer worker stopped: ${message}`);
   }
 
   /** Restore the main-thread canvas when automatic Worker selection fails. */
@@ -1642,7 +1675,7 @@ export class Deinterlacer extends EventTarget {
     this.#closePendingWorkerFrame();
     this.#releaseSentPictures();
     // This context is the renderer now, with whatever it has prepared.
-    this.decodedVideo.onprepared?.();
+    this.decodedVideo.onrendererstatus?.();
     if (this.#running) {
       this.#request();
       this.#startCaptureLoop();
@@ -1664,7 +1697,7 @@ export class Deinterlacer extends EventTarget {
   }
 
   start(): void {
-    if (this.#running || this.#destroyed || this.#lost) return;
+    if (this.#running || this.#destroyed || this.#failure !== null) return;
     this.#playbackRevision++;
     this.#running = true;
     this.#resetStats();
@@ -2828,10 +2861,9 @@ export class Deinterlacer extends EventTarget {
       this.#upload(picture);
     } catch (error) {
       this.#endGpuTimer(q);
-      this.#notifyFailure(
+      this.#rendererFailed(
         error instanceof Error ? error.message : String(error),
       );
-      this.stop();
       return;
     } finally {
       this.#release(picture.data);
@@ -4824,14 +4856,10 @@ export class Deinterlacer extends EventTarget {
    */
   #onContextLost = (event: Event): void => {
     event.preventDefault();
-    if (this.#externalHost) {
-      this.#externalHost.onFailure("the deinterlacer WebGL context was lost");
-      return;
-    }
-    if (this.#workerState === "active") return;
+    // The page's context is not the one drawing while a Worker is.
+    if (!this.#externalHost && this.#workerState === "active") return;
     this.#lost = true;
-    this.#notifyFailure("the deinterlacer WebGL context was lost");
-    this.stop();
+    this.#rendererFailed("the deinterlacer WebGL context was lost");
   };
 }
 
