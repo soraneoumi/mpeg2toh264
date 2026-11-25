@@ -172,6 +172,44 @@ try {
     assert.ok(held.worst < 0.0005, "75 Hz: no lead left");
     assert.ok(Math.abs(held.adjust - 1) < 0.002, "75 Hz: no rate match");
   }
+  // The refresh period: refreshes the page missed count as the periods they
+  // were, and a display that changes its rate is followed once the window
+  // holds refreshes of the new rate, in under two seconds at 144 Hz.
+  {
+    const lock = new DisplayLock(() => {});
+    let now = 1000;
+    const frame = () =>
+      lock.frame({
+        now,
+        step: null,
+        rate: 1,
+        active: false,
+        avDifference: Number.NaN,
+      });
+    for (let index = 0; index < 600; index++) {
+      // Every seventh refresh missed, one in fifty missed twice over.
+      now += (1000 / 59.94) * (index % 50 === 0 ? 3 : index % 7 === 0 ? 2 : 1);
+      frame();
+    }
+    assert.ok(
+      Math.abs(lock.period - 1000 / 59.94) < 0.01,
+      `missed refreshes: ${lock.period}`,
+    );
+    const next = lock.refreshAfter(now + 20);
+    assert.ok(
+      Math.abs(next - (now + (2 * 1000) / 59.94)) < 0.05,
+      `the refresh after: ${next - now}`,
+    );
+    for (let index = 0; index < 288; index++) {
+      now += 1000 / 144;
+      frame();
+    }
+    assert.ok(
+      Math.abs(lock.period - 1000 / 144) < 0.01,
+      `a display at 144 Hz after two seconds: ${lock.period}`,
+    );
+    console.log(`refresh period: ${lock.period.toFixed(4)} ms at 144 Hz`);
+  }
   console.log("display lock tests passed");
 } finally {
   await unlink(output).catch(() => {});

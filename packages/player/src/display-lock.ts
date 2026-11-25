@@ -49,6 +49,13 @@ const MAX_CORRECTION = 0.002;
 const MAX_ADJUST = MAX_DEVIATION + MAX_CORRECTION + MAX_DRIFT;
 /** Refreshes the refresh period is averaged over. */
 const PERIOD_WINDOW = 240;
+/** Refreshes seen before the period is first measured. */
+const PERIOD_FIRST = 30;
+/**
+ * Refreshes after which the period is measured again: it changes only with
+ * the display, and a measurement sorts the window's gaps.
+ */
+const PERIOD_REMEASURE = 30;
 /** How often a new speed goes to the worklet, at most, in ms. */
 const SEND_INTERVAL_MS = 250;
 /** The smallest change of speed worth sending. */
@@ -69,8 +76,14 @@ export interface DisplayLockInput {
 
 export class DisplayLock {
   readonly #send: (adjust: number) => void;
-  /** Recent refresh times, to average the period over. */
-  readonly #frames: number[] = [];
+  /** Recent refresh times, a ring from `#oldest`, to average the period over. */
+  readonly #times = new Float64Array(PERIOD_WINDOW);
+  #oldest = 0;
+  #count = 0;
+  /** The gaps between them, sorted for their median where measured. */
+  readonly #gaps = new Float64Array(PERIOD_WINDOW - 1);
+  #period = Number.NaN;
+  #sinceMeasured = 0;
   #adjust = 1;
   #sentAt = Number.NEGATIVE_INFINITY;
   /** How much faster than asked the sound plays at adjust 1, as learnt from the lead. */
@@ -94,17 +107,7 @@ export class DisplayLock {
 
   /** The refresh period, in ms, or NaN until enough refreshes were seen. */
   get period(): number {
-    const frames = this.#frames;
-    if (frames.length < 30) return Number.NaN;
-    // Refreshes the page missed leave gaps of whole periods: count them as
-    // the periods they were.
-    const span = frames.at(-1)! - frames[0]!;
-    const deltas = frames.slice(1).map((time, index) => time - frames[index]!);
-    const median = [...deltas].sort((a, b) => a - b)[deltas.length >> 1]!;
-    let periods = 0;
-    for (const delta of deltas)
-      periods += Math.max(1, Math.round(delta / median));
-    return span / periods;
+    return this.#period;
   }
 
   /**
@@ -112,18 +115,17 @@ export class DisplayLock {
    * animation frame's time; NaN while the period is not known.
    */
   refreshAfter(wall: number): number {
-    const period = this.period;
-    const last = this.#frames.at(-1);
-    if (Number.isNaN(period) || last === undefined) return Number.NaN;
+    const period = this.#period;
+    if (Number.isNaN(period)) return Number.NaN;
+    const last = this.#time(this.#count - 1);
     return last + Math.max(0, Math.ceil((wall - last) / period)) * period;
   }
 
   /** Take one animation frame. */
   frame(input: DisplayLockInput): void {
     const { now, rate, step } = input;
-    this.#frames.push(now);
-    if (this.#frames.length > PERIOD_WINDOW) this.#frames.shift();
-    const period = this.period;
+    this.#record(now);
+    const period = this.#period;
     if (step === null || Number.isNaN(period)) {
       this.#offer(now, 1);
       return;
@@ -158,6 +160,48 @@ export class DisplayLock {
       Math.max(1 - MAX_ADJUST, match * (1 - correction - this.#drift)),
     );
     this.#offer(now, adjust);
+  }
+
+  /** Add a refresh time, and measure the period where it is due. */
+  #record(now: number): void {
+    if (this.#count < PERIOD_WINDOW) {
+      this.#times[(this.#oldest + this.#count) % PERIOD_WINDOW] = now;
+      this.#count++;
+    } else {
+      this.#times[this.#oldest] = now;
+      this.#oldest = (this.#oldest + 1) % PERIOD_WINDOW;
+    }
+    this.#sinceMeasured++;
+    if (
+      this.#count >= PERIOD_FIRST &&
+      (Number.isNaN(this.#period) || this.#sinceMeasured >= PERIOD_REMEASURE)
+    )
+      this.#measure();
+  }
+
+  /** The `index`th refresh time held, oldest first. */
+  #time(index: number): number {
+    return this.#times[(this.#oldest + index) % PERIOD_WINDOW]!;
+  }
+
+  /**
+   * The span of the refreshes held over the refreshes it took. Refreshes the
+   * page missed leave gaps of whole periods, counted as the periods they
+   * were against the median gap.
+   */
+  #measure(): void {
+    const count = this.#count - 1;
+    const gaps =
+      count === this.#gaps.length ? this.#gaps : this.#gaps.subarray(0, count);
+    for (let index = 0; index < count; index++)
+      gaps[index] = this.#time(index + 1) - this.#time(index);
+    gaps.sort();
+    const median = gaps[count >> 1]!;
+    let periods = 0;
+    for (let index = 0; index < count; index++)
+      periods += Math.max(1, Math.round(gaps[index]! / median));
+    this.#period = (this.#time(count) - this.#time(0)) / periods;
+    this.#sinceMeasured = 0;
   }
 
   #offer(now: number, adjust: number): void {
