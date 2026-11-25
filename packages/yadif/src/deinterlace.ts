@@ -2720,9 +2720,16 @@ export class Deinterlacer extends EventTarget {
     for (;;) {
       const next = this.#pending[0];
       if (next === undefined) break;
-      // A picture is filtered when its successor is taken in, which is one
-      // picture ahead of its own time.
-      if (next.timestamp > time + lookahead + next.duration) break;
+      // A picture is filtered when its successor is taken in, so that is
+      // taken in when the picture waiting for it comes within the lookahead
+      // -- by that picture's own time, for a picture lasts as long as it
+      // does: one the decoder lengthened over pictures it could not make, or
+      // a repeated first field. With none waiting, a picture's time ahead of
+      // its own.
+      const waiting = this.#awaiting
+        ? this.#held[this.#head]!.timestamp
+        : next.timestamp - next.duration;
+      if (waiting > time + lookahead) break;
       // A picture of a new size starts with a new set of outputs.
       if (
         (next.width === this.#width && next.height === this.#height

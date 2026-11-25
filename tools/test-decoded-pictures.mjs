@@ -2343,21 +2343,24 @@ for (const rendering of ["main", "worker"]) {
 // Announced starts that the pictures do not make easy. After a seek the
 // pictures that follow the one the start falls in may be missing -- the
 // decoder could not make them -- and that one is not held for a successor
-// that comes too late for its fields: it goes up with the sound. And a start
-// that falls just short of a field shows that field, within the tolerance,
-// which passes over the one before it without that being lateness.
+// that comes too late for its fields: it goes up with the sound, whether it
+// ends where they would have begun ("gap") or the decoder lengthened it over
+// them ("long"). And a start that falls just short of a field shows that
+// field, within the tolerance, which passes over the one before it without
+// that being lateness.
 for (const rendering of ["main", "worker"])
-  for (const kind of ["gap", "short"]) {
+  for (const kind of ["gap", "long", "short"]) {
     const pictures = stream({ count: 900 });
-    if (kind === "gap") pictures.splice(600, 2);
+    if (kind !== "short") pictures.splice(600, 2);
+    if (kind === "long") pictures[599].duration = 3 * FRAME;
     const target = pictures[599];
     const seekTo =
-      kind === "gap"
-        ? target.timestamp + FRAME * 0.3
-        : target.timestamp + FRAME / 2 - 0.0025;
+      kind === "short"
+        ? target.timestamp + FRAME / 2 - 0.0025
+        : target.timestamp + FRAME * 0.3;
     // The field the first refresh shows, 2 ms on from where the sound starts.
     const first =
-      kind === "gap" ? target.timestamp : target.timestamp + FRAME / 2;
+      kind === "short" ? target.timestamp + FRAME / 2 : target.timestamp;
     const media = playing();
     const marks = {};
     const steps = timeline(
