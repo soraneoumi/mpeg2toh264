@@ -46,6 +46,7 @@ import {
 } from "./decoded-video.js";
 import { MediaClock } from "./media-clock.js";
 import { PictureWatch } from "./picture-watch.js";
+import { drawOnce } from "./utils.js";
 import {
   FIELD_METRICS,
   FILM_DUPLICATE_PHASE,
@@ -155,6 +156,8 @@ const MAX_DISPLAY_DEVIATION = 0.005;
 const START_TRUST_MS = 250;
 /** Time constant of the average of that difference which `avDifference` reports, in ms. */
 const AV_FILTER_MS = 1000;
+/** How often, in ms, to look whether the GPU has run the setup: about a refresh. */
+const PREPARED_POLL_MS = 16;
 
 /**
  * How far from the moment a frame was taken in hand its reported display time
@@ -838,8 +841,13 @@ export class Deinterlacer extends EventTarget {
   /** Whether finish() was called since the last reset. */
   #finished = false;
   readonly #clock = new MediaClock();
-  /** Built when the first decoded picture arrives. */
-  #converter: PictureConverter | null = null;
+  /**
+   * Made with the rest of the GPU setup, so that the first decoded picture
+   * does not draw with its program first; null once destroyed.
+   */
+  #converter: PictureConverter | null;
+  /** Whether the GPU has run this renderer's setup; see `#watchPrepared`. */
+  #gpuPrepared = false;
   /** The decoded picture in each history slot; the newest is at #head. */
   readonly #held: HeldPicture[] = Array.from({ length: HISTORY }, () => ({
     timestamp: 0,
@@ -993,6 +1001,10 @@ export class Deinterlacer extends EventTarget {
     this.#blit = createProgram(gl, BLIT_FRAGMENT_SHADER);
     this.#blitField = gl.getUniformLocation(this.#blit, "uField");
     this.#blitFlip = gl.getUniformLocation(this.#blit, "uFlip");
+    drawOnce(gl, this.#program, gl.RGBA8);
+    drawOnce(gl, this.#blit, gl.RGBA8);
+    this.#converter = new PictureConverter(gl);
+    this.#watchPrepared();
     this.#timerQueryExtension = gl.getExtension(
       "EXT_disjoint_timer_query_webgl2",
     );
@@ -1043,6 +1055,13 @@ export class Deinterlacer extends EventTarget {
         }
         this.#startLine = { media, wall };
       },
+      // The renderer is the Worker once it has said it is ready, which it
+      // does when its own setup is through, and this context otherwise.
+      prepared: () =>
+        this.#workerState === "main"
+          ? this.#gpuPrepared
+          : this.#workerState === "active",
+      onprepared: null,
     };
     // The watch shares this GL context, so it works only while pictures are
     // drawn here. A Worker renderer is sent frames, not textures.
@@ -1300,6 +1319,31 @@ export class Deinterlacer extends EventTarget {
       throw new Error("film needs EXT_color_buffer_float");
   }
 
+  /**
+   * Note when the GPU has run the setup issued so far, every program's first
+   * draw included (see `drawOnce`). The draws only queue the work, and how
+   * long it takes shows nowhere but here; until then a picture can miss the
+   * refresh it is due in, which is why a start waits for `prepared()`.
+   */
+  #watchPrepared(): void {
+    const gl = this.#gl;
+    const fence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0)!;
+    gl.flush();
+    const timers = this.#timerSource();
+    const poll = (): void => {
+      // A lost context answers WAIT_FAILED, and the loss fails the renderer
+      // by itself.
+      if (gl.clientWaitSync(fence, 0, 0) === gl.TIMEOUT_EXPIRED) {
+        timers.setTimeout(poll, PREPARED_POLL_MS);
+        return;
+      }
+      gl.deleteSync(fence);
+      this.#gpuPrepared = true;
+      if (this.#workerState === "main") this.decodedVideo.onprepared?.();
+    };
+    timers.setTimeout(poll, PREPARED_POLL_MS);
+  }
+
   /** Build the GPU pulldown detector the `film` option needs, or throw. */
   #ensureDetector(): void {
     this.#requireFloatBuffers();
@@ -1421,6 +1465,7 @@ export class Deinterlacer extends EventTarget {
     switch (notification.type) {
       case "ready":
         this.#workerState = "active";
+        this.decodedVideo.onprepared?.();
         if (this.#running) {
           this.#request();
           this.#startCaptureLoop();
@@ -1596,6 +1641,8 @@ export class Deinterlacer extends EventTarget {
     this.#workerState = "main";
     this.#closePendingWorkerFrame();
     this.#releaseSentPictures();
+    // This context is the renderer now, with whatever it has prepared.
+    this.decodedVideo.onprepared?.();
     if (this.#running) {
       this.#request();
       this.#startCaptureLoop();
@@ -2339,7 +2386,6 @@ export class Deinterlacer extends EventTarget {
 
   /** Make pushed pictures the only pictures shown, from now on. */
   #useDecoded(): void {
-    this.#converter = new PictureConverter(this.#gl);
     this.#decoded = true;
     this.#closePendingWorkerFrame();
     this.#videoFrames.cancel();

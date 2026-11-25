@@ -2,7 +2,7 @@
  * Decoded pictures handed to the deinterlacer from outside, and their
  * conversion to the RGB the filter works on.
  */
-import { createProgram, VERTEX_SHADER } from "./utils.js";
+import { createProgram, drawOnce, VERTEX_SHADER } from "./utils.js";
 
 /** One decoded picture. */
 export interface DecodedPicture {
@@ -76,6 +76,15 @@ export interface DecodedVideoInput {
    * `wall` the pictures go on at the rate they had.
    */
   startsAt(media: number, wall: number): void;
+  /**
+   * Whether the renderer can put a picture up in the refresh it is due in:
+   * the GPU has run its setup, the first draw of every program it draws with
+   * included (see `drawOnce`). A start waits for it; pictures can be pushed
+   * before.
+   */
+  prepared(): boolean;
+  /** Set by the producer. Called when `prepared()` may have become true. */
+  onprepared: (() => void) | null;
 }
 
 function positiveInteger(value: number): boolean {
@@ -263,6 +272,7 @@ export class PictureConverter {
     this.#interlaced = gl.getUniformLocation(this.#program, "uInterlaced");
     this.#matrix = gl.getUniformLocation(this.#program, "uMatrix");
     this.#framebuffer = gl.createFramebuffer();
+    drawOnce(gl, this.#program, gl.RGBA8);
   }
 
   /** Allocate the plane textures for pictures of this luma size. */

@@ -593,6 +593,10 @@ export async function run(bundles, options = {}) {
   const clock = new Clock();
   clock.now = BASE_MS;
   const draws = { page: [], worker: [] };
+  // Draws made while a renderer is being built (every program's first, see
+  // drawOnce) rather than for a picture; which realm is building, or null.
+  const setupDraws = { page: [], worker: [] };
+  let settingUp = null;
   const frameCloses = new Map();
   const stats = [];
   const failures = [];
@@ -653,7 +657,7 @@ export async function run(bundles, options = {}) {
       upload?.({ realm, t: clock.now, ...record });
     },
     draw(realm, record) {
-      draws[realm].push(record);
+      (settingUp === realm ? setupDraws : draws)[realm].push(record);
     },
     frameClosed(id, count) {
       frameCloses.set(id, count);
@@ -718,7 +722,9 @@ export async function run(bundles, options = {}) {
         sent.push({ id: data.id, at: clock.now, delay });
       clock.at(clock.now + delay, () => {
         if (!workerAlive) return;
+        if (payload.type === "initialize") settingUp = "worker";
         workerContext.self.onmessage?.({ data: payload });
+        settingUp = null;
       });
     },
     workerToPage(data, transfer) {
@@ -783,9 +789,14 @@ export async function run(bundles, options = {}) {
     onFailure: (message) => failures.push({ t: clock.now, message }),
     ...deinterlacerOptions,
   };
+  settingUp = "page";
   runInContext(
-    `globalThis.__deinterlacer = new Yadif.Deinterlacer(__video, __options);
-     __deinterlacer.scan = { interlaced: true, topFieldFirst: true };
+    "globalThis.__deinterlacer = new Yadif.Deinterlacer(__video, __options);",
+    pageContext,
+  );
+  settingUp = null;
+  runInContext(
+    `__deinterlacer.scan = { interlaced: true, topFieldFirst: true };
      __deinterlacer.enabled = true;`,
     pageContext,
   );
@@ -912,6 +923,7 @@ export async function run(bundles, options = {}) {
   const realm = rendering === "main" ? "page" : "worker";
   return {
     draws: draws[realm],
+    setupDraws: setupDraws[realm],
     stats,
     failures,
     sent,

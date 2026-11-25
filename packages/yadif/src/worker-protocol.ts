@@ -115,6 +115,7 @@ export type WorkerCommand =
   | { type: "destroy" };
 
 export type WorkerNotification =
+  /** The renderer is set up, and the GPU has run that setup. */
   | { type: "ready" }
   | { type: "failed"; message: string }
   | { type: "consumed"; id: number }

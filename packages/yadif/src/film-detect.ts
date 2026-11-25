@@ -20,7 +20,7 @@ import {
   REDUCTION_FRAGMENT_SHADER,
   REDUCTION_UNIFORMS,
 } from "./film-shader.js";
-import { createProgram, VERTEX_SHADER } from "./utils.js";
+import { createProgram, drawOnce, VERTEX_SHADER } from "./utils.js";
 
 /** What the pulldown detection said about a frame. */
 export interface Phase {
@@ -138,6 +138,10 @@ export class FilmDetector {
     this.#metricsLocation = locate(gl, this.#metricsProgram, METRICS_UNIFORMS);
     this.#combProgram = createProgram(gl, COMB_FRAGMENT_SHADER, VERTEX_SHADER);
     this.#combLocation = locate(gl, this.#combProgram, COMB_UNIFORMS);
+    drawOnce(gl, this.#compareProgram, gl.RGBA32F, 2);
+    drawOnce(gl, this.#reductionProgram, gl.RGBA32F, 2);
+    drawOnce(gl, this.#metricsProgram, gl.RGBA32F);
+    drawOnce(gl, this.#combProgram, gl.RGBA32F);
   }
 
   /** The newest measurements, or null before any frame has been measured. */

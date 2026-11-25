@@ -76,6 +76,8 @@ function fakeDeinterlacer(withDecodedVideo) {
     scan: null,
     enabled: false,
     videoTimeline: [],
+    /** Whether its renderer can put pictures up on time. */
+    isPrepared: true,
     decodedVideo: withDecodedVideo
       ? {
           onrelease: null,
@@ -84,6 +86,8 @@ function fakeDeinterlacer(withDecodedVideo) {
           finish: () => calls.push("finish"),
           avDifference: () => Number.NaN,
           startsAt: (media) => calls.push(["startsAt", media]),
+          prepared: () => deinterlacer.isPrepared,
+          onprepared: null,
         }
       : null,
     destroy: () => calls.push("destroy"),
@@ -301,13 +305,18 @@ try {
 
   // Decode mode on the page: the element's media interface is the player's,
   // the sound goes through the AudioWorklet, and playback starts only once
-  // both the sound and the first picture of the epoch are in.
+  // the sound and the first pictures of the epoch are in and the renderer
+  // can put them up.
   {
     const video = new FakeVideo();
     let deinterlacer = null;
     const player = new Mpeg2TsPlayer(video, {
       mediaSource: "worker",
-      deinterlacer: () => (deinterlacer = fakeDeinterlacer(true)),
+      deinterlacer: () => {
+        deinterlacer = fakeDeinterlacer(true);
+        deinterlacer.isPrepared = false;
+        return deinterlacer;
+      },
     });
     const events = [];
     for (const type of [
@@ -407,8 +416,14 @@ try {
     assert.equal(video.readyState, 2);
     assert.deepEqual(await takeEvents(), ["durationchange", "loadeddata"]);
 
-    // The sound buffered as well: ready to play, but nobody asked.
+    // The sound buffered as well, but the renderer is still setting up.
     node.report({ epoch, state: "ready", media: 0 });
+    assert.equal(video.readyState, 2, "the renderer is not prepared");
+    assert.deepEqual(await takeEvents(), []);
+
+    // Prepared: ready to play, but nobody asked.
+    deinterlacer.isPrepared = true;
+    deinterlacer.decodedVideo.onprepared();
     assert.equal(video.readyState, 4);
     assert.deepEqual(await takeEvents(), ["canplay"]);
     assert.equal(node.port.take("play").length, 0, "paused");

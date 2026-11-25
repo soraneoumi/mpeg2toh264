@@ -151,7 +151,11 @@ workerScope.onmessage = (event: MessageEvent<WorkerCommand>) => {
       deinterlacer.scan = command.scan;
       deinterlacer.videoTimeline = command.videoTimeline;
       deinterlacer.enabled = command.enabled;
-      post({ type: "ready" });
+      // Ready once the GPU has run the setup, so that the page does not start
+      // playback on pictures this renderer cannot yet put up on time.
+      engine.decodedVideo.onprepared = () => {
+        if (!destroying) post({ type: "ready" });
+      };
       return;
     }
     if (!video || !deinterlacer) return;

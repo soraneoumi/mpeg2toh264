@@ -100,6 +100,10 @@ export interface PlayerDecodedVideo {
   avDifference(): number;
   /** Playback starts: media time `media` is heard at `wall`; see `DecodedVideoInput.startsAt`. */
   startsAt(media: number, wall: number): void;
+  /** Whether pictures can be put up on time; see `DecodedVideoInput.prepared`. */
+  prepared(): boolean;
+  /** Called when `prepared()` may have become true. */
+  onprepared: (() => void) | null;
 }
 
 /**
@@ -761,6 +765,9 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.#startPlayhead();
     if (this.#decoding && decodedVideo) {
       decodedVideo.onrelease = this.#recycle;
+      decodedVideo.onprepared = () => {
+        if (id === this.#generation) this.#startIfReady();
+      };
       try {
         this.#openSound(id);
       } catch (error) {
@@ -880,10 +887,20 @@ export class Mpeg2TsPlayer extends EventTarget {
     } satisfies Command);
   }
 
-  /** Let the sound play, where the epoch has what it waits for and playback is wanted. */
+  /**
+   * Let the sound play, where the epoch has what it waits for -- its sound,
+   * its first pictures, and a renderer that can put them up on time -- and
+   * playback is wanted.
+   */
   #startIfReady(): void {
     const takeover = this.#takeover;
-    if (!takeover || !this.#soundReady || !this.#pictureReady) return;
+    if (
+      !takeover ||
+      !this.#soundReady ||
+      !this.#pictureReady ||
+      !this.#deinterlacer!.decodedVideo!.prepared()
+    )
+      return;
     takeover.seeked();
     takeover.setReadyState(Ready.EnoughData);
     if (!takeover.paused) this.#play();
