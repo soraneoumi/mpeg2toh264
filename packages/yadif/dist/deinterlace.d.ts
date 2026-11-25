@@ -180,7 +180,9 @@ export interface DeinterlacerOptions {
     film?: boolean;
     /**
      * Called when a rendering resource fails after construction: a GPU film detector that throws mid-stream,
-     * a Worker that died twice, or a lost WebGL context.
+     * which leaves plain YADIF running, or the renderer itself -- a Worker that died again after its restart,
+     * Worker rendering asked for where there is none, a lost WebGL context, a decoded picture it could not
+     * take in -- which stops it for good (see `DecodedVideoInput.rendererStatus`).
      * The same message is dispatched as a `failure` event.
      * This option lets callers install the handler alongside `onStats`.
      */

@@ -13,11 +13,20 @@ export interface PlayerDecodedVideo {
     avDifference(): number;
     /** Playback starts: media time `media` is heard at `wall`; see `DecodedVideoInput.startsAt`. */
     startsAt(media: number, wall: number): void;
-    /** Whether pictures can be put up on time; see `DecodedVideoInput.prepared`. */
-    prepared(): boolean;
-    /** Called when `prepared()` may have become true. */
-    onprepared: (() => void) | null;
+    /** Where the renderer stands; see `DecodedVideoInput.rendererStatus`. */
+    rendererStatus(): PlayerRendererStatus;
+    /** Called when `rendererStatus()` may have changed. */
+    onrendererstatus: (() => void) | null;
 }
+/** Where a deinterlacer's renderer stands; see `RendererStatus` in the yadif package. */
+export type PlayerRendererStatus = {
+    state: "preparing";
+} | {
+    state: "prepared";
+} | {
+    state: "failed";
+    reason: string;
+};
 /** A replaceable deinterlacer controlled by the source picture timeline. */
 export interface PlayerDeinterlacer {
     /**
