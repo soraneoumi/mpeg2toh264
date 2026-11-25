@@ -196,13 +196,6 @@ export class SoundClock {
     return Number.NaN;
   }
 
-  /** Media seconds per wall second right now; 0 when not playing. */
-  get speed(): number {
-    const report = this.#reportAt(this.frameAt(performance.now()));
-    if (report === undefined || report.state !== "playing") return 0;
-    return report.speed * this.#slope;
-  }
-
   /** The processor's state as last reported; "idle" before the first report. */
   get state(): SoundPosition["state"] | "idle" {
     return this.#reports.at(-1)?.state ?? "idle";

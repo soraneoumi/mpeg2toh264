@@ -425,6 +425,12 @@ export class Mpeg2TsPlayer extends EventTarget {
   #takeover: MediaTakeover | null = null;
   #lock: DisplayLock | null = null;
   /**
+   * The output device's drift the last load's lock learnt (see
+   * `DisplayLock`), which the next starts from: the device is the context's,
+   * which stays.
+   */
+  #drift = 0;
+  /**
    * The context and the clock of what it plays, kept from load to load so
    * that the clock's mapping to wall time is settled before a load's first
    * pictures need it.
@@ -836,8 +842,9 @@ export class Mpeg2TsPlayer extends EventTarget {
         if (id === this.#generation) this.#lockFrame(now);
       },
     });
-    const lock = new DisplayLock((ratio) =>
-      sound.control({ type: "adjust", ratio }),
+    const lock = new DisplayLock(
+      (ratio) => sound.control({ type: "adjust", ratio }),
+      this.#drift,
     );
     const takeover = new MediaTakeover(this.video, {
       play: () => this.#startIfReady(),
@@ -866,11 +873,9 @@ export class Mpeg2TsPlayer extends EventTarget {
 
   /** Hold the media clock to the display, for the refresh at `now`. */
   #lockFrame(now: number): void {
-    const sound = this.#sound!;
     const takeover = this.#takeover!;
     this.#lock!.frame({
       now,
-      speed: sound.clock.speed,
       step: this.#gridStep,
       rate: takeover.rate,
       active: takeover.playing,
@@ -1633,6 +1638,7 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.#sink = null;
     this.#sound?.close();
     this.#sound = null;
+    if (this.#lock) this.#drift = this.#lock.drift;
     this.#lock = null;
     // Before the element is reset below, which is its own again by then.
     this.#takeover?.uninstall();

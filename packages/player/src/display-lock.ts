@@ -11,26 +11,42 @@
  * sound follow: it plays the sound a fraction of a percent faster or slower
  * (`adjust`, which the AudioWorklet applies by resampling).
  *
- * The speed has two parts. The rate match is what the pictures' count
- * demands -- whole steps per measured refresh, or the speed asked for --
- * against the sound's own rate, which the device clock's drift from
- * `performance.now()` is part of. The drift correction takes back what is
- * left, the deinterlacer's `avDifference` (the sound's lead over the picture
- * shown, averaged over a second), over `AV_RECOVERY_SECONDS`: rounding, a
- * start that did not fall on a refresh, the clock's settling. Only a
- * difference past a refresh and 20 ms -- a stall -- is taken back on the
- * pictures' side, by the deinterlacer moving its count. The pitch moves by
- * as little as the speed, which no one hears.
+ * The speed has three parts. The rate match is what the pictures' count
+ * demands: whole steps per measured refresh, or the speed asked for. The
+ * correction takes back the deinterlacer's `avDifference` (the sound's lead
+ * over the picture shown, averaged over a second) over `AV_RECOVERY_SECONDS`:
+ * rounding, a start that did not fall on a refresh. The drift is what the
+ * lead keeps asking for after that -- the output device's clock running
+ * faster or slower than `performance.now()`, a few hundredths of a percent --
+ * learnt from the lead as it stays, so that none is left standing. With the
+ * correction it takes back a change of the drift critically damped.
+ *
+ * The device's rate is learnt from the lead rather than taken from the sound
+ * clock's fit of the context's time: in a context's first second or two its
+ * time can run ahead (Edge: by up to 0.7 %), which a fit takes for a faster
+ * device for tens of seconds, and a start falls in that time. The lead is
+ * what is heard against what is shown.
+ *
+ * Only a difference past a refresh and 20 ms -- a stall -- is taken back on
+ * the pictures' side, by the deinterlacer moving its count. The pitch moves
+ * by as little as the speed, which no one hears.
  */
 
 /** How far the screen may be from whole picture steps a refresh for the pictures to be counted in them. */
 const MAX_DEVIATION = 0.005;
 /** Time in which the sound's lead over the pictures is taken back, in seconds. */
-const AV_RECOVERY_SECONDS = 10;
-/** The furthest the drift correction moves the speed. */
+const AV_RECOVERY_SECONDS = 5;
+/**
+ * How fast the drift follows the lead, per second squared: a quarter of the
+ * square of the correction's rate, which damps the two critically.
+ */
+const DRIFT_GAIN = 1 / (4 * AV_RECOVERY_SECONDS * AV_RECOVERY_SECONDS);
+/** The furthest the output device's clock is taken to be from `performance.now()`'s. */
+const MAX_DRIFT = 0.001;
+/** The furthest the correction moves the speed. */
 const MAX_CORRECTION = 0.002;
-/** The furthest the speed is ever moved from the sound's own: the match, the correction and the device's drift. */
-const MAX_ADJUST = MAX_DEVIATION + MAX_CORRECTION + 0.001;
+/** The furthest the speed is ever moved from the one asked for: the match, the correction and the drift. */
+const MAX_ADJUST = MAX_DEVIATION + MAX_CORRECTION + MAX_DRIFT;
 /** Refreshes the refresh period is averaged over. */
 const PERIOD_WINDOW = 240;
 /** How often a new speed goes to the worklet, at most, in ms. */
@@ -41,8 +57,6 @@ const SEND_STEP = 2e-6;
 export interface DisplayLockInput {
   /** The time of this animation frame's refresh, on `performance.now()`'s clock. */
   now: number;
-  /** Media seconds per wall second at the speed last sent; 0 while the sound is not playing. */
-  speed: number;
   /** The step the pictures change on in seconds, or null while there is none. */
   step: number | null;
   /** The playback speed asked for. */
@@ -59,9 +73,18 @@ export class DisplayLock {
   readonly #frames: number[] = [];
   #adjust = 1;
   #sentAt = Number.NEGATIVE_INFINITY;
+  /** How much faster than asked the sound plays at adjust 1, as learnt from the lead. */
+  #drift: number;
 
-  constructor(send: (adjust: number) => void) {
+  /** `drift` is what an earlier lock on the same output device learnt. */
+  constructor(send: (adjust: number) => void, drift = 0) {
     this.#send = send;
+    this.#drift = drift;
+  }
+
+  /** How much faster than asked the output device plays, as learnt so far. */
+  get drift(): number {
+    return this.#drift;
   }
 
   /** The speed factor last sent. */
@@ -108,27 +131,31 @@ export class DisplayLock {
     // Paused or waiting: the rates are the same when it plays again, so the
     // speed that matched them stays.
     if (!input.active) return;
-    // The sound's own speed, media seconds per wall second at adjust 1.
-    const base = input.speed / this.#adjust;
-    if (!(base > 0)) return;
-    // What the pictures' count moves by: whole steps a refresh, or whole
-    // refreshes a step, where the screen is close enough to that.
+    // What the pictures' count moves by, against the speed asked for: whole
+    // steps a refresh, or whole refreshes a step, where the screen is close
+    // enough to that.
     const steps = (rate * period) / (step * 1000);
     const whole = steps >= 1 ? Math.round(steps) : 1 / Math.round(1 / steps);
-    const pictures =
+    const match =
       Math.abs(steps / whole - 1) <= MAX_DEVIATION
-        ? (whole * step * 1000) / period
-        : rate;
+        ? (whole * step * 1000) / (period * rate)
+        : 1;
     const lead = input.avDifference;
-    const correction = Number.isFinite(lead)
-      ? Math.min(
-          MAX_CORRECTION,
-          Math.max(-MAX_CORRECTION, lead / AV_RECOVERY_SECONDS),
-        )
-      : 0;
+    let correction = 0;
+    if (Number.isFinite(lead)) {
+      correction = Math.min(
+        MAX_CORRECTION,
+        Math.max(-MAX_CORRECTION, lead / AV_RECOVERY_SECONDS),
+      );
+      // A refresh's worth, so that refreshes the page missed add nothing.
+      this.#drift = Math.min(
+        MAX_DRIFT,
+        Math.max(-MAX_DRIFT, this.#drift + (DRIFT_GAIN * lead * period) / 1000),
+      );
+    }
     const adjust = Math.min(
       1 + MAX_ADJUST,
-      Math.max(1 - MAX_ADJUST, (pictures * (1 - correction)) / base),
+      Math.max(1 - MAX_ADJUST, match * (1 - correction - this.#drift)),
     );
     this.#offer(now, adjust);
   }
