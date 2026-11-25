@@ -458,6 +458,8 @@ export class Mpeg2TsPlayer extends EventTarget {
   #pictureReady = false;
   /** Playback was asked to start and waits for a refresh it can be placed on (`#placeStart`). */
   #startWanted = false;
+  /** The page was hidden or shown: see `#placeStart`. */
+  #onVisibility = (): void => this.#placeStart();
   /** A playback speed asked for while playing that the worklet has not been seen to play at yet. */
   #rateChange: number | null = null;
 
@@ -865,6 +867,8 @@ export class Mpeg2TsPlayer extends EventTarget {
     sound.control({ type: "volume", gain: takeover.gain });
     sound.control({ type: "dual-mono", sub: this.#dualMonoSub });
     takeover.install();
+    // The animation frames that place a start are the page's.
+    document.addEventListener("visibilitychange", this.#onVisibility);
     this.#sound = sound;
     this.#takeover = takeover;
     this.#lock = lock;
@@ -967,10 +971,20 @@ export class Mpeg2TsPlayer extends EventTarget {
    * takes the refresh period and the sound clock's mapping to wall time,
    * which a context that has just started running does not have yet: until
    * then the start waits.
+   *
+   * A hidden page has no refreshes to place it on, and puts up no pictures
+   * to start with: the sound starts at once, and the pictures follow its
+   * clock once the page is shown. A start waiting for a refresh when the
+   * page is hidden goes then (`#onVisibility`).
    */
   #placeStart(): void {
     if (!this.#startWanted) return;
     const sound = this.#sound!;
+    if (document.visibilityState === "hidden") {
+      this.#startWanted = false;
+      sound.control({ type: "play", at: 0 });
+      return;
+    }
     const earliest =
       performance.now() +
       (sound.context.outputLatency ?? 0) * 1000 +
@@ -1642,6 +1656,7 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.#lock = null;
     // Before the element is reset below, which is its own again by then.
     this.#takeover?.uninstall();
+    document.removeEventListener("visibilitychange", this.#onVisibility);
     this.#takeover = null;
     if (this.#objectUrl) URL.revokeObjectURL(this.#objectUrl);
     this.#objectUrl = null;

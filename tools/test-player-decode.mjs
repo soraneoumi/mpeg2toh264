@@ -186,6 +186,10 @@ globalThis.AudioWorkletNode = FakeAudioWorkletNode;
 globalThis.requestAnimationFrame = (callback) =>
   setTimeout(() => callback(performance.now()), 16);
 globalThis.cancelAnimationFrame = (handle) => clearTimeout(handle);
+/** The page, whose animation frames place a start, shown or hidden. */
+globalThis.document = Object.assign(new EventTarget(), {
+  visibilityState: "visible",
+});
 
 try {
   await build({
@@ -831,6 +835,51 @@ try {
     assert.equal(player.state, "error");
     player.destroy();
   }
+
+  // A hidden page has no refreshes to place a start on: the sound starts at
+  // once, announced to no pictures, whether the page was hidden when play was
+  // asked for or turned hidden while the start waited for a refresh.
+  for (const when of ["hidden", "waiting"]) {
+    document.visibilityState = when === "hidden" ? "hidden" : "visible";
+    let deinterlacer = null;
+    const video = new FakeVideo();
+    const player = new Mpeg2TsPlayer(video, {
+      mediaSource: "worker",
+      deinterlacer: () => (deinterlacer = fakeDeinterlacer(true)),
+    });
+    const loaded = player.load("https://example.invalid/j.ts");
+    const worker = FakeWorker.last;
+    const [load] = worker.take("load");
+    const [need] = worker.take("need");
+    worker.send({ type: "opened", id: load.id });
+    await loaded;
+    await wait(0);
+    const node = FakeAudioWorkletNode.last;
+    for (const time of [0, 0.04, 0.08])
+      worker.send({
+        type: "picture",
+        id: load.id,
+        epoch: need.epoch,
+        picture: picture(time),
+      });
+    worker.send({ type: "seekable", id: load.id, duration: 600 });
+    node.report({ epoch: need.epoch, state: "ready", media: 0 });
+    node.port.posted = [];
+    await video.play();
+    if (when === "waiting") {
+      assert.equal(node.port.take("play").length, 0, "no refresh yet");
+      document.visibilityState = "hidden";
+      document.dispatchEvent(new Event("visibilitychange"));
+    }
+    assert.deepEqual(node.port.take("play"), [{ type: "play", at: 0 }], when);
+    assert.equal(
+      deinterlacer.calls.filter((call) => call[0] === "startsAt").length,
+      0,
+      `${when}: announced to pictures nobody sees`,
+    );
+    player.destroy();
+  }
+  document.visibilityState = "visible";
 
   console.log("player decode-mode tests passed");
 } finally {
