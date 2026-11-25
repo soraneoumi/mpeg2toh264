@@ -39,7 +39,7 @@ import {
 import bundledWorkerURL from "./worker.ts?worker&url";
 import { DisplayLock } from "./display-lock.js";
 import { MediaTakeover, Ready } from "./media-takeover.js";
-import { CONTEXT_SAMPLE_RATE, SoundOutput } from "./sound-output.js";
+import { SoundOutput } from "./sound-output.js";
 import { SoundClock, type SoundPosition } from "./sound/index.js";
 
 /**
@@ -817,7 +817,13 @@ export class Mpeg2TsPlayer extends EventTarget {
    * media interface answered from here for the length of the load.
    */
   #openSound(id: number): void {
-    this.#context ??= new AudioContext({ sampleRate: CONTEXT_SAMPLE_RATE });
+    // At the output device's own rate. A context at any other rate is
+    // resampled to the device's inside the browser, and through Chromium's
+    // way of doing that the context's time slips by about 10 ms every few
+    // seconds -- for 48 kHz on a 44.1 kHz device, every 5 s -- which
+    // unsettles the clock of what is heard. The worklet resamples the 48 kHz
+    // broadcast sound to the context's rate as it changes its speed anyway.
+    this.#context ??= new AudioContext();
     this.#clock ??= new SoundClock(this.#context);
     const sound = new SoundOutput(this.#context, this.#clock, {
       report: (position) => {

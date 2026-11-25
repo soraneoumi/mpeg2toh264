@@ -24,9 +24,6 @@ import {
  */
 const SAMPLE_INTERVAL_MS = 50;
 
-/** Broadcast sound is 48 kHz; asking for it spares the browser a resampler. */
-export const CONTEXT_SAMPLE_RATE = 48000;
-
 /** The processor's module, loaded once into each context. */
 const modules = new WeakMap<BaseAudioContext, Promise<void>>();
 

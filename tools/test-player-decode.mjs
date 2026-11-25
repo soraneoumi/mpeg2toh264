@@ -345,8 +345,9 @@ try {
     assert.equal(load.video, "decode");
     const decodedVideo = deinterlacer.decodedVideo;
     assert.equal(typeof decodedVideo.onrelease, "function");
+    // At the device's rate, which the worklet resamples the sound to.
     const context = FakeAudioContext.last;
-    assert.equal(context.sampleRate, 48000);
+    assert.equal(context.sampleRate, 44100);
 
     // The worker gets the worklet's port and the epoch to feed it.
     const [soundPort] = worker.take("sound-port");

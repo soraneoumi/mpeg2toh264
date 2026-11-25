@@ -3,7 +3,8 @@
  * The sound output stage, for the page.
  *
  * ```ts
- * const context = new AudioContext({ sampleRate: 48000 });
+ * // At the device's rate: the processor resamples the sound to it.
+ * const context = new AudioContext();
  * await context.audioWorklet.addModule(soundProcessorURL);
  * const node = new AudioWorkletNode(context, SOUND_PROCESSOR, {
  *   numberOfInputs: 0,
