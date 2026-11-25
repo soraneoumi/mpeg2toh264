@@ -774,6 +774,8 @@ class Playback {
   async #run(offset: number): Promise<void> {
     const leg = this.#nextLeg();
     const signal = this.#leg!.signal;
+    // Only units read from the input's start begin it.
+    this.#pictures?.readFrom(offset === 0);
     const id = this.#command.id;
     try {
       await loadWasm(this.#command.wasmUrl);

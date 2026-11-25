@@ -88,6 +88,13 @@ export class PictureSchedule<U extends ScheduledUnit> {
   #exhausted = false;
   /** Where the units dropped behind the playhead reached. */
   #droppedUntil = Number.NEGATIVE_INFINITY;
+  /**
+   * Whether the earliest unit held is the input's first, so that nothing
+   * comes before it: a request from before it begins where it does. Not so
+   * once the input is read again from somewhere in it, nor once a unit is
+   * dropped.
+   */
+  #fromStart = true;
 
   constructor(keepBehindSeconds: number) {
     this.#keepBehindSeconds = keepBehindSeconds;
@@ -132,6 +139,8 @@ export class PictureSchedule<U extends ScheduledUnit> {
    */
   clear(from = this.#highestEpoch + 1): void {
     this.#entries = [];
+    // Where the input is read from next is not known yet; see `readFrom`.
+    this.#fromStart = false;
     this.#minEpoch = from;
     this.#epoch = null;
     this.#window = null;
@@ -142,6 +151,14 @@ export class PictureSchedule<U extends ScheduledUnit> {
     this.#ended = false;
     this.#endAnnounced = false;
     this.#droppedUntil = Number.NEGATIVE_INFINITY;
+  }
+
+  /**
+   * The units to come are read from the input's start (`start`), or from
+   * somewhere in it.
+   */
+  readFrom(start: boolean): void {
+    this.#fromStart = start;
   }
 
   /**
@@ -174,6 +191,7 @@ export class PictureSchedule<U extends ScheduledUnit> {
     let drop = 0;
     while (drop < keep && this.#entries[drop]!.end < limit) drop++;
     if (drop === 0) return;
+    this.#fromStart = false;
     for (const entry of this.#entries.splice(0, drop))
       this.#droppedUntil = Math.max(this.#droppedUntil, entry.end);
     if (this.#cursor !== null)
@@ -225,14 +243,13 @@ export class PictureSchedule<U extends ScheduledUnit> {
     if (window === null || epoch === null) return null;
     if (entries.length === 0) return this.#idle(this.#ended);
     let { from, until } = window;
-    // Nothing ever held reaches back that far, so the pictures begin where
-    // the units do.
+    // The input begins with the earliest unit, so the pictures begin where
+    // it does. (Read from somewhere in it, the input has what comes before
+    // that unit: a request from there waits for the seek that reads it, and
+    // decoding the earliest unit for it instead would hand out the pictures
+    // of where the input was read from under the request's epoch.)
     const earliest = entries[0]!;
-    if (
-      from < earliest.first &&
-      startable(earliest.unit) &&
-      this.#droppedUntil === Number.NEGATIVE_INFINITY
-    ) {
+    if (this.#fromStart && from < earliest.first && startable(earliest.unit)) {
       until += earliest.first - from;
       from = earliest.first;
     }

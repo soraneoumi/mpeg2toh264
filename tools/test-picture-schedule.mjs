@@ -216,6 +216,44 @@ try {
     assert.equal(steps[0].from, 0.5);
   }
 
+  // The input read again from somewhere in it, as after a seek: a request
+  // from before the earliest unit waits for what comes before that unit
+  // rather than beginning with it, and is served once the input is read from
+  // its start. The same once units are dropped.
+  {
+    const late = units(2).map((unit) => ({
+      ...unit,
+      start: unit.start + 2,
+      pictures: unit.pictures.map((picture) => ({
+        ...picture,
+        time: picture.time + 2,
+      })),
+    }));
+    const schedule = new PictureSchedule(10);
+    for (const unit of all) schedule.add(unit);
+    schedule.need(0, 0, 0.3);
+    drain(schedule, shows);
+    schedule.clear(1);
+    schedule.readFrom(false);
+    for (const unit of late) schedule.add(unit);
+    schedule.need(1, 0.5, 0.8);
+    assert.equal(next(schedule, shows), null, "began with a unit after it");
+    assert.equal(schedule.exhausted, true);
+    schedule.clear(2);
+    schedule.readFrom(true);
+    for (const unit of late) schedule.add(unit);
+    schedule.need(2, 0.5, 0.8);
+    assert.equal(drain(schedule, shows)[0].from, 2, "the input's start");
+
+    const dropping = new PictureSchedule(0.5);
+    for (const unit of late) dropping.add(unit);
+    dropping.need(0, 2, 2.3);
+    drain(dropping, shows);
+    dropping.playhead(3.5);
+    dropping.need(1, 0.5, 0.8);
+    assert.equal(next(dropping, shows), null, "began after dropping");
+  }
+
   // A seek that reopens the input: everything goes, and requests of the
   // epochs before it are refused.
   {
