@@ -511,8 +511,13 @@ try {
     assert.deepEqual(worker.take("seek"), [
       { type: "seek", id, time: 10, epoch: epoch + 1, transfer: [] },
     ]);
+    // The display lock's speed goes out on its own schedule, which follows
+    // the sound clock's fit to real time and so the load on the machine.
     assert.deepEqual(
-      node.port.posted.splice(0).map((message) => message.type),
+      node.port.posted
+        .splice(0)
+        .map((message) => message.type)
+        .filter((type) => type !== "adjust"),
       ["pause", "epoch"],
     );
     assert.deepEqual(await takeEvents(), ["seeking"]);
