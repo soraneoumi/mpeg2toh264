@@ -78,6 +78,15 @@ export interface DecodedVideoInput {
      * `wall` the pictures go on at the rate they had.
      */
     startsAt(media: number, wall: number): void;
+    /**
+     * Whether the renderer can put a picture up in the refresh it is due in:
+     * the GPU has run its setup, the first draw of every program it draws with
+     * included (see `drawOnce`). A start waits for it; pictures can be pushed
+     * before.
+     */
+    prepared(): boolean;
+    /** Set by the producer. Called when `prepared()` may have become true. */
+    onprepared: (() => void) | null;
 }
 /** Throw if the picture's fields or its planes do not describe a picture inside `data`. */
 export declare function checkPicture(picture: DecodedPicture): void;

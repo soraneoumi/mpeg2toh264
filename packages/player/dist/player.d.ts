@@ -13,6 +13,10 @@ export interface PlayerDecodedVideo {
     avDifference(): number;
     /** Playback starts: media time `media` is heard at `wall`; see `DecodedVideoInput.startsAt`. */
     startsAt(media: number, wall: number): void;
+    /** Whether pictures can be put up on time; see `DecodedVideoInput.prepared`. */
+    prepared(): boolean;
+    /** Called when `prepared()` may have become true. */
+    onprepared: (() => void) | null;
 }
 /** A replaceable deinterlacer controlled by the source picture timeline. */
 export interface PlayerDeinterlacer {

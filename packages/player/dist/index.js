@@ -194,7 +194,7 @@ class C {
   }
   /** Tell the sink where playback has got to, so it can evict what is behind. */
   setCurrentTime(t) {
-    this.#b = t, this.#H(), this.#L(), this.#N();
+    this.#b = t, this.#V(), this.#L(), this.#N();
   }
   #I(t) {
     this.#n.push(t), this.#g += t.data.byteLength, this.#L(), this.#N();
@@ -233,7 +233,7 @@ class C {
       try {
         t.appendBuffer(e.data);
       } catch (s) {
-        this.#u = null, s instanceof DOMException && s.name === "QuotaExceededError" ? (this.#a = !0, this.#L(), this.#T(), this.#H()) : this.#R(s);
+        this.#u = null, s instanceof DOMException && s.name === "QuotaExceededError" ? (this.#a = !0, this.#L(), this.#T(), this.#V()) : this.#R(s);
       }
     }
   }
@@ -245,7 +245,7 @@ class C {
         this.#g -= e.data.byteLength, e.init || this.#C(e.start);
       }
     } else t?.type === "remove" ? (this.#a = !1, this.#T()) : t?.type === "clear" && (this.#p = !1);
-    this.#u = null, this.#x(), this.#H(), this.#L(), this.#N();
+    this.#u = null, this.#x(), this.#V(), this.#L(), this.#N();
   };
   /**
    * The managed source asking for data again, which is the only thing that
@@ -317,7 +317,7 @@ class C {
    * from its own bookkeeping, and does not need help. Removing anyway would
    * only be another chance to remove the wrong thing.
    */
-  #H() {
+  #V() {
     const t = this.#t;
     if (!this.#a || !t || t.updating || this.#u || this.#p || t.buffered.length === 0) return;
     const e = this.#b - this.#s.keepBehindSeconds;
@@ -334,12 +334,12 @@ class C {
     }
   }
   /** How far past the playhead the buffer reaches, in seconds. */
-  #V() {
+  #B() {
     const t = this.#t?.buffered;
     return !t || t.length === 0 ? 0 : t.end(t.length - 1) - this.#b;
   }
   #L() {
-    const t = !this.#a && this.#c && this.#V() < this.#s.maxAheadSeconds && this.#g < this.#s.queueHighWaterMark && // The fragment limit would stop the input before a start hold fills.
+    const t = !this.#a && this.#c && this.#B() < this.#s.maxAheadSeconds && this.#g < this.#s.queueHighWaterMark && // The fragment limit would stop the input before a start hold fills.
     (this.#i > 0 || this.#n.length < 2);
     this.#l.set(t) && this.#s.onReadyChange?.(t);
   }
@@ -366,7 +366,7 @@ class C {
     );
   }
 }
-const x = "" + new URL("assets/worker-DPoV-j1g.js", import.meta.url).href, I = 5e-3, H = 10, E = 2e-3, v = I + E + 1e-3, V = 240, B = 250, W = 2e-6;
+const x = "" + new URL("assets/worker-DPoV-j1g.js", import.meta.url).href, I = 5e-3, V = 10, E = 2e-3, v = I + E + 1e-3, H = 240, B = 250, W = 2e-6;
 class G {
   #e;
   /** Recent refresh times, to average the period over. */
@@ -401,7 +401,7 @@ class G {
   /** Take one animation frame. */
   frame(t) {
     const { now: e, rate: s, step: i } = t;
-    this.#s.push(e), this.#s.length > V && this.#s.shift();
+    this.#s.push(e), this.#s.length > H && this.#s.shift();
     const r = this.period;
     if (i === null || Number.isNaN(r)) {
       this.#f(e, 1);
@@ -412,7 +412,7 @@ class G {
     if (!(n > 0)) return;
     const a = s * r / (i * 1e3), o = a >= 1 ? Math.round(a) : 1 / Math.round(1 / a), u = Math.abs(a / o - 1) <= I ? o * i * 1e3 / r : s, c = t.avDifference, L = Number.isFinite(c) ? Math.min(
       E,
-      Math.max(-E, c / H)
+      Math.max(-E, c / V)
     ) : 0, P = Math.min(
       1 + v,
       Math.max(1 - v, u * (1 - L) / n)
@@ -945,12 +945,12 @@ class Et extends EventTarget {
   #C = null;
   #x = null;
   /** Which dual-mono service was last chosen, which a new load keeps. */
-  #H = !1;
+  #V = !1;
   /**
    * The step the pictures change on -- a field, or a frame of progressive
    * video -- in seconds, from the last picture pushed.
    */
-  #V = null;
+  #B = null;
   /**
    * Decode mode: where the current epoch starts, and whether each of the two
    * things playback waits for after a start or a seek is there -- the sound
@@ -966,7 +966,7 @@ class Et extends EventTarget {
   /** Playback was asked to start and waits for a refresh it can be placed on (`#placeStart`). */
   #R = !1;
   /** A playback speed asked for while playing that the worklet has not been seen to play at yet. */
-  #B = null;
+  #W = null;
   constructor(t, e = {}) {
     super(), this.video = t, this.#e = e;
     const s = e.mediaSource ?? "auto";
@@ -1025,7 +1025,7 @@ class Et extends EventTarget {
    * one describes nothing anew, so the change costs no restart point.
    */
   selectDualMono(t) {
-    this.#H = t, this.#h?.control({ type: "dual-mono", sub: t }), this.#r?.postMessage({
+    this.#V = t, this.#h?.control({ type: "dual-mono", sub: t }), this.#r?.postMessage({
       type: "audio",
       id: this.#t,
       pid: null,
@@ -1175,7 +1175,9 @@ class Et extends EventTarget {
       maxAheadSeconds: this.#e.maxAheadSeconds ?? 8,
       keepBehindSeconds: this.#e.keepBehindSeconds ?? 10
     }), this.#nt(), this.#l && i) {
-      i.onrelease = this.#tt;
+      i.onrelease = this.#tt, i.onprepared = () => {
+        s === this.#t && this.#H();
+      };
       try {
         this.#ut(s);
       } catch (o) {
@@ -1217,7 +1219,7 @@ class Et extends EventTarget {
     }), s = new G(
       (r) => e.control({ type: "adjust", ratio: r })
     ), i = new z(this.video, {
-      play: () => this.#W(),
+      play: () => this.#H(),
       pause: () => {
         this.#R = !1, e.control({ type: "pause" });
       },
@@ -1229,7 +1231,7 @@ class Et extends EventTarget {
       heard: () => e.clock.at(performance.now()),
       resume: () => e.resume()
     });
-    e.control({ type: "rate", rate: i.rate }), e.control({ type: "volume", gain: i.gain }), e.control({ type: "dual-mono", sub: this.#H }), i.install(), this.#h = e, this.#k = i, this.#U = s, this.#V = null;
+    e.control({ type: "rate", rate: i.rate }), e.control({ type: "volume", gain: i.gain }), e.control({ type: "dual-mono", sub: this.#V }), i.install(), this.#h = e, this.#k = i, this.#U = s, this.#B = null;
   }
   /** Hold the media clock to the display, for the refresh at `now`. */
   #ct(t) {
@@ -1237,7 +1239,7 @@ class Et extends EventTarget {
     this.#U.frame({
       now: t,
       speed: e.clock.speed,
-      step: this.#V,
+      step: this.#B,
       rate: s.rate,
       active: s.playing,
       avDifference: this.#i.decodedVideo.avDifference()
@@ -1261,17 +1263,21 @@ class Et extends EventTarget {
       epoch: this.#M
     });
   }
-  /** Let the sound play, where the epoch has what it waits for and playback is wanted. */
-  #W() {
+  /**
+   * Let the sound play, where the epoch has what it waits for -- its sound,
+   * its first pictures, and a renderer that can put them up on time -- and
+   * playback is wanted.
+   */
+  #H() {
     const t = this.#k;
-    !t || !this.#T || !this.#P || (t.seeked(), t.setReadyState(d.EnoughData), t.paused || this.#ft());
+    !t || !this.#T || !this.#P || !this.#i.decodedVideo.prepared() || (t.seeked(), t.setReadyState(d.EnoughData), t.paused || this.#ft());
   }
   /**
    * Playback is to start: at the first refresh it can be placed on
    * (`#placeStart`), which every refresh tries until it can.
    */
   #ft() {
-    this.#B = null, this.#R = !0, this.#Z();
+    this.#W = null, this.#R = !0, this.#Z();
   }
   /**
    * Tell the worklet to play from a context frame a little ahead, heard at a
@@ -1306,7 +1312,7 @@ class Et extends EventTarget {
    * ahead.
    */
   #pt(t) {
-    this.#h.control({ type: "rate", rate: t }), this.#B = this.#k.playing ? t : null;
+    this.#h.control({ type: "rate", rate: t }), this.#W = this.#k.playing ? t : null;
   }
   /** What the worklet says it is doing, for the element and the start. */
   #mt(t) {
@@ -1315,10 +1321,10 @@ class Et extends EventTarget {
       switch (t.state) {
         case "ready":
           if (this.#T) break;
-          this.#T = !0, this.#W();
+          this.#T = !0, this.#H();
           break;
         case "playing":
-          e.setReadyState(d.EnoughData), e.soundStarted(t.media), this.#B !== null && Math.abs(t.speed / this.#B - 1) < ot && (this.#B = null, this.#i.decodedVideo.startsAt(
+          e.setReadyState(d.EnoughData), e.soundStarted(t.media), this.#W !== null && Math.abs(t.speed / this.#W - 1) < ot && (this.#W = null, this.#i.decodedVideo.startsAt(
             t.media,
             this.#h.clock.wallOfFrame(t.frame)
           ));
@@ -1330,7 +1336,7 @@ class Et extends EventTarget {
           e.soundStopped(t.media, !1);
           break;
         case "ended":
-          this.#T || (this.#T = !0, this.#W()), e.soundStopped(t.media, !0);
+          this.#T || (this.#T = !0, this.#H()), e.soundStopped(t.media, !0);
           break;
       }
   }
@@ -1376,12 +1382,12 @@ class Et extends EventTarget {
       return;
     }
     const r = e.interlaced ? e.repeatFirstField ? 3 : 2 : 1;
-    if (this.#V = e.duration / r, !this.#P && // The picture two after the one the start falls in; a millisecond
+    if (this.#B = e.duration / r, !this.#P && // The picture two after the one the start falls in; a millisecond
     // over, for timestamps at the start that are a tick either side.
     e.timestamp > this.#L + e.duration + 1e-3) {
       this.#P = !0;
       const n = this.#k;
-      n.readyState < d.CurrentData && n.setReadyState(d.CurrentData), this.#W();
+      n.readyState < d.CurrentData && n.setReadyState(d.CurrentData), this.#H();
     }
   }
   /** Abandon the current load. The player stays usable. */
@@ -1458,7 +1464,7 @@ class Et extends EventTarget {
           this.#gt(e.epoch, e.picture);
           break;
         case "pictures-end":
-          this.#l && e.epoch === this.#M && (this.#i?.decodedVideo?.finish(), this.#P || (this.#P = !0, this.#W()));
+          this.#l && e.epoch === this.#M && (this.#i?.decodedVideo?.finish(), this.#P || (this.#P = !0, this.#H()));
           break;
         case "no-aac-audio":
           this.#At();
