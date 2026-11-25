@@ -34,7 +34,7 @@ export declare class FilmDetector {
     get texture(): WebGLTexture | null;
     /**
      * Combed pixels per block of the frame last measured by `measureComb`, or
-     * null before one has been. See COMB_FRAGMENT_SHADER.
+     * null before one has been. See COMB_FLAGS_FRAGMENT_SHADER.
      */
     get combTexture(): WebGLTexture | null;
     /**

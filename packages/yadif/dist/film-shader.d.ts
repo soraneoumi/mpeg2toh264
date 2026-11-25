@@ -149,14 +149,14 @@ export declare const METRICS_UNIFORMS: {
  * keeps the cycle's place but counts only once the cycle is believed.
  */
 export declare const METRICS_FRAGMENT_SHADER: string;
-export declare const COMB_UNIFORMS: {
+export declare const COMB_FLAGS_UNIFORMS: {
     readonly prev: "uPrev";
     readonly cur: "uCur";
     readonly first: "uFirst";
     readonly size: "uSize";
 };
 /**
- * Count, block by block, the pixels a woven film frame would show combed.
+ * Mark the pixels a woven film frame would show combed.
  *
  * Film reconstruction trusts the cadence: a frame whose phase says it is one
  * film frame goes out as it is, and the frame that holds two gets the previous
@@ -172,9 +172,27 @@ export declare const COMB_UNIFORMS: {
  * direction by more than the threshold, the five-line test (the same pattern
  * two lines apart) agrees that it alternates rather than being a thin line,
  * and it changed since the previous frame -- still detail is never combing,
- * whatever its shape. The filter interpolates a block past COMB_BLOCK_PIXELS
- * instead of weaving it; blocks rather than pixels, since weak combing left
- * between the pixels that crossed the threshold looks worse than either.
+ * whatever its shape.
+ *
+ * One fragment a pixel of the second field, line `y` of the target being
+ * that field's line `y` from the top, so that every pixel is looked at in
+ * parallel; COMB_SUM_FRAGMENT_SHADER counts them by block. (One fragment a
+ * block looking at its pixels in turn took half as long again as the two
+ * passes together.)
  */
-export declare const COMB_FRAGMENT_SHADER = "#version 300 es\nprecision highp float;\nprecision highp int;\n\nuniform sampler2D uPrev;\nuniform sampler2D uCur;\n/** The parity of the lines of the field captured first. */\nuniform int uFirst;\nuniform ivec2 uSize;\n\nout vec4 outValue;\n\nconst float COMB = 8.0 / 255.0;\n\nfloat luma(sampler2D image, int x, int y) {\n  int line = y < 0 ? -y : (y >= uSize.y ? 2 * (uSize.y - 1) - y : y);\n  vec3 c = texelFetch(image, ivec2(x, clamp(line, 0, uSize.y - 1)), 0).rgb;\n  return dot(c, vec3(0.2126, 0.7152, 0.0722));\n}\n\nbool combed(float above2, float above, float pixel, float below, float below2) {\n  float d1 = pixel - above;\n  float d2 = pixel - below;\n  return ((d1 > COMB && d2 > COMB) || (d1 < -COMB && d2 < -COMB)) &&\n    abs(above2 + 4.0 * pixel + below2 - 3.0 * (above + below)) > 6.0 * COMB;\n}\n\nvoid main() {\n  // Block rows count from the top of the frame, as the filter reads them.\n  ivec2 block = ivec2(gl_FragCoord.xy);\n  ivec2 base = block * 16;\n  float standing = 0.0;\n  float woven = 0.0;\n  for (int dy = 0; dy < 16; ++dy) {\n    int y = base.y + dy;\n    if (y >= uSize.y || (y & 1) == uFirst) continue;\n    for (int dx = 0; dx < 16; ++dx) {\n      int x = base.x + dx;\n      if (x >= uSize.x) break;\n      float current = luma(uCur, x, y);\n      float previous = luma(uPrev, x, y);\n      if (abs(current - previous) <= COMB) continue;\n      // The first field's lines either side are the same whichever second\n      // field is woven between them.\n      float above = luma(uCur, x, y - 1);\n      float below = luma(uCur, x, y + 1);\n      if (combed(luma(uCur, x, y - 2), above, current, below, luma(uCur, x, y + 2)))\n        standing += 1.0;\n      if (combed(luma(uPrev, x, y - 2), above, previous, below, luma(uPrev, x, y + 2)))\n        woven += 1.0;\n    }\n  }\n  outValue = vec4(standing, woven, 0.0, 0.0);\n}\n";
+export declare const COMB_FLAGS_FRAGMENT_SHADER = "#version 300 es\nprecision highp float;\nprecision highp int;\n\nuniform sampler2D uPrev;\nuniform sampler2D uCur;\n/** The parity of the lines of the field captured first. */\nuniform int uFirst;\nuniform ivec2 uSize;\n\nout vec4 outValue;\n\nconst float COMB = 8.0 / 255.0;\n\nfloat luma(sampler2D image, int x, int y) {\n  int line = y < 0 ? -y : (y >= uSize.y ? 2 * (uSize.y - 1) - y : y);\n  vec3 c = texelFetch(image, ivec2(x, clamp(line, 0, uSize.y - 1)), 0).rgb;\n  return dot(c, vec3(0.2126, 0.7152, 0.0722));\n}\n\nbool combed(float above2, float above, float pixel, float below, float below2) {\n  float d1 = pixel - above;\n  float d2 = pixel - below;\n  return ((d1 > COMB && d2 > COMB) || (d1 < -COMB && d2 < -COMB)) &&\n    abs(above2 + 4.0 * pixel + below2 - 3.0 * (above + below)) > 6.0 * COMB;\n}\n\nvoid main() {\n  ivec2 at = ivec2(gl_FragCoord.xy);\n  int x = at.x;\n  int y = 2 * at.y + 1 - uFirst;\n  outValue = vec4(0.0);\n  if (y >= uSize.y) return;\n  float current = luma(uCur, x, y);\n  float previous = luma(uPrev, x, y);\n  if (abs(current - previous) <= COMB) return;\n  // The first field's lines either side are the same whichever second\n  // field is woven between them.\n  float above = luma(uCur, x, y - 1);\n  float below = luma(uCur, x, y + 1);\n  outValue.r = float(combed(luma(uCur, x, y - 2), above, current, below, luma(uCur, x, y + 2)));\n  outValue.g = float(combed(luma(uPrev, x, y - 2), above, previous, below, luma(uPrev, x, y + 2)));\n}\n";
+export declare const COMB_SUM_UNIFORMS: {
+    readonly flags: "uFlags";
+    readonly size: "uSize";
+};
+/**
+ * Count the pixels COMB_FLAGS_FRAGMENT_SHADER marked, block by block: a
+ * block is COMB_BLOCK pixels square, so COMB_BLOCK by COMB_BLOCK / 2 of the
+ * marks, one field's lines. Block rows count from the top of the frame, as
+ * the filter reads them. The filter interpolates a block past
+ * COMB_BLOCK_PIXELS instead of weaving it; blocks rather than pixels, since
+ * weak combing left between the pixels that crossed the threshold looks
+ * worse than either.
+ */
+export declare const COMB_SUM_FRAGMENT_SHADER = "#version 300 es\nprecision highp float;\nprecision highp int;\n\nuniform sampler2D uFlags;\n/** The size of the marks. */\nuniform ivec2 uSize;\n\nout vec4 outValue;\n\nvoid main() {\n  ivec2 block = ivec2(gl_FragCoord.xy);\n  ivec2 base = block * ivec2(16, 8);\n  ivec2 end = min(base + ivec2(16, 8), uSize);\n  vec2 count = vec2(0.0);\n  for (int y = base.y; y < end.y; ++y)\n    for (int x = base.x; x < end.x; ++x)\n      count += texelFetch(uFlags, ivec2(x, y), 0).rg;\n  outValue = vec4(count, 0.0, 0.0);\n}\n";
 //# sourceMappingURL=film-shader.d.ts.map
