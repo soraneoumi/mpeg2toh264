@@ -916,12 +916,19 @@ export class Deinterlacer extends EventTarget {
   /** Whether the page showing the canvas is hidden; it is then given no refreshes. */
   #pageHidden = false;
   /**
-   * The position when the page last became visible again, and the clock's
-   * origin then. The position bounds what passed while it was hidden only for
-   * as long as playback has been continuous since, which the origin tells.
-   * It is the element's own position where the clock has not caught up with
-   * it: a hidden page sends no readings, so playback resumed while it was
-   * hidden finds the clock still where the element was paused.
+   * Whether no refresh has been filled since the page was hidden: while it
+   * is hidden, and after it shows again until the first refresh it is given,
+   * which comes some time after the page says it is visible. Nothing that
+   * went by meanwhile could be seen.
+   */
+  #unseen = false;
+  /**
+   * The position of the first refresh filled after the page was last hidden,
+   * and the clock's origin then. The position bounds what passed unseen only
+   * for as long as playback has been continuous since, which the origin
+   * tells. It is the element's own position where the clock has not caught
+   * up with it: a hidden page sends no readings, so playback resumed while
+   * it was hidden finds the clock still where the element was paused.
    */
   #unseenUntil = Number.NaN;
   #unseenOrigin = Number.NaN;
@@ -2493,13 +2500,14 @@ export class Deinterlacer extends EventTarget {
 
   /**
    * Whether something ending at `end` that goes unshown counts against the
-   * renderer. A hidden page is given no refreshes, so nothing goes up while it
-   * is hidden, and what ended before the position it came back at passed
-   * while it was. Neither was dropped for being late, and counting them would
-   * report a background tab as thousands of dropped frames.
+   * renderer. A hidden page is given no refreshes, so nothing goes up from
+   * when it is hidden until the first refresh after it shows again, and what
+   * ended by that refresh passed unseen. Neither was dropped for being late,
+   * and counting them would report a background tab as thousands of dropped
+   * frames, and every return to it as one more.
    */
   #countable(end: number): boolean {
-    if (this.#pageHidden || !this.#wasDue(end)) return false;
+    if (this.#unseen || !this.#wasDue(end)) return false;
     return !(
       this.#clock.origin === this.#unseenOrigin &&
       end <= this.#unseenUntil + TIMESTAMP_TOLERANCE
@@ -2515,13 +2523,7 @@ export class Deinterlacer extends EventTarget {
       hidden,
       video: this.#workerVideoState(),
     } satisfies WorkerCommand);
-    if (hidden) return;
-    const clock = this.#clock.at(performance.now());
-    const element = this.#video.currentTime;
-    this.#unseenUntil = Number.isNaN(clock)
-      ? element
-      : Math.max(clock, element);
-    this.#unseenOrigin = this.#clock.origin;
+    if (hidden) this.#unseen = true;
   }
 
   /**
@@ -2656,11 +2658,7 @@ export class Deinterlacer extends EventTarget {
       if (target < line.wall) {
         if (!this.#counting) return;
         const rate = this.#countRate;
-        const time = this.#advanceCount(target, rate);
-        const revision = this.#playbackRevision;
-        this.#feed(time, rate);
-        if (this.#frameIsCurrent(revision))
-          this.#showDecoded(time, rate, false);
+        this.#fillRefresh(this.#advanceCount(target, rate), rate, false);
         return;
       }
       this.#startLine = null;
@@ -2701,10 +2699,23 @@ export class Deinterlacer extends EventTarget {
       // by it.
       time = video.paused ? reading : this.#countRefresh(reading, rate);
     }
+    this.#fillRefresh(time, rate, video.paused);
+  }
+
+  /**
+   * Fill the coming refresh, whose media time is `time`: take in what it
+   * needs and put up what belongs on it.
+   */
+  #fillRefresh(time: number, rate: number, paused: boolean): void {
+    if (this.#unseen && !this.#pageHidden) {
+      // The first refresh since the page was hidden: where it came back.
+      this.#unseen = false;
+      this.#unseenUntil = Math.max(time, this.#video.currentTime);
+      this.#unseenOrigin = this.#clock.origin;
+    }
     const revision = this.#playbackRevision;
     this.#feed(time, rate);
-    if (this.#frameIsCurrent(revision))
-      this.#showDecoded(time, rate, video.paused);
+    if (this.#frameIsCurrent(revision)) this.#showDecoded(time, rate, paused);
   }
 
   /**

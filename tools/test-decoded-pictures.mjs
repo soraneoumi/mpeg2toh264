@@ -2896,6 +2896,73 @@ for (const rendering of ["main", "worker"]) {
   );
 }
 
+// Hidden while it plays, and shown again while it plays, as a viewer going
+// to another tab and coming back makes it. The page says it is visible some
+// time before it is given a refresh again, and the renderer takes in the
+// picture before the one that refresh shows, as its filter's neighbour: that
+// picture, and whatever else ended by that refresh, passed unseen. Nothing is
+// counted for the return that the same playing without it does not count, and
+// the pictures are on time from the first refresh after it.
+for (const rendering of ["main", "worker"]) {
+  const run = async (hiddenSeconds) => {
+    const pictures = stream({ count: 400 });
+    const media = playing();
+    const marks = {};
+    const steps = timeline(
+      [
+        3.5,
+        (control) => {
+          if (hiddenSeconds > 0) control.suspend("page");
+          else marks.shown = control.now();
+        },
+      ],
+      [
+        3.5 + hiddenSeconds,
+        (control) => {
+          if (hiddenSeconds === 0) return;
+          control.resume("page");
+          marks.shown = control.now();
+        },
+      ],
+    );
+    const { result, refreshMs, stats } = await play({
+      seconds: 3.5 + hiddenSeconds + 2.5,
+      media,
+      pictures,
+      rendering,
+      script: (vsync, control) => steps(control),
+    });
+    return { result, refreshMs, stats, pictures, media, marks };
+  };
+  const steady = await run(0);
+  for (const hiddenSeconds of [0.3, 1.5, 4]) {
+    const label = `${rendering}, hidden ${hiddenSeconds} s while playing`;
+    const { result, refreshMs, stats, pictures, media, marks } =
+      await run(hiddenSeconds);
+    assert.equal(stats.missed, 0, `${label}: ${stats.missed} pictures dropped`);
+    assert.equal(
+      stats.late,
+      steady.stats.late,
+      `${label}: ${stats.late} outputs late, ${steady.stats.late} without it`,
+    );
+    assert.equal(stats.queueResetted, 0, `${label}: pictures left over`);
+    checkTiming(
+      label,
+      appearances(
+        { draws: canvasDraws(result, marks.shown) },
+        outputs(pictures),
+        refreshMs,
+      ),
+      media,
+      refreshMs,
+      { from: marks.shown, toleranceMs: 2 },
+    );
+    console.log(
+      `ok ${label}: nothing counted for the return, on time from its first refresh`,
+    );
+  }
+}
+
 // Chromium's reading after a start, with the real renderer, as Edge's
 // recordings show it: after a seek the reading is at the target at the first
 // reading after seeked and moves at the next, and the sound starts 40 ms
