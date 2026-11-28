@@ -13,7 +13,8 @@
  * the epoch starts, each stretch where the one before ends, and the
  * worklet is told when it ends, a seek into the last picture or past it
  * included; buffers handed back are used again, and after a seek the
- * pictures start where it landed.
+ * pictures start where it landed. A seek back to the edge of what is kept
+ * behind the playhead gets its pictures wherever in a group it falls.
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -135,6 +136,8 @@ try {
   let completed = false;
   let duration = null;
   let errors = [];
+  /** The sound the worker says it holds. */
+  let heldSound = null;
 
   /**
    * The AudioWorklet's end of the PCM channel: what was sent under each
@@ -223,6 +226,9 @@ try {
         throw new Error(`decode mode has no sink, and sent ${message.type}`);
       case "seekable":
         duration = message.duration;
+        break;
+      case "buffered":
+        heldSound = message.range;
         break;
       case "completed":
         completed = true;
@@ -330,10 +336,15 @@ try {
   async function seekTo(target, label) {
     startEpoch(target);
     const seekEpoch = epoch;
+    const asked = performance.now();
     while (!(newest >= playhead + 0.3) && errors.length === 0) {
       send({ type: "need", id, epoch, from: playhead, until: playhead + 0.3 });
       await new Promise((resolve) => setTimeout(resolve, 2));
       await pump(() => true);
+      assert.ok(
+        performance.now() - asked < 20_000,
+        `${label} to ${target.toFixed(3)} s: no pictures came`,
+      );
     }
     assert.deepEqual(errors, []);
     checkSound(target, label);
@@ -370,6 +381,25 @@ try {
   await seekTo(duration / 2, "seek");
   // Back a little, into what is still held: no reading again.
   await seekTo(duration / 2 + 0.1, "seek into the held sound");
+
+  // Seeks back to the edge of what is kept behind the playhead, as a viewer
+  // stepping back twice makes them. The units there are dropped a group at a
+  // time, so wherever in a group the target falls its pictures can still be
+  // decoded from what is held, or the input is read again: across more than
+  // a group of targets, each gets its pictures.
+  const playFor = async (seconds) => {
+    const until = playhead + seconds;
+    while (playhead < until && errors.length === 0) await step();
+    assert.deepEqual(errors, []);
+  };
+  for (let offset = 0.01; offset < 0.7; offset += 0.05) {
+    await seekTo(duration / 3, "seek");
+    await playFor(2.5);
+    await seekTo(
+      heldSound.start + offset,
+      `seek back to ${offset.toFixed(2)} s into the held sound`,
+    );
+  }
 
   // A request of a new epoch past the last picture, with the input read to
   // its end and the decoder holding a picture back from the seek before: it

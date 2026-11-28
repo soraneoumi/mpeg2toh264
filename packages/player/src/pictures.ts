@@ -66,6 +66,12 @@ interface Entry<U> {
  * whose pictures all start after the request, unless the decoder is holding
  * back a picture the request reaches: it lets an anchor out only once it
  * decodes the next one.
+ *
+ * Decoding can begin only at some units, a group of pictures apart, so the
+ * units are kept and dropped a group at a time: the earliest one held is
+ * always one decoding can begin at, and every picture held can be decoded.
+ * `reaches` says whether that goes for a time, by the rule `next` begins
+ * decoding by, so that a seek the store is said to reach is one it serves.
  */
 export class PictureSchedule<U extends ScheduledUnit> {
   readonly #keepBehindSeconds: number;
@@ -86,15 +92,17 @@ export class PictureSchedule<U extends ScheduledUnit> {
   #endAnnounced = false;
   /** Whether the last `next` found nothing left to come for the request. */
   #exhausted = false;
-  /** Where the units dropped behind the playhead reached. */
-  #droppedUntil = Number.NEGATIVE_INFINITY;
   /**
-   * Whether the earliest unit held is the input's first, so that nothing
-   * comes before it: a request from before it begins where it does. Not so
-   * once the input is read again from somewhere in it, nor once a unit is
-   * dropped.
+   * The requests the earliest unit held begins the pictures for, where they
+   * start before it. "all": it is the input's first unit, and nothing comes
+   * before it. An epoch: the input was read again for that epoch's seek, and
+   * what comes before the unit was not read for it. null: units before it
+   * were dropped. A request of any other epoch from before the earliest unit
+   * waits for its own seek, which reads the input again: beginning with the
+   * earliest unit instead would hand out the pictures of where the input
+   * was last read from under the request's epoch.
    */
-  #fromStart = true;
+  #begins: "all" | number | null = "all";
 
   constructor(keepBehindSeconds: number) {
     this.#keepBehindSeconds = keepBehindSeconds;
@@ -136,11 +144,11 @@ export class PictureSchedule<U extends ScheduledUnit> {
    * input. Requests of epochs before `from` are refused from here on: by
    * default every epoch seen so far, and for a seek the page already started
    * an epoch for -- its request can come before the seek -- that epoch's.
+   * The units to come are read for that epoch.
    */
   clear(from = this.#highestEpoch + 1): void {
     this.#entries = [];
-    // Where the input is read from next is not known yet; see `readFrom`.
-    this.#fromStart = false;
+    this.#begins = from;
     this.#minEpoch = from;
     this.#epoch = null;
     this.#window = null;
@@ -150,23 +158,38 @@ export class PictureSchedule<U extends ScheduledUnit> {
     this.#broken = false;
     this.#ended = false;
     this.#endAnnounced = false;
-    this.#droppedUntil = Number.NEGATIVE_INFINITY;
+  }
+
+  /** The units to come are read from the input's start. */
+  readFromStart(): void {
+    this.#begins = "all";
   }
 
   /**
-   * The units to come are read from the input's start (`start`), or from
-   * somewhere in it.
+   * Whether the pictures at `time` can be decoded from the units held, now
+   * or once the units after them arrive: a unit decoding can begin at lies
+   * at or before `time`, or the input begins after it. Where neither is so,
+   * only reading the input again gives them.
    */
-  readFrom(start: boolean): void {
-    this.#fromStart = start;
+  reaches(time: number): boolean {
+    const earliest = this.#entries[0];
+    if (earliest === undefined) return false;
+    if (time < earliest.first)
+      return this.#begins === "all" && startable(earliest.unit);
+    return this.#startFor(time) >= 0;
   }
 
   /**
-   * Whether `time` lies among units that were dropped, so that only reading
-   * the input again can give its pictures.
+   * The latest unit decoding can begin at whose first picture decoded is at
+   * or before `time`, or -1 when none is held.
    */
-  dropped(time: number): boolean {
-    return time < this.#droppedUntil;
+  #startFor(time: number): number {
+    const entries = this.#entries;
+    for (let index = entries.length - 1; index >= 0; index--) {
+      const entry = entries[index]!;
+      if (startable(entry.unit) && entry.anchor <= time) return index;
+    }
+    return -1;
   }
 
   /** The input has ended: no unit is coming after the last one held. */
@@ -176,24 +199,22 @@ export class PictureSchedule<U extends ScheduledUnit> {
 
   /**
    * Drop the units ending more than the keep-behind span before the
-   * playhead, but never the last one decoding can begin at before it.
+   * playhead, as far as a unit decoding can begin at: those left behind one
+   * that was dropped could not be decoded. Never the last such unit before
+   * the playhead, nor any after it.
    */
   playhead(time: number): void {
+    const entries = this.#entries;
     const limit = time - this.#keepBehindSeconds;
-    let keep = this.#entries.length;
-    for (let index = this.#entries.length - 1; index >= 0; index--) {
-      const entry = this.#entries[index]!;
-      if (startable(entry.unit) && entry.anchor <= time) {
-        keep = index;
-        break;
-      }
-    }
+    const keep = this.#startFor(time);
     let drop = 0;
-    while (drop < keep && this.#entries[drop]!.end < limit) drop++;
+    for (let index = 1; index <= keep; index++) {
+      if (!(entries[index - 1]!.end < limit)) break;
+      if (startable(entries[index]!.unit)) drop = index;
+    }
     if (drop === 0) return;
-    this.#fromStart = false;
-    for (const entry of this.#entries.splice(0, drop))
-      this.#droppedUntil = Math.max(this.#droppedUntil, entry.end);
+    this.#begins = null;
+    entries.splice(0, drop);
     if (this.#cursor !== null)
       this.#cursor = this.#cursor < drop ? null : this.#cursor - drop;
   }
@@ -243,27 +264,21 @@ export class PictureSchedule<U extends ScheduledUnit> {
     if (window === null || epoch === null) return null;
     if (entries.length === 0) return this.#idle(this.#ended);
     let { from, until } = window;
-    // The input begins with the earliest unit, so the pictures begin where
-    // it does. (Read from somewhere in it, the input has what comes before
-    // that unit: a request from there waits for the seek that reads it, and
-    // decoding the earliest unit for it instead would hand out the pictures
-    // of where the input was read from under the request's epoch.)
+    // Where the earliest unit begins the pictures for this request, they
+    // begin where it does; see `#begins`.
     const earliest = entries[0]!;
-    if (this.#fromStart && from < earliest.first && startable(earliest.unit)) {
+    if (
+      from < earliest.first &&
+      startable(earliest.unit) &&
+      (this.#begins === "all" || this.#begins === epoch)
+    ) {
       until += earliest.first - from;
       from = earliest.first;
     }
     if (this.#cursor === null) {
       // Nothing held reaches the request: it is not buffered yet.
       if (this.#containing(from) < 0) return this.#idle(this.#ended);
-      let target = -1;
-      for (let index = entries.length - 1; index >= 0; index--) {
-        const entry = entries[index]!;
-        if (startable(entry.unit) && entry.anchor <= from) {
-          target = index;
-          break;
-        }
-      }
+      const target = this.#startFor(from);
       // Units arrive in time order, so none a decoder can begin at is still
       // to come before the request.
       if (target < 0) return this.#idle(true);

@@ -216,10 +216,12 @@ try {
     assert.equal(steps[0].from, 0.5);
   }
 
-  // The input read again from somewhere in it, as after a seek: a request
-  // from before the earliest unit waits for what comes before that unit
-  // rather than beginning with it, and is served once the input is read from
-  // its start. The same once units are dropped.
+  // The input read again from somewhere in it for a seek. Where that landed
+  // after the seek's target, the seek's own requests begin with the earliest
+  // unit: nothing before it was read for them. A request of a later epoch
+  // from before that unit waits for its own seek rather than beginning with
+  // it, and so does any request once units are dropped; all begin with the
+  // earliest unit where the input is read from its start.
   {
     const late = units(2).map((unit) => ({
       ...unit,
@@ -234,15 +236,23 @@ try {
     schedule.need(0, 0, 0.3);
     drain(schedule, shows);
     schedule.clear(1);
-    schedule.readFrom(false);
     for (const unit of late) schedule.add(unit);
+    assert.equal(schedule.reaches(0.5), false, "another seek reads again");
     schedule.need(1, 0.5, 0.8);
+    const landed = drain(schedule, shows);
+    assert.deepEqual(names(landed), ["0.0", "0.1", "0.2"]);
+    assert.ok(
+      landed.every((step) => step.from === 2 && step.epoch === 1),
+      "the seek's pictures begin where its reading landed",
+    );
+    schedule.need(2, 0.5, 0.8);
     assert.equal(next(schedule, shows), null, "began with a unit after it");
     assert.equal(schedule.exhausted, true);
     schedule.clear(2);
-    schedule.readFrom(true);
+    schedule.readFromStart();
     for (const unit of late) schedule.add(unit);
-    schedule.need(2, 0.5, 0.8);
+    assert.equal(schedule.reaches(0.5), true, "the input begins after it");
+    schedule.need(3, 0.5, 0.8);
     assert.equal(drain(schedule, shows)[0].from, 2, "the input's start");
 
     const dropping = new PictureSchedule(0.5);
@@ -333,12 +343,39 @@ try {
     assert.equal(drain(schedule, shows)[0].unit.name, "2.0", "group 2 is kept");
     // Back among what was dropped: only reading the input again helps, and
     // nothing later is put in its place.
-    assert.equal(schedule.dropped(0.2), true);
-    assert.equal(schedule.dropped(1.5), false);
+    assert.equal(schedule.reaches(0.2), false);
+    assert.equal(schedule.reaches(1.5), true);
     schedule.need(2, 0.2, 0.5);
     assert.equal(next(schedule, shows), null);
     schedule.clear();
-    assert.equal(schedule.dropped(0.2), false, "a reopened input");
+    assert.equal(schedule.reaches(1.5), false, "nothing is held");
+  }
+
+  // Units go a group at a time: a group that has begun to fall behind is
+  // kept whole, since decoding can begin only at its first unit. Whatever
+  // time the store says it reaches, a request there is decoded from the
+  // unit decoding begins at; the leading pictures of the earliest group
+  // need the group before it, which is gone.
+  {
+    const schedule = new PictureSchedule(0.5);
+    for (const unit of all) schedule.add(unit);
+    schedule.need(0, 0, 3);
+    drain(schedule, shows);
+    // 1.2 s is inside group 2, past its first unit.
+    schedule.playhead(1.7);
+    assert.equal(schedule.size, 8, "groups 2 and 3");
+    assert.equal(schedule.reaches(0.9), false, "group 1 is gone");
+    assert.equal(schedule.reaches(1.0), false, "before group 2's intra");
+    let epoch = 1;
+    for (let time = 1.04; time < 1.9; time += 0.01) {
+      assert.equal(schedule.reaches(time), true, `reaches ${time}`);
+      schedule.need(epoch, time, time + 0.3);
+      const steps = drain(schedule, shows);
+      assert.ok(steps.length > 0, `a request at ${time} is decoded`);
+      assert.equal(steps[0].reset, true);
+      assert.equal(steps[0].unit.name, time < 1.52 ? "2.0" : "3.0");
+      epoch++;
+    }
   }
 
   // Whether anything more is to come for a request: what holds the sound

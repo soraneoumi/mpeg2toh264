@@ -392,9 +392,9 @@ class Playback {
     if (sound !== null) {
       if (epoch === null)
         throw new TypeError("a decode-mode seek has no epoch");
-      // Played a moment ago, or converted already: both the sound and the
-      // units of the pictures are still here.
-      if (sound.covers(time) && !this.#pictures!.dropped(time)) {
+      // Played a moment ago, or converted already: the sound is still here,
+      // and so are the units its pictures are decoded from.
+      if (sound.covers(time) && this.#pictures!.reaches(time)) {
         sound.begin(epoch, time);
         return;
       }
@@ -774,8 +774,7 @@ class Playback {
   async #run(offset: number): Promise<void> {
     const leg = this.#nextLeg();
     const signal = this.#leg!.signal;
-    // Only units read from the input's start begin it.
-    this.#pictures?.readFrom(offset === 0);
+    if (offset === 0) this.#pictures?.readFromStart();
     const id = this.#command.id;
     try {
       await loadWasm(this.#command.wasmUrl);
